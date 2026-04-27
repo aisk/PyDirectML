@@ -40,11 +40,28 @@
 
 #if __cpp_exceptions
     #include <stdexcept>
+#else
+    #include <cstdlib>
 #endif
 
 #if __cplusplus >= 201703L && __has_include(<string_view>)
     #include <string_view>
 #endif
+
+namespace dml
+{
+    namespace detail
+    {
+        [[noreturn]] inline void ThrowTensorSizeOverflow()
+        {
+#if __cpp_exceptions
+            throw std::overflow_error("Tensor size calculation overflowed.");
+#else
+            std::abort();
+#endif
+        }
+    }
+}
 
 /** Calculates the minimum number of bytes required to store a buffer tensor with the specified type, sizes, and
     strides. The formula can be expressed as the following:
@@ -64,6 +81,19 @@ inline UINT64 DMLCalcBufferTensorSize(
     _In_reads_(dimensionCount) const UINT* sizes,
     _In_reads_opt_(dimensionCount) const UINT* strides)
 {
+    auto addWillOverflow = [](UINT64 a, UINT64 b) {
+        return a > UINT64_MAX - b;
+    };
+
+    auto multiplyWillOverflow = [](UINT64 a, UINT64 b) {
+        return b != 0 && a > UINT64_MAX / b;
+    };
+
+    if (dimensionCount == 0 || sizes == nullptr)
+    {
+        return 0;
+    }
+
     UINT elementSizeInBits = 0;
     switch (dataType)
     {
@@ -107,24 +137,67 @@ inline UINT64 DMLCalcBufferTensorSize(
         minimumImpliedSizeInBits = sizes[0];
         for (UINT i = 1; i < dimensionCount; ++i)
         {
+            if (multiplyWillOverflow(minimumImpliedSizeInBits, sizes[i]))
+            {
+                dml::detail::ThrowTensorSizeOverflow();
+            }
+
             minimumImpliedSizeInBits *= sizes[i];
         }
+
+        if (multiplyWillOverflow(minimumImpliedSizeInBits, elementSizeInBits))
+        {
+            dml::detail::ThrowTensorSizeOverflow();
+        }
+
         minimumImpliedSizeInBits *= elementSizeInBits;
     }
     else
     {
-        UINT indexOfLastElement = 0;
+        UINT64 indexOfLastElement = 0;
         for (UINT i = 0; i < dimensionCount; ++i)
         {
-            indexOfLastElement += (sizes[i] - 1) * strides[i];
+            if (sizes[i] == 0)
+            {
+                return 0;
+            }
+
+            UINT64 lastElementOffset = sizes[i] - 1;
+            if (multiplyWillOverflow(lastElementOffset, strides[i]))
+            {
+                dml::detail::ThrowTensorSizeOverflow();
+            }
+
+            lastElementOffset *= strides[i];
+            if (addWillOverflow(indexOfLastElement, lastElementOffset))
+            {
+                dml::detail::ThrowTensorSizeOverflow();
+            }
+
+            indexOfLastElement += lastElementOffset;
         }
 
-        minimumImpliedSizeInBits = (static_cast<UINT64>(indexOfLastElement) + 1) * elementSizeInBits;
+        if (addWillOverflow(indexOfLastElement, 1) || multiplyWillOverflow(indexOfLastElement + 1, elementSizeInBits))
+        {
+            dml::detail::ThrowTensorSizeOverflow();
+        }
+
+        minimumImpliedSizeInBits = (indexOfLastElement + 1) * elementSizeInBits;
+    }
+
+    if (addWillOverflow(minimumImpliedSizeInBits, 7))
+    {
+        dml::detail::ThrowTensorSizeOverflow();
     }
 
     UINT64 minimumImpliedSizeInBytes = (minimumImpliedSizeInBits + 7) / 8;
 
     // Round up to the nearest 4 bytes.
+    if (addWillOverflow(minimumImpliedSizeInBytes, 3))
+    {
+        dml::detail::ThrowTensorSizeOverflow();
+    }
+
     minimumImpliedSizeInBytes = (minimumImpliedSizeInBytes + 3) & ~3ull;
 
     return minimumImpliedSizeInBytes;
@@ -369,6 +442,10 @@ namespace dml
             uint32_t dimensionCount = static_cast<uint32_t>(sizes.size());
             TensorStrides strides(dimensionCount);
 
+            auto multiplyWillOverflowUint32 = [](uint32_t a, uint32_t b) {
+                return b != 0 && a > UINT32_MAX / b;
+            };
+
             enum Axes { N, C, /* spatial dimensions ... */ };
 
             // N dimension strides
@@ -377,6 +454,11 @@ namespace dml
                 strides[N] = 1;
                 for (uint32_t i = 1; i < dimensionCount; ++i)
                 {
+                    if (multiplyWillOverflowUint32(strides[N], sizes[i]))
+                    {
+                        detail::ThrowTensorSizeOverflow();
+                    }
+
                     strides[N] *= sizes[i];
                 }
             }
@@ -394,6 +476,11 @@ namespace dml
                 for (uint32_t i = dimensionCount - 1; i >= 2; --i)
                 {
                     strides[i] = stride;
+                    if (multiplyWillOverflowUint32(stride, sizes[i]))
+                    {
+                        detail::ThrowTensorSizeOverflow();
+                    }
+
                     stride *= sizes[i];
                 }
             }
