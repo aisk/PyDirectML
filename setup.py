@@ -18,7 +18,7 @@ dml_resource_version = '1.9.1'
 
 dependency_dir = 'dependencies'
 dml_bin_path = f'{dependency_dir}/{dml_resource_id}.{dml_resource_version}/bin/x64-win/'
-lib_dir = '..\libraries'
+lib_dir = 'third_party'
 base_path = os.path.dirname(os.path.realpath(__file__))
 dependency_path = os.path.join(base_path, dependency_dir)
 
@@ -27,7 +27,7 @@ dml_path = '%s\%s' % (dependency_path, dml_resource_name)
 
 dmlx = 'DirectMLX'
 dmlx_file = dmlx + '.h'
-dmlx_source_path = '%s\%s' % (os.path.join(base_path, lib_dir), dmlx_file)
+dmlx_source_path = os.path.join(base_path, lib_dir, dmlx_file)
 dmlx_path = os.path.join(dependency_path, dmlx)
 
 class CMakeExtension(Extension):

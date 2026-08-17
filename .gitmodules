@@ -1,0 +1,9 @@
+[submodule "pybind11"]
+	path = pybind11
+	url = https://github.com/pybind/pybind11.git
+	branch = v2.10
+
+[submodule "gpgmm"]
+	path = gpgmm
+	url = https://github.com/intel/gpgmm.git
+	branch = main

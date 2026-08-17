@@ -1,0 +1,25 @@
+# Python extensions package artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# DirectML nuget package downloaded by setup.py
+dependencies/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+
+# Visual Studio
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
