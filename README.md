@@ -1,4 +1,7 @@
 # Python Binding for DirectML Samples
+
+> Forked from the `Python/` directory of [microsoft/DirectML](https://github.com/microsoft/DirectML), which is no longer maintained. `third_party/DirectMLX.h` comes from that repository's `Libraries/` directory. Licensed under MIT, see [LICENSE](./LICENSE).
+
 PyDirectML is an open source Python binding library for DirectML written to facilitate DirectML sample authoring in Python. It provides the following capabilities to Python sample authors:
 - Simplified DirectML graph authoring and compilation with operator composition
 - Wrapper of DirectML device and resource management
