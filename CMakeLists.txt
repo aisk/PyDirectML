@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.15)
 message("DML_PATH=${DML_PATH}")
 message("DMLX_PATH=${DMLX_PATH}")
 
-project(pydirectml)
+project(directml)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED on)
@@ -28,13 +28,13 @@ add_subdirectory(gpgmm)
 add_subdirectory(pybind11)
 
 pybind11_add_module(
-    pydirectml
+    directml
     src/util.cpp
     src/module.cpp
     src/device.cpp
     )
 
-target_compile_options(pydirectml PRIVATE /W4 /WX)
-target_include_directories(pydirectml PRIVATE pybind11/include gpgmm/src/include gpgmm/ ${DML_PATH}/include ${DMLX_PATH})
-target_link_directories(pydirectml PRIVATE ${DML_PATH}/bin/x64-win)
-target_link_libraries(pydirectml PRIVATE gpgmm dxgi.lib d3d12.lib directml.lib)
+target_compile_options(directml PRIVATE /W4 /WX)
+target_include_directories(directml PRIVATE pybind11/include gpgmm/src/include gpgmm/ ${DML_PATH}/include ${DMLX_PATH})
+target_link_directories(directml PRIVATE ${DML_PATH}/bin/x64-win)
+target_link_libraries(directml PRIVATE gpgmm dxgi.lib d3d12.lib directml.lib)

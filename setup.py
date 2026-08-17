@@ -123,7 +123,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(['cmake', '--build', '.'] + build_args, cwd=self.build_temp)
 
 setup(
-    name='pydirectml',
+    name='directml',
     version='1.0.0',
     author='Microsoft Corporation',
     author_email='askdirectml@microsoft.com',
@@ -132,7 +132,7 @@ setup(
     url="https://github.com/microsoft/directml",
     license='MIT',
     python_requires='>=3.6',
-    ext_modules=[CMakeExtension('pydirectml')],
+    ext_modules=[CMakeExtension('directml')],
     cmdclass=dict(build_ext=CMakeBuild),
     keywords='DirectML Python samples',
     setup_requires=['cmake', 'requests'],

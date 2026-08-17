@@ -3,7 +3,7 @@
 # Based on the following model: https://github.com/onnx/models/blob/master/vision/classification/squeezenet/model/squeezenet1.1-7.onnx
 #
 
-import pydirectml as dml
+import directml as dml
 import numpy as np
 from PIL import Image, ImageOps
 import sys

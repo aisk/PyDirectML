@@ -2,7 +2,7 @@
 # DirectML super-sesolution sample
 # Based on the following model: https://github.com/onnx/models/tree/master/vision/super_resolution/sub_pixel_cnn_2016
 #
-import pydirectml as dml
+import directml as dml
 import numpy as np
 from PIL import Image, ImageOps
 import sys

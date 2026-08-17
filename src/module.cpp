@@ -6,7 +6,7 @@
 
 #include "precomp.h"
 
-PYBIND11_MODULE(pydirectml, module)
+PYBIND11_MODULE(directml, module)
 {
     module.doc() = "Python binding for DirectML";
 

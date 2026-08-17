@@ -3,7 +3,7 @@
 # Based on the following model: https://github.com/microsoft/Windows-Machine-Learning/blob/master/Samples/FNSCandyStyleTransfer/UWP/cs/Assets/candy.onnx
 #
 
-import pydirectml as dml
+import directml as dml
 import numpy as np
 from PIL import Image, ImageOps
 import sys
