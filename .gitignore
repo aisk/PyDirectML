@@ -4,9 +4,6 @@ dist/
 .eggs/
 *.egg-info/
 
-# DirectML nuget package downloaded by setup.py
-dependencies/
-
 # CMake
 CMakeCache.txt
 CMakeFiles/

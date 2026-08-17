@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
 
-message("DML_PATH=${DML_PATH}")
-message("DMLX_PATH=${DMLX_PATH}")
-
 project(directml)
+
+# DirectML.h and DirectML.lib ship with the Windows SDK, so they resolve through
+# the default include and library paths. DirectMLX.h is header-only and vendored
+# under third_party/.
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED on)
@@ -35,6 +36,5 @@ pybind11_add_module(
     )
 
 target_compile_options(directml PRIVATE /W4 /WX)
-target_include_directories(directml PRIVATE pybind11/include gpgmm/src/include gpgmm/ ${DML_PATH}/include ${DMLX_PATH})
-target_link_directories(directml PRIVATE ${DML_PATH}/bin/x64-win)
+target_include_directories(directml PRIVATE pybind11/include gpgmm/src/include gpgmm/ third_party)
 target_link_libraries(directml PRIVATE gpgmm dxgi.lib d3d12.lib directml.lib)

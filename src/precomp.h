@@ -39,7 +39,12 @@ namespace py = pybind11;
 
 #define DML_TARGET_VERSION_USE_LATEST 1
 #include <DirectML.h>
+// DirectMLX guards several locals with assert() only, so they read as unused
+// once NDEBUG compiles the asserts out.
+#pragma warning(push)
+#pragma warning(disable: 4189) // local variable is initialized but not referenced
 #include <DirectMLX.h>
+#pragma warning(pop)
 
 #define IID_GRAPHICS_PPV_ARGS IID_PPV_ARGS
 #include "d3dx12.h"
