@@ -165,7 +165,7 @@ std::vector<pydml::TensorData*> Device::DispatchOperator(
         DmlBufferTensorDesc desc = *input->desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
 
         // If OWNED_BY_DML is *not* set, this input must be bound at execution
-        if (!desc.flags & DML_TENSOR_FLAG_OWNED_BY_DML)
+        if (!(desc.flags & DML_TENSOR_FLAG_OWNED_BY_DML))
         {
             uint32_t requiredAlignment = std::max(desc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
 

@@ -24,24 +24,20 @@ PYBIND11_MODULE(directml, module)
         .value("INT8", DML_TENSOR_DATA_TYPE_INT8)
         .value("FLOAT64", DML_TENSOR_DATA_TYPE_FLOAT64)
         .value("UINT64", DML_TENSOR_DATA_TYPE_UINT64)
-        .value("INT64", DML_TENSOR_DATA_TYPE_INT64)
-        .export_values();
+        .value("INT64", DML_TENSOR_DATA_TYPE_INT64);
 
     py::enum_<DML_TENSOR_FLAGS>(module, "TensorFlags")
         .value("NONE", DML_TENSOR_FLAG_NONE)
-        .value("OWNED_BY_DML", DML_TENSOR_FLAG_OWNED_BY_DML)
-        .export_values();
+        .value("OWNED_BY_DML", DML_TENSOR_FLAG_OWNED_BY_DML);
 
     py::enum_<DML_MATRIX_TRANSFORM>(module, "MatrixTransform")
         .value("NONE", DML_MATRIX_TRANSFORM_NONE)
-        .value("TRANSPOSE", DML_MATRIX_TRANSFORM_TRANSPOSE)
-        .export_values();
+        .value("TRANSPOSE", DML_MATRIX_TRANSFORM_TRANSPOSE);
 
     py::enum_<DML_RECURRENT_NETWORK_DIRECTION>(module, "RecurrentNetworkDirection")
         .value("FORWARD", DML_RECURRENT_NETWORK_DIRECTION_FORWARD)
         .value("BACKWARD", DML_RECURRENT_NETWORK_DIRECTION_BACKWARD)
-        .value("BIDIRECTIONAL", DML_RECURRENT_NETWORK_DIRECTION_BIDIRECTIONAL)
-        .export_values();
+        .value("BIDIRECTIONAL", DML_RECURRENT_NETWORK_DIRECTION_BIDIRECTIONAL);
 
     py::enum_<dml::GRUOutputOptions>(module, "OutputOptions", py::arithmetic())
         .value("Both", dml::GRUOutputOptions::Both)
@@ -50,31 +46,26 @@ PYBIND11_MODULE(directml, module)
 
     py::enum_<DML_CONVOLUTION_MODE>(module, "ConvolutionMode")
         .value("CONVOLUTION", DML_CONVOLUTION_MODE_CONVOLUTION)
-        .value("CROSS_CORRELATION", DML_CONVOLUTION_MODE_CROSS_CORRELATION)
-        .export_values();
+        .value("CROSS_CORRELATION", DML_CONVOLUTION_MODE_CROSS_CORRELATION);
 
     py::enum_<DML_CONVOLUTION_DIRECTION>(module, "ConvolutionDirection")
         .value("FORWARD", DML_CONVOLUTION_DIRECTION_FORWARD)
-        .value("BACKWARD", DML_CONVOLUTION_DIRECTION_BACKWARD)
-        .export_values();
+        .value("BACKWARD", DML_CONVOLUTION_DIRECTION_BACKWARD);
 
     py::enum_<DML_INTERPOLATION_MODE>(module, "InterpolationMode")
         .value("NEAREST_NEIGHBOR", DML_INTERPOLATION_MODE_NEAREST_NEIGHBOR)
-        .value("LINEAR", DML_INTERPOLATION_MODE_LINEAR)
-        .export_values();
+        .value("LINEAR", DML_INTERPOLATION_MODE_LINEAR);
 
     py::enum_<DML_PADDING_MODE>(module, "PaddingMode")
         .value("CONSTANT", DML_PADDING_MODE_CONSTANT)
         .value("EDGE", DML_PADDING_MODE_EDGE)
-        .value("REFLECTION", DML_PADDING_MODE_REFLECTION)
-        .export_values();
+        .value("REFLECTION", DML_PADDING_MODE_REFLECTION);
 
     py::enum_<DML_EXECUTION_FLAGS>(module, "ExecutionFlags", py::arithmetic())
         .value("NONE", DML_EXECUTION_FLAG_NONE)
         .value("ALLOW_HALF_PRECISION_COMPUTATION", DML_EXECUTION_FLAG_ALLOW_HALF_PRECISION_COMPUTATION)
         .value("DISABLE_META_COMMANDS", DML_EXECUTION_FLAG_DISABLE_META_COMMANDS)
-        .value("DESCRIPTORS_VOLATILE", DML_EXECUTION_FLAG_DESCRIPTORS_VOLATILE)
-        .export_values();
+        .value("DESCRIPTORS_VOLATILE", DML_EXECUTION_FLAG_DESCRIPTORS_VOLATILE);
 
     py::enum_<DML_OPERATOR_TYPE>(module, "OperatorType")
         .value("INVALID", DML_OPERATOR_INVALID)
@@ -173,12 +164,11 @@ PYBIND11_MODULE(directml, module)
         .value("DIAGONAL_MATRIX", DML_OPERATOR_DIAGONAL_MATRIX)
         .value("SCATTER", DML_OPERATOR_SCATTER)
         .value("ONE_HOT", DML_OPERATOR_ONE_HOT)
-        .value("RESAMPLE", DML_OPERATOR_RESAMPLE)
-        .export_values();
+        .value("RESAMPLE", DML_OPERATOR_RESAMPLE);
 
     // Classes
     //
-    py::class_<pydml::Binding>(module, "Binding", py::buffer_protocol())
+    py::class_<pydml::Binding>(module, "Binding")
         .def(py::init([](dml::Expression& expression, py::array_t<float, py::array::c_style | py::array::forcecast> data) {
             return new pydml::Binding(expression, data.request());
             }),
@@ -207,16 +197,14 @@ PYBIND11_MODULE(directml, module)
             }),
             py::arg("device"))
         .def("build", [](dml::Graph& self, DML_EXECUTION_FLAGS flags, std::vector<dml::Expression> outputs) {
-            self; return new pydml::CompiledModel(self, flags, outputs);
+            return new pydml::CompiledModel(self, flags, outputs);
             }, "Compile the expressions to a compiled operator.");
 
     py::class_<pydml::CompiledModel>(module, "Model");
 
-    py::class_<dml::TensorDimensions>(module, "Dimensions");
-
     py::class_<dml::TensorPolicy>(module, "TensorPolicy")
-        .def_property_readonly_static("default", []() { return dml::TensorPolicy::Default(); })
-        .def_property_readonly_static("interleaved_channel", []() { return dml::TensorPolicy::InterleavedChannel(); });
+        .def_property_readonly_static("default", [](py::object) { return dml::TensorPolicy::Default(); })
+        .def_property_readonly_static("interleaved_channel", [](py::object) { return dml::TensorPolicy::InterleavedChannel(); });
 
     py::class_<dml::TensorDesc>(module, "TensorDesc")
         .def(py::init<DML_TENSOR_DATA_TYPE, dml::TensorDimensions, const dml::TensorPolicy&>(),
@@ -265,9 +253,6 @@ PYBIND11_MODULE(directml, module)
             });
 
     py::class_<pydml::TensorData>(module, "TensorData", py::buffer_protocol())
-        .def(py::init([](py::array_t<float, py::array::c_style | py::array::forcecast> data) { 
-            return new pydml::TensorData(data.request()); 
-            }))
         .def_buffer([](pydml::TensorData& self) -> py::buffer_info {
             return py::buffer_info(
                 self.Get(),
@@ -279,7 +264,6 @@ PYBIND11_MODULE(directml, module)
                 ); });
 
     py::class_<dml::Expression>(module, "Expression")
-        .def(py::init<>())
         .def("get_output_desc", &dml::Expression::GetOutputDesc, "Get the expression's output descriptor.")
         .def(py::self + py::self)
         .def(py::self - py::self)
@@ -319,16 +303,10 @@ PYBIND11_MODULE(directml, module)
             py::arg("param_2") = 0);
 
     py::class_<dml::MaxPoolingOutputs>(module, "MaxPoolingOutputs")
-        .def(py::init([](dml::Expression values, dml::Expression indices) {
-            return new dml::MaxPoolingOutputs { values, indices };
-            }))
         .def_readwrite("values", &dml::MaxPoolingOutputs::values)
         .def_readwrite("indices", &dml::MaxPoolingOutputs::indices);
 
     py::class_<dml::GRUOutputs>(module, "GRUOutputs")
-        .def(py::init([](dml::Expression sequence, dml::Expression single) {
-            return new dml::GRUOutputs { sequence, single };
-            }))
         .def_readwrite("sequence", &dml::GRUOutputs::sequence)
         .def_readwrite("single", &dml::GRUOutputs::single);
 
