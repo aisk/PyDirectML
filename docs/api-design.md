@@ -10,7 +10,7 @@
 
 - 不做大规模重构。C++ 侧的 `Device` / `CompiledModel` / `Binding` / `TensorData` 结构不动。（**这条后来推翻了**，见 §3.13：persistent resource 必须从 `Device` 移到 `CompiledModel`，否则「初始化一次、之后只分派」做不成。）
 - 不引入新抽象。**概念映射保持 1:1**：`dml::Graph`、`dml::Expression`、`dml::TensorDesc`、`IDMLCompiledOperator`、`DML_BUFFER_BINDING` 在 Python 侧各自仍然只有一个对应类型。不做 Keras 式的 `Layer` / `Sequential`，不做自动求导，不做算子融合的语法糖。
-- 不追求补齐算子覆盖。当前只绑定了约 25 个算子，DirectMLX 有上百个；那是另一件事。
+- 不追求补齐算子覆盖。当前只绑定了约 25 个算子，DirectMLX 有上百个；那是另一件事。**这条仍然成立**：算子按 sample 的实际需要一个个补，不做批量补齐。目前因此加进来的是 `activation_softmax` 的 `axes` 重载和 `activation_gelu`，都来自 `samples/sdxl/`。
 - 不加 Python 包装层。全部改动落在 `module.cpp` / `model.h` / `device.cpp`，扩展模块保持顶层单文件。理由见 §4。
 
 一句话概括方向：**同样的概念，更好的签名。**

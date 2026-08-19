@@ -126,14 +126,28 @@ difference between fitting on a 16 GiB card with room for activations and not.
 known to overflow in float16, which is why `madebyollin/sdxl-vae-fp16-fix`
 exists.
 
-What is left is scale and coverage rather than capability:
+**Every operator it needs is bound.** `activation_gelu` was the last gap -- the
+UNet's GEGLU feed-forward and OpenCLIP ViT-bigG's MLP both want it, and it is the
+exact erf form rather than the tanh approximation, which is what those two use.
+CLIP ViT-L's QuickGELU is `x * sigmoid(1.702x)` and needs nothing new. Everything
+else the UNet and the text encoders reach for was already there:
+
+| | |
+| --- | --- |
+| Multi-head attention | `reinterpret` to `[1, heads, tokens, dim]`, batched `gemm`, `activation_softmax` |
+| Cross-attention | the same, with keys and values from the text embeddings |
+| LayerNorm | `mean_variance_normalization` over the last axis, affine after |
+| GEGLU | two `slice` calls for the halves, then `activation_gelu` and `multiply` |
+| Token embedding | `gather` with a uint32 index tensor, which needed the dtype fix |
+| Timestep embedding | sinusoidal on the CPU, then `gemm` and SiLU |
+| Skip connections | `join` on the channel axis |
+
+What is left is scale, not capability:
 
 - The two text encoders (CLIP ViT-L and OpenCLIP ViT-bigG, 817 million
   parameters between them) and a BPE tokenizer.
-- `dml::ActivationGelu` or `dml::Erf`, which DirectMLX has
-  (`third_party/DirectMLX.h:1658`, `:1958`) and `module.cpp` does not bind. The
-  UNet's GEGLU feed-forward and the text encoders' GELU both need one of them.
-  Cross-attention and timestep embeddings are already expressible.
+- The UNet itself, which is the same building blocks as the VAE plus
+  cross-attention, at forty times the parameter count.
 - A way to drop a weight's CPU copy. `Binding` keeps one for the lifetime of the
   model even after DirectML has taken the data, which is fine for 320 MiB and not
   for 10.3 GiB.

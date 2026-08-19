@@ -425,6 +425,11 @@ PYBIND11_MODULE(directml, module)
     module.def("activation_tanh", &dml::ActivationTanh, "Calculates the hyperbolic tangent of the given input tensor.",
         py::arg("input"));
 
+    module.def("activation_gelu", &dml::ActivationGelu,
+        "Gaussian error linear unit, f(input) = input * 0.5 * (1 + erf(input / sqrt(2))). "
+        "This is the exact form, not the tanh approximation.",
+        py::arg("input"));
+
     module.def("multiply", &dml::Multiply, "Takes 2 input tensors and performs multiplication then returns resulting tensor.",
         py::arg("a"),
         py::arg("b"));
