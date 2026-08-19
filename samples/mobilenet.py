@@ -730,7 +730,7 @@ conv54 = dml.convolution(avg_pool1, conv54_filter)
 reshape = dml.reinterpret(conv54, dml.TensorDataType.FLOAT32, [1,1,1,1000], [1000,1000,1000,1])
 
 # softmax
-soft_max = dml.activation_soft_max(reshape)
+soft_max = dml.activation_softmax(reshape)
 
 # Compile the expression graph into a compiled operator
 op = builder.build(dml.ExecutionFlags.NONE, [soft_max])

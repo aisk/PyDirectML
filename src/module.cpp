@@ -536,9 +536,14 @@ PYBIND11_MODULE(directml, module)
         py::arg("new_size"),
         py::arg("new_strides"));
 
-    module.def("activation_soft_max", [](dml::Expression input) { return dml::ActivationSoftmax(input); },
-        "Raise all elements to e, and divide all the elements in each batch by that batch's sum.",
-        py::arg("input"));
+    module.def("activation_softmax", [](dml::Expression input, std::vector<uint32_t> axes) {
+            // An empty axis list selects the legacy operator, which normalizes along
+            // the last dimension of a flattened 2-D view of the tensor.
+            return axes.empty() ? dml::ActivationSoftmax(input) : dml::ActivationSoftmax(input, axes);
+        },
+        "Raise all elements to e, and divide each element by the sum over the given axes.",
+        py::arg("input"),
+        py::arg("axes") = std::vector<uint32_t>{});
 
     module.def("join", [](
         std::vector<dml::Expression> inputs,

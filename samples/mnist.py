@@ -103,7 +103,7 @@ times212 = dml.gemm(times212_reshape0, times212_reshape1)
 plus214_param194 = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1, 1, 1, 10]), "Parameter194.npy")
 plus214 = dml.add(times212, plus214_param194)
 
-softmax = dml.activation_soft_max(plus214)
+softmax = dml.activation_softmax(plus214)
 # Compile the expression graph into a compiled operator
 op = builder.build(dml.ExecutionFlags.NONE, [softmax])
 

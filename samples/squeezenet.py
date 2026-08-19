@@ -229,7 +229,7 @@ squeezenet0_pool3_fwd = dml.average_pooling(squeezenet0_conv25_fwd, [13,13], [13
 squeezenet0_flatten0_reshape0 =dml.reinterpret(squeezenet0_pool3_fwd, dml.TensorDataType.FLOAT32, [1,1,1,1000], [1000,1000,1000,1])
 
 # softmax
-soft_max = dml.activation_soft_max(squeezenet0_flatten0_reshape0)
+soft_max = dml.activation_softmax(squeezenet0_flatten0_reshape0)
 
 # Compile the expression graph into a compiled operator
 op = builder.build(dml.ExecutionFlags.NONE, [soft_max])
