@@ -12,6 +12,9 @@ from safetensors.numpy import load_file
 VAE_REPO = "stabilityai/sdxl-vae"
 VAE_FILE = "diffusion_pytorch_model.safetensors"
 
+SDXL_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
+TEXT_ENCODERS = ("text_encoder", "text_encoder_2")
+
 
 def as_float32(array):
     """Widen a checkpoint tensor to float32, including bfloat16."""
@@ -27,6 +30,23 @@ def load_vae(repo=VAE_REPO, filename=VAE_FILE):
     """Download (or reuse the cached) SDXL VAE and return its tensors as float32."""
     path = hf_hub_download(repo_id=repo, filename=filename)
     return {name: as_float32(tensor) for name, tensor in load_file(path).items()}
+
+
+def load_text_encoders(repo=SDXL_REPO):
+    """Download (or reuse) both CLIP text towers. 3.3 GiB as float32."""
+    return {
+        name: {k: as_float32(v)
+               for k, v in load_file(hf_hub_download(repo, f"{name}/model.safetensors")).items()}
+        for name in TEXT_ENCODERS
+    }
+
+
+def load_tokenizers(repo=SDXL_REPO):
+    """The two BPE tokenizers, from transformers. No PyTorch involved."""
+    from transformers import CLIPTokenizer
+
+    return {name: CLIPTokenizer.from_pretrained(repo, subfolder=folder)
+            for name, folder in zip(TEXT_ENCODERS, ("tokenizer", "tokenizer_2"))}
 
 
 def main():

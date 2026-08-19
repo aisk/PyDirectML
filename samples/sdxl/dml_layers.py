@@ -27,6 +27,14 @@ import numpy as np
 import directml as dml
 
 FLOAT32 = dml.TensorDataType.FLOAT32
+UINT32 = dml.TensorDataType.UINT32
+
+NUMPY_DTYPES = {
+    FLOAT32: np.float32,
+    dml.TensorDataType.FLOAT16: np.float16,
+    UINT32: np.uint32,
+    dml.TensorDataType.INT32: np.int32,
+}
 
 
 def sizes(expression):
@@ -52,8 +60,8 @@ class Model:
         self._outputs = []
         self._operator = None
 
-    def _add_input(self, shape, array, flags):
-        desc = dml.TensorDesc(FLOAT32, flags, list(shape))
+    def _add_input(self, array, flags, data_type):
+        desc = dml.TensorDesc(data_type, flags, list(array.shape))
         expression = dml.input_tensor(self.graph, len(self._expressions), desc)
         self._expressions.append(expression)
         self._arrays.append(array)
@@ -69,11 +77,17 @@ class Model:
         array = np.ascontiguousarray(array, np.float32)
         if shape is not None:
             array = array.reshape(shape)
-        return self._add_input(array.shape, array, dml.TensorFlags.OWNED_BY_DML)
+        return self._add_input(array, dml.TensorFlags.OWNED_BY_DML, FLOAT32)
 
-    def placeholder(self, shape):
-        """Register an input whose data is supplied to :meth:`run`."""
-        expression = self._add_input(shape, np.zeros(shape, np.float32), dml.TensorFlags.NONE)
+    def placeholder(self, shape, data_type=FLOAT32):
+        """Register an input whose data is supplied to :meth:`run`.
+
+        Token indices are the reason this takes a data type: ``gather`` wants an
+        integer tensor, and a Binding now converts to whatever the tensor
+        declares rather than forcing float32.
+        """
+        array = np.zeros(shape, NUMPY_DTYPES[data_type])
+        expression = self._add_input(array, dml.TensorFlags.NONE, data_type)
         self._placeholders.append(len(self._expressions) - 1)
         return expression
 
@@ -86,6 +100,14 @@ class Model:
         # Uploads every OWNED_BY_DML tensor and hands it to DirectML. After this
         # a dispatch only carries the placeholders.
         self.device.initialize(self._operator, self._bindings)
+
+        # DirectML has the weights and each Binding kept its own copy, so the
+        # arrays the graph was built from can go. That is 2.8 GiB for the larger
+        # text encoder. The Binding copies are the ones that cannot be dropped
+        # yet -- see the note in this directory's README.
+        for index in range(len(self._arrays)):
+            if index not in self._placeholders:
+                self._arrays[index] = None
         return self
 
     def run(self, *values):
@@ -97,13 +119,13 @@ class Model:
 
         for index, value in zip(self._placeholders, values):
             expected = list(self._arrays[index].shape)
-            value = np.ascontiguousarray(value, np.float32)
+            value = np.ascontiguousarray(value, self._arrays[index].dtype)
             if list(value.shape) != expected:
                 raise ValueError(f"input {index} has shape {list(value.shape)}, expected {expected}")
             self._bindings[index] = dml.Binding(self._expressions[index], value)
 
         results = self.device.dispatch(self._operator, self._bindings, self._outputs)
-        return [np.array(r, np.float32).reshape(sizes(o)) for r, o in zip(results, self._outputs)]
+        return [np.asarray(r).reshape(sizes(o)) for r, o in zip(results, self._outputs)]
 
     @property
     def input_count(self):
@@ -238,3 +260,77 @@ def upsample_nearest(x, scale=2):
     """Nearest-neighbour upsampling, the only interpolation the VAE uses."""
     return dml.up_sample_2d(x, dml.Size2D(scale, scale),
                             dml.InterpolationMode.NEAREST_NEIGHBOR)
+
+
+# --- Transformer pieces, used by the text encoders -------------------------
+
+
+def layer_norm(model, x, weight, bias, epsilon=1e-5):
+    """LayerNorm over the last axis of a token tensor.
+
+    Same shape rule as :func:`group_norm`: the affine cannot ride along on the
+    normalization, because the axis it varies over is the axis being normalized.
+    """
+    shape = sizes(x)
+    leading = [1] * (len(shape) - 1)
+    normalized = dml.mean_variance_normalization(
+        x, None, None, [len(shape) - 1],
+        normalize_variance=True, normalize_mean=True, epsilon=epsilon)
+
+    scale = broadcast(model.constant(weight, shape=leading + [shape[-1]]), shape)
+    shift = broadcast(model.constant(bias, shape=leading + [shape[-1]]), shape)
+    return dml.add(dml.multiply(normalized, scale), shift)
+
+
+def quick_gelu(x):
+    """x * sigmoid(1.702x), the approximation CLIP ViT-L was trained with."""
+    return dml.multiply(x, dml.activation_sigmoid(dml.activation_linear(x, 1.702, 0.0)))
+
+
+def split_heads(x, heads):
+    """View ``[1, 1, T, C]`` as ``[1, heads, T, C/heads]``. No copy."""
+    n, _, tokens, channels = sizes(x)
+    if channels % heads:
+        raise ValueError(f"{channels} channels do not divide into {heads} heads")
+    dim = channels // heads
+    return dml.reinterpret(x, FLOAT32, [n, heads, tokens, dim],
+                           [tokens * channels, dim, channels, 1])
+
+
+def merge_heads(x):
+    """The inverse of :func:`split_heads`, which costs one copy.
+
+    Strides cannot express this one. Going from ``[1, heads, T, dim]`` back to
+    ``[1, 1, T, heads*dim]`` means an output channel index splits into a head and
+    an offset within it, and an offset that divides an index is not a stride. So
+    view the buffer as ``[1, T, heads, dim]`` -- that much *is* a stride trick --
+    then let an identity operator write it out packed, after which the last
+    reshape is free.
+    """
+    n, heads, tokens, dim = sizes(x)
+    transposed = dml.reinterpret(x, FLOAT32, [n, tokens, heads, dim],
+                                 [heads * tokens * dim, dim, tokens * dim, 1])
+    packed = dml.activation_identity(transposed)
+    return dml.reinterpret(packed, FLOAT32, [n, 1, tokens, heads * dim], None)
+
+
+def multi_head_attention(model, x, params, prefix, heads, mask=None):
+    """Self-attention over ``[1, 1, T, C]`` with an optional additive mask."""
+    _, _, _, channels = sizes(x)
+    dim = channels // heads
+
+    query = split_heads(linear(model, x, params[f"{prefix}.q_proj.weight"],
+                               params[f"{prefix}.q_proj.bias"]), heads)
+    key = split_heads(linear(model, x, params[f"{prefix}.k_proj.weight"],
+                             params[f"{prefix}.k_proj.bias"]), heads)
+    value = split_heads(linear(model, x, params[f"{prefix}.v_proj.weight"],
+                               params[f"{prefix}.v_proj.bias"]), heads)
+
+    scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
+                      alpha=1.0 / math.sqrt(dim))
+    if mask is not None:
+        scores = dml.add(scores, broadcast(mask, sizes(scores)))
+
+    attended = dml.gemm(dml.activation_softmax(scores, [3]), value)
+    return linear(model, merge_heads(attended), params[f"{prefix}.out_proj.weight"],
+                  params[f"{prefix}.out_proj.bias"])

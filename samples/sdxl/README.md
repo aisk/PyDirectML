@@ -1,11 +1,11 @@
 # SDXL on DirectML
 
 Stable Diffusion XL has four pieces: two text encoders, a UNet, a VAE, and a
-sampler that ties them together. This directory has the VAE and the sampler,
-built out of the operators `directml` exposes, running against the real
-`stabilityai/sdxl-vae` weights.
+sampler that ties them together. This directory has three of the four -- both
+text encoders, the VAE, and the sampler -- built out of the operators `directml`
+exposes and running against the real SDXL weights.
 
-The UNet is not here yet. See [What the UNet needs](#what-the-unet-needs).
+The UNet is not here yet. See [What is left](#what-is-left).
 
 ## Running it
 
@@ -14,12 +14,14 @@ pip install .[dev] --no-build-isolation   # from the repository root
 cd samples\sdxl
 
 python roundtrip.py                       # encode and decode an image
+python encode_prompt.py "a prompt"        # a prompt to the UNet's conditioning
 python check.py                           # verify the graphs against NumPy
 python euler.py                           # the sampler's schedule and self test
 ```
 
-The weights (320 MiB) download from the Hugging Face hub on first use and land in
-the usual `~/.cache/huggingface` directory.
+Weights download from the Hugging Face hub on first use and land in the usual
+`~/.cache/huggingface` directory: 320 MiB for the VAE, 3.3 GiB for the two text
+encoders. `check.py --part vae` skips the large download.
 
 `roundtrip.py` pushes an image through the encoder and back through the decoder.
 On a Radeon RX 6800:
@@ -39,13 +41,14 @@ to survive the trip through this decoder.
 
 | File | |
 | --- | --- |
-| `dml_layers.py` | Conv, GroupNorm, SiLU, attention -- the layers, as DirectML expressions |
+| `dml_layers.py` | Conv, GroupNorm, LayerNorm, SiLU, attention -- the layers, as DirectML expressions |
 | `vae.py` | The encoder and decoder graphs |
+| `text_encoder.py` | Both CLIP towers, and the tokenizing that feeds them |
 | `euler.py` | `EulerDiscreteScheduler`, in NumPy |
-| `reference.py` | The same VAE in NumPy, line for line |
+| `reference.py` | The same VAE and text encoders in NumPy, line for line |
 | `check.py` | Runs both and compares |
 | `weights.py` | Checkpoint download and float32 conversion |
-| `roundtrip.py` | The demo |
+| `roundtrip.py`, `encode_prompt.py` | The demos |
 
 `reference.py` exists because there is no PyTorch in this repository to check
 against. It is slow enough to be obviously correct and fast enough to run at
@@ -76,10 +79,55 @@ not pixels: `[1, C, H, W]` read as `[1, 1, H*W, C]` with strides
 whole attention block is four matrix multiplies and a softmax, and the reshapes
 around them are free.
 
-The one operator this sample had to add was `activation_softmax` with an `axes`
-argument. The old binding called `DML_ACTIVATION_SOFTMAX`, which normalizes a
-flattened 2-D view and fails outright on the 4-D score matrix attention produces;
-`DML_ACTIVATION_SOFTMAX1` takes axes and does the right thing.
+**And one reshape strides cannot express.** Splitting attention heads is a stride
+trick -- `[1, 1, T, C]` read as `[1, heads, T, C/heads]` -- but putting them back
+is not. An output channel index decomposes into a head and an offset inside it,
+and an index that divides another index is not a stride. So `merge_heads()` views
+the buffer as `[1, T, heads, dim]`, which *is* affine, lets an identity operator
+write that out packed, and then the last reshape is free. One copy per attention
+block, and only in that direction.
+
+Two operators had to be bound for this sample. `activation_softmax` gained an
+`axes` argument: the old binding called `DML_ACTIVATION_SOFTMAX`, which normalizes
+a flattened 2-D view and fails outright on the 4-D score matrix attention
+produces, where `DML_ACTIVATION_SOFTMAX1` takes axes and does the right thing.
+`activation_gelu` is the exact erf form, which is what both the UNet's GEGLU and
+OpenCLIP's MLP were trained with.
+
+## The text encoders
+
+SDXL conditions on two CLIP towers at once: ViT-L/14 (768 wide, 12 layers) and
+OpenCLIP ViT-bigG/14 (1280 wide, 32 layers). Their per-token outputs concatenate
+into the 77x2048 sequence the UNet cross-attends to, and bigG contributes a
+pooled 1280-wide vector that joins the timestep embedding.
+
+Three details are easy to get wrong and nothing will complain:
+
+- The embeddings SDXL uses are the **penultimate** layer's output, and the final
+  layer norm is not applied to them. It is applied to the last layer's output,
+  which is where the pooled vector comes from. So ViT-L only runs 11 of its 12
+  layers here -- its pooled output is never used.
+- The two towers use different activations. ViT-L was trained with QuickGELU,
+  `x * sigmoid(1.702x)`; bigG uses real GELU.
+- The two tokenizers pad differently. The first pads with the end-of-text token,
+  the second with 0. Pooling finds the real end-of-text either way by taking the
+  highest token id, which is what CLIP itself does.
+
+Tokenizing is `transformers.CLIPTokenizer`. BPE over a 49408-entry vocabulary is
+string processing, not a DirectML concern, and transformers ships its tokenizers
+without needing PyTorch -- nothing in this repository does.
+
+Both towers together are 817 million parameters, 518 graph inputs for bigG alone,
+and they encode a prompt in about 290 ms. That happens once per prompt rather
+than once per sampling step, so it is not where a generation spends its time.
+
+Checking them turned up a bug in the bindings that had nothing to do with CLIP.
+Buffers grew by rounding up to the next power of two, so bigG's 2.78 GiB of
+weights asked for a 4 GiB single resource -- and allocating that removed the
+device outright, `DXGI_ERROR_DEVICE_REMOVED`, with no other symptom. The
+threshold was exactly where the rounding crosses 2 GiB: 2.00 GiB of weights
+worked and 2.07 GiB did not. Buffers past 256 MiB now grow by a fixed step
+instead.
 
 ## The sampler
 
@@ -102,52 +150,35 @@ clean latent to 3e-6.
 `sample(scheduler, denoiser, latents)` takes any callable as the denoiser. The
 UNet drops in there.
 
-## What the UNet needs
+## What is left
 
-The UNet is 2.6 billion parameters against the VAE's 84 million. Two things in
-the bindings stood in the way of ever running it; both are fixed now.
+Only the UNet. It is 2.6 billion parameters against the text encoders' 817
+million and the VAE's 84 million, and it is the same building blocks as both plus
+cross-attention. Two things in the bindings stood in the way of ever running
+something that size; both are fixed now.
 
 **Weights stay on the GPU.** `Device::Compute` used to run the operator
 initializer on every call, so nothing could be uploaded once and reused.
 Initialization and dispatch are separate now, and the persistent resource -- the
 buffer DirectML folds `OWNED_BY_DML` weights into -- belongs to the model rather
-than to the device, so two models can be live at the same time. `compile()` in
-`dml_layers.py` initializes; `run()` only dispatches. Repeated 512x512 decoding
-went from 0.33 s to 0.16 s, and repeated 1024x1024 from 1.09 s to 0.70 s. The
-weight-residency half of that is small here because the VAE is only 320 MiB; the
-UNet is 10.3 GiB at float32 and a 20-step run with classifier-free guidance is 40
-dispatches, which is where it stops being a rounding error.
+than to the device, so several models can be live at once, which is what lets the
+two text encoders and the VAE share a device. `compile()` in `dml_layers.py`
+initializes; `run()` only dispatches. Repeated 512x512 decoding went from 0.33 s
+to 0.16 s, and repeated 1024x1024 from 1.09 s to 0.70 s. The weight-residency
+half of that is small at the VAE's 320 MiB; the UNet is 10.3 GiB at float32 and a
+20-step run with classifier-free guidance is 40 dispatches, which is where it
+stops being a rounding error.
 
 **Half precision works.** A tensor's declared `TensorDataType` is honored end to
 end, so float16 weights load as float16 and results come back as float16. The
 SDXL UNet is 5.2 GiB at half precision against 10.3 GiB at single, which is the
 difference between fitting on a 16 GiB card with room for activations and not.
-`samples/dtypes.py` shows both. This sample stays at float32: the SDXL VAE is
-known to overflow in float16, which is why `madebyollin/sdxl-vae-fp16-fix`
+`samples/dtypes.py` shows both. This sample stays at float32 throughout: the SDXL
+VAE is known to overflow in float16, which is why `madebyollin/sdxl-vae-fp16-fix`
 exists.
 
-**Every operator it needs is bound.** `activation_gelu` was the last gap -- the
-UNet's GEGLU feed-forward and OpenCLIP ViT-bigG's MLP both want it, and it is the
-exact erf form rather than the tanh approximation, which is what those two use.
-CLIP ViT-L's QuickGELU is `x * sigmoid(1.702x)` and needs nothing new. Everything
-else the UNet and the text encoders reach for was already there:
-
-| | |
-| --- | --- |
-| Multi-head attention | `reinterpret` to `[1, heads, tokens, dim]`, batched `gemm`, `activation_softmax` |
-| Cross-attention | the same, with keys and values from the text embeddings |
-| LayerNorm | `mean_variance_normalization` over the last axis, affine after |
-| GEGLU | two `slice` calls for the halves, then `activation_gelu` and `multiply` |
-| Token embedding | `gather` with a uint32 index tensor, which needed the dtype fix |
-| Timestep embedding | sinusoidal on the CPU, then `gemm` and SiLU |
-| Skip connections | `join` on the channel axis |
-
-What is left is scale, not capability:
-
-- The two text encoders (CLIP ViT-L and OpenCLIP ViT-bigG, 817 million
-  parameters between them) and a BPE tokenizer.
-- The UNet itself, which is the same building blocks as the VAE plus
-  cross-attention, at forty times the parameter count.
-- A way to drop a weight's CPU copy. `Binding` keeps one for the lifetime of the
-  model even after DirectML has taken the data, which is fine for 320 MiB and not
-  for 10.3 GiB.
+One thing still wants fixing before the UNet: `Binding` keeps a CPU copy of every
+weight for the lifetime of the model, even after DirectML has taken the data.
+`compile()` drops the arrays the graph was built from, which is 2.8 GiB back for
+bigG, but the Binding copies need a change on the C++ side. Fine at 320 MiB, not
+fine at 10.3 GiB.

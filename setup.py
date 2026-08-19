@@ -70,7 +70,9 @@ setup(
     keywords='DirectML Python samples',
     setup_requires=['cmake'],
     # What the samples under samples/ need: NumPy everywhere, Pillow for the
-    # image samples, and the hub and safetensors readers for the SDXL sample.
-    extras_require={'dev': ['numpy', 'pillow', 'safetensors', 'huggingface_hub']},
+    # image samples, and for the SDXL sample the hub and safetensors readers plus
+    # transformers, whose CLIP tokenizer it uses. None of these pull in PyTorch.
+    extras_require={'dev': ['numpy', 'pillow', 'safetensors', 'huggingface_hub',
+                            'transformers']},
     zip_safe=False
 )

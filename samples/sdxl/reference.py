@@ -10,6 +10,7 @@ Layer for layer this mirrors ``vae.py``; read the two side by side.
 
 import numpy as np
 
+import text_encoder
 from vae import (
     BLOCK_OUT_CHANNELS, LATENT_CHANNELS, LAYERS_PER_BLOCK, NORM_EPSILON,
     NORM_GROUPS)
@@ -132,3 +133,76 @@ def encode(image, params):
     h = conv2d(silu(h), params["encoder.conv_out.weight"], params["encoder.conv_out.bias"])
     moments = conv2d(h, params["quant_conv.weight"], params["quant_conv.bias"], padding=0)
     return moments[:, :LATENT_CHANNELS]
+
+
+# --- Text encoders ---------------------------------------------------------
+
+# Abramowitz and Stegun 7.1.26. NumPy has no erf and calling math.erf through
+# np.vectorize would take twenty seconds over bigG's activations; this is within
+# 1.5e-7, well under float32's resolution at these magnitudes.
+_ERF_COEFFICIENTS = (0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429)
+
+
+def erf(x):
+    sign = np.sign(x)
+    t = 1.0 / (1.0 + 0.3275911 * np.abs(x))
+    series = sum(c * t ** (i + 1) for i, c in enumerate(_ERF_COEFFICIENTS))
+    return sign * (1.0 - series * np.exp(-x * x))
+
+
+def gelu(x):
+    return x * 0.5 * (1.0 + erf(x / np.sqrt(2.0)))
+
+
+def quick_gelu(x):
+    return x / (1.0 + np.exp(-1.702 * x))
+
+
+def layer_norm(x, weight, bias, epsilon=text_encoder.LAYER_NORM_EPSILON):
+    mean = x.mean(axis=-1, keepdims=True)
+    variance = x.var(axis=-1, keepdims=True)
+    return (x - mean) / np.sqrt(variance + epsilon) * weight + bias
+
+
+def multi_head_attention(x, params, prefix, heads, mask):
+    tokens, channels = x.shape
+    dim = channels // heads
+
+    def project(name):
+        p = linear(x, params[f"{prefix}.{name}.weight"], params[f"{prefix}.{name}.bias"])
+        return p.reshape(tokens, heads, dim).transpose(1, 0, 2)
+
+    query, key, value = (project(n) for n in ("q_proj", "k_proj", "v_proj"))
+    scores = query @ key.transpose(0, 2, 1) / np.sqrt(dim) + mask
+    attended = softmax(scores) @ value
+
+    merged = attended.transpose(1, 0, 2).reshape(tokens, channels)
+    return linear(merged, params[f"{prefix}.out_proj.weight"], params[f"{prefix}.out_proj.bias"])
+
+
+def encode_text(ids, params, config):
+    """The NumPy twin of text_encoder.build_text_encoder."""
+    layers, heads = config["layers"], config["heads"]
+    activation = quick_gelu if config["activation"] == "quick_gelu" else gelu
+    wants_pooled = config["projection"] is not None
+
+    x = params["text_model.embeddings.token_embedding.weight"][ids]
+    x = x + params["text_model.embeddings.position_embedding.weight"][:len(ids)]
+    mask = text_encoder.causal_mask(len(ids))[0, 0]
+
+    penultimate = None
+    for i in range(layers if wants_pooled else layers - 1):
+        prefix = f"text_model.encoder.layers.{i}"
+        x = x + multi_head_attention(
+            layer_norm(x, params[f"{prefix}.layer_norm1.weight"], params[f"{prefix}.layer_norm1.bias"]),
+            params, f"{prefix}.self_attn", heads, mask)
+        h = layer_norm(x, params[f"{prefix}.layer_norm2.weight"], params[f"{prefix}.layer_norm2.bias"])
+        h = activation(linear(h, params[f"{prefix}.mlp.fc1.weight"], params[f"{prefix}.mlp.fc1.bias"]))
+        x = x + linear(h, params[f"{prefix}.mlp.fc2.weight"], params[f"{prefix}.mlp.fc2.bias"])
+        if i == layers - 2:
+            penultimate = x
+
+    if not wants_pooled:
+        return [penultimate]
+    return [penultimate, layer_norm(x, params["text_model.final_layer_norm.weight"],
+                                    params["text_model.final_layer_norm.bias"])]

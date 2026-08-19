@@ -11,7 +11,13 @@
 inline void ThrowIfFailed(HRESULT hr)
 {
     if (FAILED(hr))
-        throw std::exception();
+    {
+        // Without the code this surfaces in Python as "Unknown exception", which
+        // says nothing about whether a device call failed or an allocation did.
+        char message[32];
+        snprintf(message, sizeof(message), "HRESULT 0x%08X", static_cast<unsigned int>(hr));
+        throw std::runtime_error(message);
+    }
 }
 
 inline void ThrowIfNull(void* p)
@@ -266,4 +272,21 @@ T RoundUpToPow2(T value)
     }
 
     return pow2;
+}
+
+// How large a buffer to actually allocate for a request. Doubling keeps repeated
+// small growth from reallocating every time, but past a gigabyte it both wastes
+// hundreds of megabytes and walks into a wall: a 2.1 GiB request rounds to a
+// 4 GiB single resource, which removes the device outright (DXGI_ERROR_DEVICE_REMOVED)
+// on at least some drivers. Above the step size, grow by a fixed amount instead.
+inline uint64_t GrowBufferSize(uint64_t requestedSizeInBytes)
+{
+    constexpr uint64_t minimumSizeInBytes = 65536;         // 64 KiB
+    constexpr uint64_t stepSizeInBytes = 256ull << 20;     // 256 MiB
+
+    if (requestedSizeInBytes <= stepSizeInBytes)
+    {
+        return std::max(RoundUpToPow2(requestedSizeInBytes), minimumSizeInBytes);
+    }
+    return RoundUpToMultiple(requestedSizeInBytes, stepSizeInBytes);
 }

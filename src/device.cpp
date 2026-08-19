@@ -601,8 +601,7 @@ void Device::ExecuteCommandListAndWait()
 void Device::EnsureUploadHeapSize(uint64_t requestedSizeInBytes)
 {
     uint64_t existingSize = m_uploadHeap ? m_uploadHeap->GetResource()->GetDesc().Width : 0;
-    uint64_t newSize = RoundUpToPow2(requestedSizeInBytes);     // ensures geometric growth
-    newSize = std::max(newSize, static_cast<uint64_t>(65536));  // Minimum size of 64k
+    uint64_t newSize = GrowBufferSize(requestedSizeInBytes);
 
     if (newSize != existingSize)
     {
@@ -631,8 +630,7 @@ void Device::EnsureCpuOrDefaultBufferSize(uint64_t requestedSizeInBytes, _Inout_
 void Device::EnsureCpuBufferSize(uint64_t requestedSizeInBytes, _Inout_ ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer)
 {
     uint64_t existingSize = buffer ? buffer->GetResource()->GetDesc().Width : 0;
-    uint64_t newSize = RoundUpToPow2(requestedSizeInBytes);     // ensures geometric growth
-    newSize = std::max(newSize, static_cast<uint64_t>(65536));  // Minimum size of 64k
+    uint64_t newSize = GrowBufferSize(requestedSizeInBytes);
 
     if (newSize != existingSize)
     {
@@ -646,8 +644,7 @@ void Device::EnsureCpuBufferSize(uint64_t requestedSizeInBytes, _Inout_ ComPtr<g
 void Device::EnsureDefaultBufferSize(uint64_t requestedSizeInBytes, _Inout_ ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer)
 {
     uint64_t existingSize = buffer ? buffer->GetResource()->GetDesc().Width : 0;
-    uint64_t newSize = RoundUpToPow2(requestedSizeInBytes);     // ensures geometric growth
-    newSize = std::max(newSize, static_cast<uint64_t>(65536));  // Minimum size of 64k
+    uint64_t newSize = GrowBufferSize(requestedSizeInBytes);
 
     if (newSize != existingSize)
     {
@@ -695,8 +692,7 @@ void Device::EnsureDescriptorHeapSize(uint32_t requestedSizeInDescriptors)
 void Device::EnsureReadBackHeapSize(uint64_t requestedSizeInBytes)
 {
     uint64_t existingSize = m_readbackHeap ? m_readbackHeap->GetResource()->GetDesc().Width : 0;
-    uint64_t newSize = RoundUpToPow2(requestedSizeInBytes); // ensures geometric growth
-    newSize = std::max(newSize, static_cast<uint64_t>(65536)); // Minimum size of 64k
+    uint64_t newSize = GrowBufferSize(requestedSizeInBytes);
 
     if (newSize != existingSize)
     {
