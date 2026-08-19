@@ -24,10 +24,13 @@ the usual `~/.cache/huggingface` directory.
 `roundtrip.py` pushes an image through the encoder and back through the decoder.
 On a Radeon RX 6800:
 
-| Size | Encode | Decode | PSNR |
-| --- | --- | --- | --- |
-| 512x512 | 0.6 s | 0.5 s | 34.1 dB |
-| 1024x1024 | 4.6 s | 9.8 s | 36.3 dB |
+| Size | Encode | Decode | Decode, repeated | PSNR |
+| --- | --- | --- | --- | --- |
+| 512x512 | 0.1 s | 0.3 s | 0.16 s | 34.1 dB |
+| 1024x1024 | 0.7 s | 1.0 s | 0.70 s | 36.3 dB |
+
+The first dispatch pays for buffer allocation and meta-command setup, so a
+sampling loop runs at the repeated column, not the first one.
 
 That PSNR is the ceiling on any SDXL output: whatever the UNet produces still has
 to survive the trip through this decoder.
@@ -73,11 +76,10 @@ not pixels: `[1, C, H, W]` read as `[1, 1, H*W, C]` with strides
 whole attention block is four matrix multiplies and a softmax, and the reshapes
 around them are free.
 
-The one binding change this sample needed was `activation_softmax`, which now
-takes an `axes` argument. The old binding called `DML_ACTIVATION_SOFTMAX`, which
-normalizes a flattened 2-D view and fails outright on the 4-D score matrix
-attention produces; `DML_ACTIVATION_SOFTMAX1` takes axes and does the right
-thing.
+The one operator this sample had to add was `activation_softmax` with an `axes`
+argument. The old binding called `DML_ACTIVATION_SOFTMAX`, which normalizes a
+flattened 2-D view and fails outright on the 4-D score matrix attention produces;
+`DML_ACTIVATION_SOFTMAX1` takes axes and does the right thing.
 
 ## The sampler
 
@@ -102,27 +104,36 @@ UNet drops in there.
 
 ## What the UNet needs
 
-The UNet is 2.6 billion parameters against the VAE's 84 million, and two things
-in the bindings have to change before it is worth writing.
+The UNet is 2.6 billion parameters against the VAE's 84 million. Two things in
+the bindings stood in the way of ever running it; both are fixed now.
 
-**Weights are re-uploaded on every dispatch.** `Device::Compute` calls
-`InitializeOperator` and `DispatchOperator` together on each call
-(`src/device.cpp:141`), with a comment conceding the point. For the VAE that is
-320 MiB once and does not matter. A 20-step run with classifier-free guidance is
-40 UNet dispatches, so at float32 it is 10.3 GiB crossing PCIe forty times.
-Splitting initialization from dispatch, so `DML_TENSOR_FLAG_OWNED_BY_DML` weights
-stay resident, is the prerequisite.
+**Weights stay on the GPU.** `Device::Compute` used to run the operator
+initializer on every call, so nothing could be uploaded once and reused.
+Initialization and dispatch are separate now, and the persistent resource -- the
+buffer DirectML folds `OWNED_BY_DML` weights into -- belongs to the model rather
+than to the device, so two models can be live at the same time. `compile()` in
+`dml_layers.py` initializes; `run()` only dispatches. Repeated 512x512 decoding
+went from 0.33 s to 0.16 s, and repeated 1024x1024 from 1.09 s to 0.70 s. The
+weight-residency half of that is small here because the VAE is only 320 MiB; the
+UNet is 10.3 GiB at float32 and a 20-step run with classifier-free guidance is 40
+dispatches, which is where it stops being a rounding error.
 
-**Everything is float32.** `Binding` takes a `py::array_t<float>`
-(`src/module.cpp:172`) and `TensorData` hands results back as float32
-(`src/model.h:41`), so a float16 checkpoint is widened on load. The SDXL UNet is
-10.3 GiB at float32 against 5.2 GiB at float16, and 16 GiB cards have to hold
-activations too. This is also `docs/api-design.md` §3.2, which wants the dtype
-honored for correctness reasons independent of SDXL.
+**Half precision works.** A tensor's declared `TensorDataType` is honored end to
+end, so float16 weights load as float16 and results come back as float16. The
+SDXL UNet is 5.2 GiB at half precision against 10.3 GiB at single, which is the
+difference between fitting on a 16 GiB card with room for activations and not.
+`samples/dtypes.py` shows both. This sample stays at float32: the SDXL VAE is
+known to overflow in float16, which is why `madebyollin/sdxl-vae-fp16-fix`
+exists.
 
-Beyond that the UNet needs the two text encoders (CLIP ViT-L and OpenCLIP
-ViT-bigG, 817 million parameters between them) and a BPE tokenizer. Its
-cross-attention and timestep embeddings are expressible with what is bound
-today; its GEGLU feed-forward is not, and neither is the text encoders' GELU.
-Both want `dml::ActivationGelu` or `dml::Erf`, which DirectMLX has
-(`third_party/DirectMLX.h:1658`, `:1958`) and `module.cpp` does not bind yet.
+What is left is scale and coverage rather than capability:
+
+- The two text encoders (CLIP ViT-L and OpenCLIP ViT-bigG, 817 million
+  parameters between them) and a BPE tokenizer.
+- `dml::ActivationGelu` or `dml::Erf`, which DirectMLX has
+  (`third_party/DirectMLX.h:1658`, `:1958`) and `module.cpp` does not bind. The
+  UNet's GEGLU feed-forward and the text encoders' GELU both need one of them.
+  Cross-attention and timestep embeddings are already expressible.
+- A way to drop a weight's CPU copy. `Binding` keeps one for the lifetime of the
+  model even after DirectML has taken the data, which is fine for 320 MiB and not
+  for 10.3 GiB.

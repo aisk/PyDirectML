@@ -19,6 +19,21 @@ namespace pydml
         {}
 
         Microsoft::WRL::ComPtr<IDMLCompiledOperator> op;
+
+        // The allocator that made persistentResource. gpgmm hands the memory back
+        // to it on release, and Python is free to destroy the Device before the
+        // Model, so the allocation keeps its allocator alive. Declared first so it
+        // is destroyed last.
+        Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocator> allocator;
+
+        // Written by Device::Initialize. DirectML folds the DML_TENSOR_FLAG_OWNED_BY_DML
+        // inputs into this buffer -- reordered into whatever layout the operator
+        // wants -- and reads them from here on every dispatch. Owning it per
+        // operator rather than per device is what lets those weights stay on the
+        // GPU across dispatches instead of being re-uploaded each time.
+        Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> persistentResource;
+        uint64_t persistentResourceSize = 0;
+        bool initialized = false;
     };
 
     struct TensorData
@@ -39,8 +54,8 @@ namespace pydml
         }
 
         TensorData(dml::TensorDesc* desc) :
-            itemSize(sizeof(float)),
-            format(py::format_descriptor<float>::format()),
+            itemSize(GetDataType(desc->dataType).itemSize),
+            format(GetDataType(desc->dataType).format),
             dimensions(desc->sizes.size())
         {
             for (auto size : desc->sizes)
@@ -101,7 +116,22 @@ namespace pydml
         explicit Binding(dml::Expression& expression, py::buffer_info const& info)
             :   desc(expression.GetOutputDesc()),
                 data(info)
-        {}
+        {
+            auto required = static_cast<size_t>(desc.AsPtr<DML_BUFFER_TENSOR_DESC>()->TotalTensorSizeInBytes);
+
+            if (data.buffer.size() > required)
+            {
+                throw std::invalid_argument(
+                    "array of " + std::to_string(data.buffer.size()) +
+                    " bytes does not fit a tensor of " + std::to_string(required) + " bytes");
+            }
+
+            // DirectML rounds a tensor's size up to a 4-byte boundary, so a packed
+            // array can come up a few bytes short. Device::Dispatch copies
+            // TotalTensorSizeInBytes out of this buffer, so pad it rather than let
+            // that copy read past the end.
+            data.buffer.resize(required);
+        }
 
         Binding() = default;
 

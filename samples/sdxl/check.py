@@ -62,6 +62,12 @@ def main():
     encoded, = encoder.run(image)
     passed &= report("encode", encoded, reference.encode(image, params))
 
+    # Each model owns its persistent resource, which holds the weights DirectML
+    # took at initialization. Initializing the encoder must not disturb the
+    # decoder's copy -- it did when that buffer belonged to the device.
+    print("Decoder again, now that the encoder is initialized too")
+    passed &= report("decode", decoder.run(latent)[0], decoded)
+
     return 0 if passed else 1
 
 

@@ -15,8 +15,26 @@ namespace pydml
     public:
         explicit Device(bool useGpu = true, bool useDebugLayer = false, DXGI_GPU_PREFERENCE gpuPreference = DXGI_GPU_PREFERENCE_UNSPECIFIED);
 
+        // Bind the DML_TENSOR_FLAG_OWNED_BY_DML inputs and run the operator
+        // initializer, leaving the result in the model's persistent resource.
+        // Once done, those inputs live on the GPU and dispatching does not touch
+        // them again.
+        void Initialize(
+            pydml::CompiledModel& model,
+            std::vector<pydml::Binding*>& inputs
+            );
+
+        // Upload the inputs that are not owned by DirectML, run the operator, and
+        // read the outputs back. Requires an initialized model.
+        std::vector<pydml::TensorData*> Dispatch(
+            pydml::CompiledModel& model,
+            std::vector<pydml::Binding*>& inputs,
+            std::vector<dml::Expression*>& outputs
+            );
+
+        // Initialize on first use, then dispatch.
         std::vector<pydml::TensorData*> Compute(
-            IDMLCompiledOperator* op,
+            pydml::CompiledModel& model,
             std::vector<pydml::Binding*>& inputs,
             std::vector<dml::Expression*>& outputs
             );
@@ -32,17 +50,6 @@ namespace pydml
         }
 
     protected:
-        void InitializeOperator(
-            IDMLCompiledOperator* op,
-            std::vector<pydml::Binding*>& inputs
-            );
-
-        std::vector<pydml::TensorData*> DispatchOperator(
-            IDMLCompiledOperator* op,
-            std::vector<pydml::Binding*>& inputs,
-            std::vector<dml::Expression*>& outputs
-            );
-
         void RecordOutputReadBack(uint64_t outputsResourceSize);
 
         std::vector<pydml::TensorData*> DownloadFromReadBackHeap(
@@ -97,12 +104,13 @@ namespace pydml
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_uploadHeap;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_readbackHeap;
 
-        // DEFAULT heap buffers to hold input tensors, output tensors, and temporary and persistent resources. The input
+        // DEFAULT heap buffers to hold input tensors, output tensors, and temporary resources. The input
         // and output resources are suballocated for operators that have multiple inputs or outputs.
+        // The persistent resource is not here: it belongs to the CompiledModel, so that one model's
+        // initialized weights survive another model being initialized on the same device.
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_inputsResource;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_outputsResource;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_temporaryResource;
-        Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_persistentResource;
 
         gpgmm::d3d12::ResidencySet m_residencySet;
 

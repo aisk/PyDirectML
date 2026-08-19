@@ -8,7 +8,7 @@
 
 **非目标 —— 明确不做的事**：
 
-- 不做大规模重构。C++ 侧的 `Device` / `CompiledModel` / `Binding` / `TensorData` 结构不动。
+- 不做大规模重构。C++ 侧的 `Device` / `CompiledModel` / `Binding` / `TensorData` 结构不动。（**这条后来推翻了**，见 §3.13：persistent resource 必须从 `Device` 移到 `CompiledModel`，否则「初始化一次、之后只分派」做不成。）
 - 不引入新抽象。**概念映射保持 1:1**：`dml::Graph`、`dml::Expression`、`dml::TensorDesc`、`IDMLCompiledOperator`、`DML_BUFFER_BINDING` 在 Python 侧各自仍然只有一个对应类型。不做 Keras 式的 `Layer` / `Sequential`，不做自动求导，不做算子融合的语法糖。
 - 不追求补齐算子覆盖。当前只绑定了约 25 个算子，DirectMLX 有上百个；那是另一件事。
 - 不加 Python 包装层。全部改动落在 `module.cpp` / `model.h` / `device.cpp`，扩展模块保持顶层单文件。理由见 §4。
@@ -53,7 +53,7 @@
 
 **改进**：全部去掉 `export_values()`，只保留 `dml.TensorFlags.NONE` 这种带作用域的写法。所有 sample 已经是这么写的（`dml.TensorDataType.FLOAT32`、`dml.PaddingMode.REFLECTION`），没有一处依赖平铺名，所以这是零成本改动。
 
-### 3.2 `Binding` 把任何 dtype 强制转成 float32
+### 3.2 `Binding` 把任何 dtype 强制转成 float32 【已落地】
 
 ```cpp
 // module.cpp:172
@@ -82,6 +82,18 @@ TensorData(dml::TensorDesc* desc) :
 **校验要放行安全转换**。`mnist.py:46` 的 `np.zeros(tensor.get_output_desc().sizes)` 产生的是 float64，forcecast 成 float32 是**正确**的；一刀切拒绝会让现在正确的代码报错。用 `np.can_cast(arr.dtype, target, 'same_kind')` 放行、其余抛 `TypeError` 并写明期望的 dtype，是合适的粒度。跨类别的（int32 → float32）必须显式写 `arr.astype(...)`。
 
 这是**唯一的内存安全问题**，优先级最高。
+
+**落地时的一处修正**：上面写的 `np.can_cast(arr.dtype, target, 'same_kind')` 达不到本节自己要的粒度。NumPy 的 `same_kind` 除了「同类别内的窄化」，还放行**向上跨类别**的转换，`np.can_cast(int32, float32, 'same_kind')` 返回 `True` —— 正好是本节点名要拦住的那一个。实际落地的判据是「**同 kind，或者 NumPy 认为 safe**」：
+
+| from → to | 同 kind | safe | `same_kind` | 实际 |
+| --- | --- | --- | --- | --- |
+| float64 → float32 | 是 | 否 | 是 | 放行（`np.zeros` 的默认 dtype，必须放行） |
+| float32 → float16 | 是 | 否 | 是 | 放行（半精度权重靠这条加载） |
+| uint8 → float32 | 否 | 是 | 是 | 放行（保值） |
+| int32 → float32 | 否 | 否 | **是** | **拒绝**，要显式 `astype` |
+| float32 → int32 | 否 | 否 | 否 | 拒绝 |
+
+另外补了一条本节没提到的越界：`Binding` 现在校验数组字节数不超过 `TotalTensorSizeInBytes`，并把缓冲区补齐到该长度。原先 `device.cpp` 是按 `TotalTensorSizeInBytes` 从数组里 `memcpy` 的，只有一句 `assert` 挡着 —— 而 `assert` 在 Release 下是空的。
 
 ### 3.3 布尔和标量的裸位置参数
 
@@ -308,6 +320,39 @@ DirectMLX 的 `FusedActivation` 本身带 18 个静态工厂 —— 无参的 `N
 ### 3.12 `average_pooling` 漏绑了 `output_sizes`
 
 `dml::AveragePooling` 的最后一个参数是 `TensorDimensions outputSizes = {}`（`DirectMLX.h:2348`），绑定里没有（`module.cpp:488-505`）。`convolution` 就绑了对应的 `output_sizes`。纯遗漏，补上即可。
+
+### 3.13 `compute` 每次调用都重跑一遍初始化 【已落地，且推翻了 §1 的一条非目标】
+
+`Device::Compute` 把初始化和分派绑在一起，注释自己也说了这是权宜之计：
+
+```cpp
+// device.cpp:141
+// Ideally initialize only needs to happen once while dispatch occurs every time a new input is bound.
+// But for now, we'll do both in one go for each compute call for simplicity.
+InitializeOperator(op, inputs);
+return DispatchOperator(op, inputs, outputs);
+```
+
+初始化是**每个算子一次**的事：它读走带 `DML_TENSOR_FLAG_OWNED_BY_DML` 的输入，让 DirectML 按自己想要的布局折进 persistent resource，之后每次分派都从那里读。重跑它只是把同一批权重再传一遍。对现有 sample 无所谓 —— 它们都只 `compute` 一次；对任何要迭代的东西（扩散采样一次 20~50 步）就是主要成本。
+
+拦路的不是那两行，是 **`m_persistentResource` 挂在 `Device` 上**。它是单个缓冲区，初始化第二个算子会覆盖第一个算子的内容，所以「初始化一次、之后只分派」在同一个 device 上建两个模型时根本不成立。这正是 §1 里「`Device` / `CompiledModel` 结构不动」那条非目标要拦的改动 —— **这条非目标推翻了**，理由是不动结构就做不成这件事，而这件事挡着整个 `samples/sdxl/` 的第二阶段。
+
+落地的样子：
+
+- persistent resource 移到 `CompiledModel`，一并存 `initialized` 标志。`CompiledModel` 还要持有创建它的 `ResourceAllocator` —— gpgmm 释放 allocation 时要回到 allocator，而 Python 完全可能先销毁 `Device` 再销毁 `Model`（模块字典按插入顺序清理，sample 里 `device` 基本都先于 `op` 定义）。不持有就是退出时段错误。
+- `Device` 增加 `Initialize` / `Dispatch` 两个公开方法。`Compute` 保留，语义变成「没初始化过就先初始化，然后分派」，所以现有 sample 一行不改，白拿一次提速。
+- 代价是一条新契约：`OWNED_BY_DML` 张量的数据在**首次** `compute` 时被读走，之后改 `Binding` 不再生效，要重新 `initialize`。docstring 里写了。
+
+实测（RX 6800，`samples/sdxl` 解码，重复调用的稳态耗时，与改动前的二进制对比）：
+
+| 分辨率 | 改动前（每次 initialize + dispatch） | 改动后（只 dispatch） | |
+| --- | --- | --- | --- |
+| 512x512 | 0.33 s | 0.16 s | 2.1x |
+| 1024x1024 | 1.09 s | 0.70 s | 1.6x |
+
+拆开看，这里面**大头是不再重跑初始化，不是权重常驻**。在同一个二进制上只切换 `OWNED_BY_DML` 标志做对照：512 是 184 ms → 162 ms，1024 是 758 ms → 731 ms，也就是总收益里只占一两成。原因是标志位省的是「重传权重」，量级跟权重字节数走（VAE 只有 320 MiB）；而重跑初始化的开销跟图的规模走。UNet fp32 是 10.3 GiB，权重那一项要乘 32 倍，两项都会放大。
+
+注意别拿单次冷调用来算这笔账。冷调用里首次分派要付掉缓冲区分配和 meta-command 建立，1024 下能到 9 s 以上，两个版本都一样 —— 改动后它只是挪进了 `compile()` 且只付一次。
 
 ## 4. 决定不做的事
 

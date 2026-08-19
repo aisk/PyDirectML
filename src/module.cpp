@@ -169,8 +169,30 @@ PYBIND11_MODULE(directml, module)
     // Classes
     //
     py::class_<pydml::Binding>(module, "Binding")
-        .def(py::init([](dml::Expression& expression, py::array_t<float, py::array::c_style | py::array::forcecast> data) {
-            return new pydml::Binding(expression, data.request());
+        .def(py::init([](dml::Expression& expression, py::array data) {
+            auto const& type = GetDataType(expression.GetOutputDesc().dataType);
+            auto numpy = py::module_::import("numpy");
+            py::dtype target(type.numpyName);
+
+            // Narrowing within a kind is fine -- float64 to float32 is what
+            // np.zeros() lands on and the samples rely on it, float32 to float16
+            // is how half-precision weights get loaded -- and so is any cast NumPy
+            // calls safe. Crossing kinds any other way, int32 into a float32
+            // tensor above all, is the silent-wrong-answer case, and has to be
+            // spelled out with an explicit astype. NumPy's own 'same_kind' rule is
+            // no help here: it permits int32 to float32.
+            auto sameKind = data.dtype().kind() == target.kind();
+            auto safe = numpy.attr("can_cast")(data.dtype(), target, "safe").cast<bool>();
+
+            if (!sameKind && !safe)
+            {
+                throw std::invalid_argument(
+                    "cannot bind a " + py::str(data.dtype()).cast<std::string>() +
+                    " array to a " + type.numpyName + " tensor; convert it explicitly with astype()");
+            }
+
+            auto converted = numpy.attr("ascontiguousarray")(data, target).cast<py::array>();
+            return new pydml::Binding(expression, converted.request());
             }),
             py::arg("expr"),
             py::arg("data"));
@@ -180,12 +202,41 @@ PYBIND11_MODULE(directml, module)
             py::arg("use_gpu") = true,
             py::arg("use_debug_layer") = false)
         .def("compute", [](
-            pydml::Device& self, 
-            pydml::CompiledModel* model,
+            pydml::Device& self,
+            pydml::CompiledModel& model,
             std::vector<pydml::Binding*> inputs,
             std::vector<dml::Expression*> outputs) {
-                return self.Compute(model->op.Get(), inputs, outputs);
-            }, "Calculate the output of the operator from the input data.")
+                return self.Compute(model, inputs, outputs);
+            },
+            "Calculate the output of the operator from the input data. Initializes "
+            "the model on the first call, so a tensor flagged OWNED_BY_DML is read "
+            "once and then lives on the GPU; rebind one and call initialize() to "
+            "make the new data take effect.",
+            py::arg("model"),
+            py::arg("inputs"),
+            py::arg("outputs"))
+        .def("initialize", [](
+            pydml::Device& self,
+            pydml::CompiledModel& model,
+            std::vector<pydml::Binding*> inputs) {
+                self.Initialize(model, inputs);
+            },
+            "Upload the tensors flagged OWNED_BY_DML and initialize the model. Only "
+            "those tensors are read; the rest are bound per dispatch.",
+            py::arg("model"),
+            py::arg("inputs"))
+        .def("dispatch", [](
+            pydml::Device& self,
+            pydml::CompiledModel& model,
+            std::vector<pydml::Binding*> inputs,
+            std::vector<dml::Expression*> outputs) {
+                return self.Dispatch(model, inputs, outputs);
+            },
+            "Run an initialized model. Uploads only the tensors that are not owned "
+            "by DirectML.",
+            py::arg("model"),
+            py::arg("inputs"),
+            py::arg("outputs"))
         .def("__repr__",
             [](pydml::Device const& device) {
                 return "dml.Device on " + std::string(device.UseGpu() ? "GPU" : "CPU");

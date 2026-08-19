@@ -133,23 +133,34 @@ Device::Device(bool useGpu, bool useDebugLayer, DXGI_GPU_PREFERENCE gpuPreferenc
 }
 
 std::vector<pydml::TensorData*> Device::Compute(
-    IDMLCompiledOperator* op,
+    pydml::CompiledModel& model,
     std::vector<pydml::Binding*>& inputs,
     std::vector<dml::Expression*>& outputs
     )
 {
-    // Ideally initialize only needs to happen once while dispatch occurs every time a new input is bound.
-    // But for now, we'll do both in one go for each compute call for simplicity.
-    InitializeOperator(op, inputs);
-    return DispatchOperator(op, inputs, outputs);
+    // Initialization is per operator, not per dispatch: it reads the inputs flagged
+    // OWNED_BY_DML once and folds them into the model's persistent resource, where
+    // they stay. Running it again would only re-upload the same weights.
+    if (!model.initialized)
+    {
+        Initialize(model, inputs);
+    }
+    return Dispatch(model, inputs, outputs);
 }
 
-std::vector<pydml::TensorData*> Device::DispatchOperator(
-    IDMLCompiledOperator* op,
+std::vector<pydml::TensorData*> Device::Dispatch(
+    pydml::CompiledModel& model,
     std::vector<pydml::Binding*>& inputs,
     std::vector<dml::Expression*>& outputs
     )
 {
+    if (!model.initialized)
+    {
+        throw std::invalid_argument("the model must be initialized before it is dispatched");
+    }
+
+    IDMLCompiledOperator* op = model.op.Get();
+
     std::vector<DmlBufferBinding> inputBindings(inputs.size());
     uint64_t inputsResourceSize = 0;
 
@@ -228,7 +239,7 @@ std::vector<pydml::TensorData*> Device::DispatchOperator(
     }
 
     // The persistent resource should have already been initialized when the operator was initialized
-    assert(m_persistentResource->GetResource()->GetDesc().Width >= bindingProps.PersistentResourceSize);
+    assert(model.persistentResource->GetResource()->GetDesc().Width >= bindingProps.PersistentResourceSize);
 
     // Upload inputs for execution
     std::vector<ID3D12Resource*> buffersToClear =
@@ -260,7 +271,7 @@ std::vector<pydml::TensorData*> Device::DispatchOperator(
             void* dest = uploadHeapData + inputBindings[i].offset;
             const void* src = inputs[i]->data.Get();
 
-            assert(inputs[i]->data.Size() == bufferDesc.totalTensorSizeInBytes);
+            assert(inputs[i]->data.buffer.size() == bufferDesc.totalTensorSizeInBytes);
 
             memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
         }
@@ -319,7 +330,7 @@ std::vector<pydml::TensorData*> Device::DispatchOperator(
     // Bind persistent/temporary resources
     if (bindingProps.PersistentResourceSize != 0)
     {
-        DML_BUFFER_BINDING persistentBinding = { m_persistentResource->GetResource(), 0, bindingProps.PersistentResourceSize };
+        DML_BUFFER_BINDING persistentBinding = { model.persistentResource->GetResource(), 0, bindingProps.PersistentResourceSize };
         auto bindingDesc = DML_BINDING_DESC { DML_BINDING_TYPE_BUFFER, &persistentBinding };
         m_bindingTable->BindPersistentResource(&bindingDesc);
     }
@@ -410,11 +421,13 @@ std::vector<pydml::TensorData*> Device::DownloadFromReadBackHeap(
     return outputData;
 }
 
-void Device::InitializeOperator(
-    IDMLCompiledOperator* op,
+void Device::Initialize(
+    pydml::CompiledModel& model,
     std::vector<pydml::Binding*>& inputs
     )
 {
+    IDMLCompiledOperator* op = model.op.Get();
+
     // Allocate resources for initialization
     ThrowIfFailed(m_operatorInitializer->Reset(1, &op));
 
@@ -455,8 +468,11 @@ void Device::InitializeOperator(
     EnsureUploadHeapSize(inputsResourceSize);
     EnsureCpuOrDefaultBufferSize(inputsResourceSize, m_inputsResource);
     EnsureDefaultBufferSize(temporaryResourceSize, m_temporaryResource);
-    EnsureDefaultBufferSize(persistentResourceSize, m_persistentResource);
+    model.allocator = m_resourceAllocator;
+    EnsureDefaultBufferSize(persistentResourceSize, model.persistentResource);
     EnsureDescriptorHeapSize(descriptorHeapSize);
+
+    model.persistentResourceSize = persistentResourceSize;
 
     // Set up the bindings to point to our input resource
     for (auto& binding : inputBinding.bindings)
@@ -472,7 +488,7 @@ void Device::InitializeOperator(
     {
         m_inputsResource->GetResource(),
         m_temporaryResource->GetResource(),
-        m_persistentResource->GetResource()
+        model.persistentResource->GetResource()
     };
 
     ClearGpuBuffers(buffersToClear);
@@ -497,7 +513,7 @@ void Device::InitializeOperator(
             void* dest = uploadHeapData + inputBinding.bindings[i].offset;
             const void* src = inputs[i]->data.Get();
 
-            assert(inputs[i]->data.Size() == bufferDesc.totalTensorSizeInBytes);
+            assert(inputs[i]->data.buffer.size() == bufferDesc.totalTensorSizeInBytes);
 
             memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
         }
@@ -540,7 +556,7 @@ void Device::InitializeOperator(
 
     if (persistentResourceSize != 0)
     {
-        DML_BUFFER_BINDING outputBinding = { m_persistentResource->GetResource(), 0, persistentResourceSize };
+        DML_BUFFER_BINDING outputBinding = { model.persistentResource->GetResource(), 0, persistentResourceSize };
         auto desc = DML_BINDING_DESC { DML_BINDING_TYPE_BUFFER, &outputBinding };
         m_bindingTable->BindOutputs(1, &desc);
     }
@@ -556,6 +572,8 @@ void Device::InitializeOperator(
     m_commandList->SetDescriptorHeaps(1, m_descriptorHeap->m_Heap.GetAddressOf());
     m_commandRecorder->RecordDispatch(m_commandList.Get(), m_operatorInitializer.Get(), m_bindingTable.Get());
     ExecuteCommandListAndWait();
+
+    model.initialized = true;
 }
 
 void Device::ExecuteCommandListAndWait()

@@ -52,23 +52,28 @@ class Model:
         self._outputs = []
         self._operator = None
 
-    def _add_input(self, shape, array):
-        desc = dml.TensorDesc(FLOAT32, list(shape))
+    def _add_input(self, shape, array, flags):
+        desc = dml.TensorDesc(FLOAT32, flags, list(shape))
         expression = dml.input_tensor(self.graph, len(self._expressions), desc)
         self._expressions.append(expression)
         self._arrays.append(array)
         return expression
 
     def constant(self, array, shape=None):
-        """Register a weight, reshaped to ``shape`` if given."""
+        """Register a weight, reshaped to ``shape`` if given.
+
+        OWNED_BY_DML hands the tensor to DirectML at initialization, which is
+        once per model, and it stays on the GPU from then on. Without the flag
+        it would be re-uploaded on every dispatch.
+        """
         array = np.ascontiguousarray(array, np.float32)
         if shape is not None:
             array = array.reshape(shape)
-        return self._add_input(array.shape, array)
+        return self._add_input(array.shape, array, dml.TensorFlags.OWNED_BY_DML)
 
     def placeholder(self, shape):
         """Register an input whose data is supplied to :meth:`run`."""
-        expression = self._add_input(shape, np.zeros(shape, np.float32))
+        expression = self._add_input(shape, np.zeros(shape, np.float32), dml.TensorFlags.NONE)
         self._placeholders.append(len(self._expressions) - 1)
         return expression
 
@@ -78,6 +83,9 @@ class Model:
         # Binding copies the array into an upload buffer, so the weights are
         # copied once here rather than on every run.
         self._bindings = [dml.Binding(e, a) for e, a in zip(self._expressions, self._arrays)]
+        # Uploads every OWNED_BY_DML tensor and hands it to DirectML. After this
+        # a dispatch only carries the placeholders.
+        self.device.initialize(self._operator, self._bindings)
         return self
 
     def run(self, *values):
@@ -94,7 +102,7 @@ class Model:
                 raise ValueError(f"input {index} has shape {list(value.shape)}, expected {expected}")
             self._bindings[index] = dml.Binding(self._expressions[index], value)
 
-        results = self.device.compute(self._operator, self._bindings, self._outputs)
+        results = self.device.dispatch(self._operator, self._bindings, self._outputs)
         return [np.array(r, np.float32).reshape(sizes(o)) for r, o in zip(results, self._outputs)]
 
     @property

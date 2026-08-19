@@ -8,6 +8,7 @@
 
 #define NOMINMAX
 #include <cassert>
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <functional>

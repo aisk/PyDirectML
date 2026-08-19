@@ -13,6 +13,8 @@ PyDirectML is an open source Python binding library for DirectML written to faci
 - `DirectML.h` and `DirectML.lib` come from the Windows SDK. Upstream downloaded the `microsoft.ai.directml` NuGet package at build time and shipped its `DirectML.dll` inside the wheel, where nothing ever loaded it.
 - `average_pooling` takes `dilations` and `mean_variance_normalization` takes `normalize_mean`, in the position the DirectMLX signature gives them. The samples are updated to match.
 - `activation_soft_max` is spelled `activation_softmax` and takes an `axes` argument, binding `DML_ACTIVATION_SOFTMAX1`. The old binding normalized a flattened 2-D view and could not express softmax over the last axis of a 4-D tensor, which attention needs.
+- A tensor's declared `TensorDataType` is honored on both ends. `Binding` converts what you hand it to that type and refuses conversions that cross a dtype kind unsafely; results come back as that type instead of always as float32. Upstream forced float32 in and read float32 out, which reads out of bounds for any narrower type. Half precision works: see `samples/dtypes.py`.
+- `Device.initialize` and `Device.dispatch` are separate, and the persistent resource belongs to the model rather than to the device. `compute` initializes on first use and dispatches after that, so a tensor flagged `OWNED_BY_DML` is uploaded once and then stays on the GPU. Upstream re-ran initialization on every `compute`, re-uploading every weight each time.
 
 ## Prerequisites
 
@@ -42,7 +44,7 @@ The samples under `samples/` need NumPy, the image samples additionally need Pil
 
 ## Samples
 
-`samples/matmul.py` is the smallest thing that works. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `candy.py` and `superres.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them.
+`samples/matmul.py` is the smallest thing that works, and `samples/dtypes.py` runs one graph at float32 and at float16 and shows what `Binding` refuses. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `candy.py` and `superres.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them.
 
 [`samples/sdxl/`](./samples/sdxl/) is a Stable Diffusion XL pipeline built on these bindings. It has the VAE — encoder and decoder, against the real `stabilityai/sdxl-vae` weights — and the Euler sampler, checked against a NumPy reference implementation that ships with it. The UNet is not there yet; the sample's README explains what has to change in the bindings first.
 

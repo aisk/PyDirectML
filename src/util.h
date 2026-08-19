@@ -20,6 +20,43 @@ inline void ThrowIfNull(void* p)
         throw std::exception();
 }
 
+// How a DML_TENSOR_DATA_TYPE is spelled elsewhere. `format` is a buffer protocol
+// format string (PEP 3118), which is what NumPy reads a TensorData through;
+// `numpyName` is the dtype constructor argument used to check what a Binding was
+// handed. 'e' is half float, which has a buffer format but no C++ type.
+struct DmlDataType
+{
+    size_t itemSize;
+    const char* format;
+    const char* numpyName;
+};
+
+inline DmlDataType const& GetDataType(DML_TENSOR_DATA_TYPE dataType)
+{
+    static const DmlDataType types[] =
+    {
+        { 0, "",  ""        },  // DML_TENSOR_DATA_TYPE_UNKNOWN
+        { 4, "f", "float32" },
+        { 2, "e", "float16" },
+        { 4, "I", "uint32"  },
+        { 2, "H", "uint16"  },
+        { 1, "B", "uint8"   },
+        { 4, "i", "int32"   },
+        { 2, "h", "int16"   },
+        { 1, "b", "int8"    },
+        { 8, "d", "float64" },
+        { 8, "Q", "uint64"  },
+        { 8, "q", "int64"   },
+    };
+
+    auto index = static_cast<size_t>(dataType);
+    if (index == 0 || index >= std::size(types))
+    {
+        throw std::invalid_argument("unsupported tensor data type " + std::to_string(index));
+    }
+    return types[index];
+}
+
 // DML_BUFFER_TENSOR_DESC (DML_TENSOR_TYPE_BUFFER)
 struct DmlBufferTensorDesc
 {
