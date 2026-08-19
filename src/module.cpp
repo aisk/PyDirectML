@@ -195,7 +195,12 @@ PYBIND11_MODULE(directml, module)
             return new pydml::Binding(expression, converted.request());
             }),
             py::arg("expr"),
-            py::arg("data"));
+            py::arg("data"))
+        .def("release_data", [](pydml::Binding& self) { self.data.Release(); },
+            "Free this binding's CPU copy of the data. Safe for an OWNED_BY_DML "
+            "tensor once the model has been initialized, since DirectML holds the "
+            "data from then on. Dispatching a released binding that is not owned "
+            "by DirectML raises.");
 
     py::class_<pydml::Device>(module, "Device")
         .def(py::init<bool, bool>(),

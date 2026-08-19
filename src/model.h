@@ -89,6 +89,16 @@ namespace pydml
 
         TensorData() {}
 
+        // Drop the CPU copy. For an OWNED_BY_DML input this is safe once the
+        // model has been initialized: DirectML has folded the data into the
+        // model's persistent resource and never reads this buffer again. At the
+        // scale of a diffusion UNet this copy is gigabytes.
+        void Release()
+        {
+            buffer.clear();
+            buffer.shrink_to_fit();
+        }
+
         void* Get() const { return static_cast<void*>(const_cast<byte*>(buffer.data())); }
 
         size_t Size() const

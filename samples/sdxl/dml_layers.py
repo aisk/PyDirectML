@@ -42,6 +42,15 @@ def sizes(expression):
     return list(expression.get_output_desc().sizes)
 
 
+def data_type(expression):
+    """The element type of an expression's output.
+
+    Every reshape below reads this off the expression rather than assuming
+    float32, so the same layer code builds a half-precision graph.
+    """
+    return expression.get_output_desc().data_type
+
+
 class Model:
     """A graph under construction, plus the arrays bound to its inputs.
 
@@ -50,21 +59,26 @@ class Model:
     :meth:`placeholder` and supplied to :meth:`run`.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, tensor_type=FLOAT32):
+        self.tensor_type = tensor_type
+        self.data_type = NUMPY_DTYPES[tensor_type]
         self.device = device
         self.graph = dml.GraphBuilder(device)
-        self._expressions = []
-        self._arrays = []
-        self._placeholders = []
         self._bindings = []
+        self._expressions = []
+        # index -> (shape, dtype) for the inputs supplied per run.
+        self._placeholders = {}
         self._outputs = []
         self._operator = None
 
     def _add_input(self, array, flags, data_type):
         desc = dml.TensorDesc(data_type, flags, list(array.shape))
-        expression = dml.input_tensor(self.graph, len(self._expressions), desc)
+        expression = dml.input_tensor(self.graph, len(self._bindings), desc)
         self._expressions.append(expression)
-        self._arrays.append(array)
+        # Bound here rather than at compile time so the caller can drop its own
+        # reference to the array immediately. Holding every weight until the
+        # whole graph is built costs a second copy of the model.
+        self._bindings.append(dml.Binding(expression, array))
         return expression
 
     def constant(self, array, shape=None):
@@ -74,40 +88,36 @@ class Model:
         once per model, and it stays on the GPU from then on. Without the flag
         it would be re-uploaded on every dispatch.
         """
-        array = np.ascontiguousarray(array, np.float32)
+        array = np.ascontiguousarray(array, self.data_type)
         if shape is not None:
             array = array.reshape(shape)
-        return self._add_input(array, dml.TensorFlags.OWNED_BY_DML, FLOAT32)
+        return self._add_input(array, dml.TensorFlags.OWNED_BY_DML, self.tensor_type)
 
-    def placeholder(self, shape, data_type=FLOAT32):
+    def placeholder(self, shape, data_type=None):
         """Register an input whose data is supplied to :meth:`run`.
 
         Token indices are the reason this takes a data type: ``gather`` wants an
         integer tensor, and a Binding now converts to whatever the tensor
         declares rather than forcing float32.
         """
-        array = np.zeros(shape, NUMPY_DTYPES[data_type])
-        expression = self._add_input(array, dml.TensorFlags.NONE, data_type)
-        self._placeholders.append(len(self._expressions) - 1)
+        data_type = self.tensor_type if data_type is None else data_type
+        expression = self._add_input(
+            np.zeros(shape, NUMPY_DTYPES[data_type]), dml.TensorFlags.NONE, data_type)
+        self._placeholders[len(self._bindings) - 1] = (list(shape), NUMPY_DTYPES[data_type])
         return expression
 
     def compile(self, outputs):
         self._outputs = list(outputs)
         self._operator = self.graph.build(dml.ExecutionFlags.NONE, self._outputs)
-        # Binding copies the array into an upload buffer, so the weights are
-        # copied once here rather than on every run.
-        self._bindings = [dml.Binding(e, a) for e, a in zip(self._expressions, self._arrays)]
         # Uploads every OWNED_BY_DML tensor and hands it to DirectML. After this
         # a dispatch only carries the placeholders.
         self.device.initialize(self._operator, self._bindings)
 
-        # DirectML has the weights and each Binding kept its own copy, so the
-        # arrays the graph was built from can go. That is 2.8 GiB for the larger
-        # text encoder. The Binding copies are the ones that cannot be dropped
-        # yet -- see the note in this directory's README.
-        for index in range(len(self._arrays)):
+        # DirectML holds the weights now, so each binding's copy can go. That is
+        # 5.1 GiB for the UNet at half precision.
+        for index, binding in enumerate(self._bindings):
             if index not in self._placeholders:
-                self._arrays[index] = None
+                binding.release_data()
         return self
 
     def run(self, *values):
@@ -117,11 +127,10 @@ class Model:
         if len(values) != len(self._placeholders):
             raise ValueError(f"expected {len(self._placeholders)} inputs, got {len(values)}")
 
-        for index, value in zip(self._placeholders, values):
-            expected = list(self._arrays[index].shape)
-            value = np.ascontiguousarray(value, self._arrays[index].dtype)
-            if list(value.shape) != expected:
-                raise ValueError(f"input {index} has shape {list(value.shape)}, expected {expected}")
+        for (index, (shape, dtype)), value in zip(sorted(self._placeholders.items()), values):
+            value = np.ascontiguousarray(value, dtype)
+            if list(value.shape) != shape:
+                raise ValueError(f"input {index} has shape {list(value.shape)}, expected {shape}")
             self._bindings[index] = dml.Binding(self._expressions[index], value)
 
         results = self.device.dispatch(self._operator, self._bindings, self._outputs)
@@ -129,7 +138,7 @@ class Model:
 
     @property
     def input_count(self):
-        return len(self._expressions)
+        return len(self._bindings)
 
 
 def broadcast(expression, shape):
@@ -153,13 +162,14 @@ def broadcast(expression, shape):
         else:
             raise ValueError(f"cannot broadcast {source} to {list(shape)}: axis of {size}")
 
-    return dml.reinterpret(expression, FLOAT32, list(shape), strides)
+    return dml.reinterpret(expression, data_type(expression), list(shape), strides)
 
 
 def to_tokens(expression):
     """View ``[1, C, H, W]`` as ``[1, 1, H*W, C]`` -- a transpose, not a copy."""
     n, c, h, w = sizes(expression)
-    return dml.reinterpret(expression, FLOAT32, [n, 1, h * w, c], [c * h * w, c * h * w, 1, h * w])
+    return dml.reinterpret(expression, data_type(expression), [n, 1, h * w, c],
+                       [c * h * w, c * h * w, 1, h * w])
 
 
 def to_image(expression, height, width):
@@ -167,7 +177,8 @@ def to_image(expression, height, width):
     n, _, tokens, c = sizes(expression)
     if tokens != height * width:
         raise ValueError(f"{tokens} tokens do not fill {height}x{width}")
-    return dml.reinterpret(expression, FLOAT32, [n, c, height, width], [c * tokens, 1, width * c, c])
+    return dml.reinterpret(expression, data_type(expression), [n, c, height, width],
+                       [c * tokens, 1, width * c, c])
 
 
 def silu(expression):
@@ -187,15 +198,20 @@ def conv2d(model, x, weight, bias, stride=1, padding=1, end_padding=None):
         end_padding=[end, end])
 
 
-def linear(model, x, weight, bias):
-    """A dense layer over the last axis, from torch-ordered ``[out, in]`` weights."""
+def linear(model, x, weight, bias=None):
+    """A dense layer over the last axis, from torch-ordered ``[out, in]`` weights.
+
+    The UNet's attention projections carry no bias, so it is optional.
+    """
     out_features = weight.shape[0]
     weights = model.constant(weight, shape=[1, 1, out_features, weight.shape[1]])
+    transpose = dml.MatrixTransform.TRANSPOSE
+    if bias is None:
+        return dml.gemm(x, weights, trans_b=transpose)
+
     biases = model.constant(bias, shape=[1, 1, 1, out_features])
     shape = sizes(x)[:-1] + [out_features]
-    return dml.gemm(
-        x, weights, broadcast(biases, shape),
-        trans_b=dml.MatrixTransform.TRANSPOSE)
+    return dml.gemm(x, weights, broadcast(biases, shape), trans_b=transpose)
 
 
 def group_norm(model, x, weight, bias, groups=32, epsilon=1e-6):
@@ -204,11 +220,11 @@ def group_norm(model, x, weight, bias, groups=32, epsilon=1e-6):
     if c % groups:
         raise ValueError(f"{c} channels do not divide into {groups} groups")
 
-    grouped = dml.reinterpret(x, FLOAT32, [n, groups, c // groups, h * w], None)
+    grouped = dml.reinterpret(x, data_type(x), [n, groups, c // groups, h * w], None)
     normalized = dml.mean_variance_normalization(
         grouped, None, None, [2, 3],
         normalize_variance=True, normalize_mean=True, epsilon=epsilon)
-    normalized = dml.reinterpret(normalized, FLOAT32, shape, None)
+    normalized = dml.reinterpret(normalized, data_type(x), shape, None)
 
     scale = broadcast(model.constant(weight, shape=[1, c, 1, 1]), shape)
     shift = broadcast(model.constant(bias, shape=[1, c, 1, 1]), shape)
@@ -293,7 +309,7 @@ def split_heads(x, heads):
     if channels % heads:
         raise ValueError(f"{channels} channels do not divide into {heads} heads")
     dim = channels // heads
-    return dml.reinterpret(x, FLOAT32, [n, heads, tokens, dim],
+    return dml.reinterpret(x, data_type(x), [n, heads, tokens, dim],
                            [tokens * channels, dim, channels, 1])
 
 
@@ -308,29 +324,70 @@ def merge_heads(x):
     reshape is free.
     """
     n, heads, tokens, dim = sizes(x)
-    transposed = dml.reinterpret(x, FLOAT32, [n, tokens, heads, dim],
+    transposed = dml.reinterpret(x, data_type(x), [n, tokens, heads, dim],
                                  [heads * tokens * dim, dim, tokens * dim, 1])
     packed = dml.activation_identity(transposed)
-    return dml.reinterpret(packed, FLOAT32, [n, 1, tokens, heads * dim], None)
+    return dml.reinterpret(packed, data_type(x), [n, 1, tokens, heads * dim], None)
 
 
-def multi_head_attention(model, x, params, prefix, heads, mask=None):
-    """Self-attention over ``[1, 1, T, C]`` with an optional additive mask."""
-    _, _, _, channels = sizes(x)
-    dim = channels // heads
+def attend(query, key, value, heads, mask=None):
+    """Scaled dot-product attention over already-projected token tensors.
 
-    query = split_heads(linear(model, x, params[f"{prefix}.q_proj.weight"],
-                               params[f"{prefix}.q_proj.bias"]), heads)
-    key = split_heads(linear(model, x, params[f"{prefix}.k_proj.weight"],
-                             params[f"{prefix}.k_proj.bias"]), heads)
-    value = split_heads(linear(model, x, params[f"{prefix}.v_proj.weight"],
-                               params[f"{prefix}.v_proj.bias"]), heads)
+    Key and value may carry a different number of tokens than the query, which
+    is what makes this cross-attention as well as self-attention.
+    """
+    dim = sizes(query)[-1] // heads
+    query, key, value = (split_heads(t, heads) for t in (query, key, value))
 
     scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
                       alpha=1.0 / math.sqrt(dim))
     if mask is not None:
         scores = dml.add(scores, broadcast(mask, sizes(scores)))
 
-    attended = dml.gemm(dml.activation_softmax(scores, [3]), value)
-    return linear(model, merge_heads(attended), params[f"{prefix}.out_proj.weight"],
+    return merge_heads(dml.gemm(dml.activation_softmax(scores, [3]), value))
+
+
+def multi_head_attention(model, x, params, prefix, heads, mask=None):
+    """Self-attention under CLIP's weight names, where every projection has a bias."""
+    def project(name):
+        return linear(model, x, params[f"{prefix}.{name}.weight"], params[f"{prefix}.{name}.bias"])
+
+    attended = attend(project("q_proj"), project("k_proj"), project("v_proj"), heads, mask)
+    return linear(model, attended, params[f"{prefix}.out_proj.weight"],
                   params[f"{prefix}.out_proj.bias"])
+
+
+def diffusers_attention(model, x, params, prefix, heads, context=None):
+    """Attention under diffusers' weight names, where only the output projects a bias.
+
+    Passing ``context`` makes it cross-attention: the query still comes from the
+    image tokens, the keys and values from the text embeddings.
+    """
+    source = x if context is None else context
+    query = linear(model, x, params[f"{prefix}.to_q.weight"])
+    key = linear(model, source, params[f"{prefix}.to_k.weight"])
+    value = linear(model, source, params[f"{prefix}.to_v.weight"])
+
+    attended = attend(query, key, value, heads)
+    return linear(model, attended, params[f"{prefix}.to_out.0.weight"],
+                  params[f"{prefix}.to_out.0.bias"])
+
+
+def to_channels(expression):
+    """View ``[1, 1, 1, C]`` as ``[1, C, 1, 1]``, ready to broadcast over an image."""
+    n, _, _, c = sizes(expression)
+    return dml.reinterpret(expression, data_type(expression), [n, c, 1, 1], None)
+
+
+def geglu(model, x, params, prefix):
+    """The UNet's feed-forward: project to twice the width, gate one half by the other."""
+    projected = linear(model, x, params[f"{prefix}.net.0.proj.weight"],
+                       params[f"{prefix}.net.0.proj.bias"])
+    n, _, tokens, doubled = sizes(projected)
+    inner = doubled // 2
+
+    def half(offset):
+        return dml.slice(projected, [0, 0, 0, offset], [n, 1, tokens, inner], [1, 1, 1, 1])
+
+    gated = dml.multiply(half(0), dml.activation_gelu(half(inner)))
+    return linear(model, gated, params[f"{prefix}.net.2.weight"], params[f"{prefix}.net.2.bias"])

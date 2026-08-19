@@ -1,11 +1,12 @@
 # SDXL on DirectML
 
-Stable Diffusion XL has four pieces: two text encoders, a UNet, a VAE, and a
-sampler that ties them together. This directory has three of the four -- both
-text encoders, the VAE, and the sampler -- built out of the operators `directml`
-exposes and running against the real SDXL weights.
+Stable Diffusion XL, built out of the operators `directml` exposes and running
+against the real SDXL weights: two CLIP text encoders, the UNet, the VAE, and the
+Euler sampler that ties them together.
 
-The UNet is not here yet. See [What is left](#what-is-left).
+    python generate.py "an astronaut riding a horse on mars, highly detailed"
+
+107 seconds for a 1024x1024 image at 20 steps on a Radeon RX 6800.
 
 ## Running it
 
@@ -13,6 +14,7 @@ The UNet is not here yet. See [What is left](#what-is-left).
 pip install .[dev] --no-build-isolation   # from the repository root
 cd samples\sdxl
 
+python generate.py "a prompt"             # a prompt to an image
 python roundtrip.py                       # encode and decode an image
 python encode_prompt.py "a prompt"        # a prompt to the UNet's conditioning
 python check.py                           # verify the graphs against NumPy
@@ -21,7 +23,17 @@ python euler.py                           # the sampler's schedule and self test
 
 Weights download from the Hugging Face hub on first use and land in the usual
 `~/.cache/huggingface` directory: 320 MiB for the VAE, 3.3 GiB for the two text
-encoders. `check.py --part vae` skips the large download.
+encoders, 5.1 GiB for the UNet at half precision. `check.py --part vae` skips
+everything but the small one.
+
+Where a 1024x1024 image at 20 steps spends its 107 seconds:
+
+| | |
+| --- | --- |
+| Encoding the prompt | 14 s, once |
+| Building and initializing the UNet | 7 s, once |
+| Sampling | 85 s -- 40 UNet forwards at 2.1 s, two per step for guidance |
+| Decoding | 1 s, once |
 
 `roundtrip.py` pushes an image through the encoder and back through the decoder.
 On a Radeon RX 6800:
@@ -44,11 +56,13 @@ to survive the trip through this decoder.
 | `dml_layers.py` | Conv, GroupNorm, LayerNorm, SiLU, attention -- the layers, as DirectML expressions |
 | `vae.py` | The encoder and decoder graphs |
 | `text_encoder.py` | Both CLIP towers, and the tokenizing that feeds them |
+| `unet.py` | The UNet, as two graphs |
 | `euler.py` | `EulerDiscreteScheduler`, in NumPy |
 | `reference.py` | The same VAE and text encoders in NumPy, line for line |
 | `check.py` | Runs both and compares |
 | `weights.py` | Checkpoint download and float32 conversion |
-| `roundtrip.py`, `encode_prompt.py` | The demos |
+| `generate.py` | The whole pipeline: a prompt to an image |
+| `roundtrip.py`, `encode_prompt.py` | Demos of the VAE and the text encoders on their own |
 
 `reference.py` exists because there is no PyTorch in this repository to check
 against. It is slow enough to be obviously correct and fast enough to run at
@@ -150,35 +164,52 @@ clean latent to 3e-6.
 `sample(scheduler, denoiser, latents)` takes any callable as the denoiser. The
 UNet drops in there.
 
-## What is left
+## The UNet, and the 4 GiB wall
 
-Only the UNet. It is 2.6 billion parameters against the text encoders' 817
-million and the VAE's 84 million, and it is the same building blocks as both plus
-cross-attention. Two things in the bindings stood in the way of ever running
-something that size; both are fixed now.
+The UNet is 2.57 billion parameters against the text encoders' 817 million and
+the VAE's 84 million, and it is the only part that runs more than once per image.
+Structurally it is the VAE's encoder and decoder joined at the waist, with two
+additions: every resnet has the timestep embedding added to it, which is how one
+set of weights behaves differently at different noise levels, and at the two
+lower resolutions every resnet is followed by transformer blocks that attend over
+the image and then cross-attend to the text. That cross-attention is where the
+prompt reaches the pixels.
 
-**Weights stay on the GPU.** `Device::Compute` used to run the operator
-initializer on every call, so nothing could be uploaded once and reused.
-Initialization and dispatch are separate now, and the persistent resource -- the
-buffer DirectML folds `OWNED_BY_DML` weights into -- belongs to the model rather
-than to the device, so several models can be live at once, which is what lets the
-two text encoders and the VAE share a device. `compile()` in `dml_layers.py`
-initializes; `run()` only dispatches. Repeated 512x512 decoding went from 0.33 s
-to 0.16 s, and repeated 1024x1024 from 1.09 s to 0.70 s. The weight-residency
-half of that is small at the VAE's 320 MiB; the UNet is 10.3 GiB at float32 and a
-20-step run with classifier-free guidance is 40 dispatches, which is where it
-stops being a rounding error.
+It runs at half precision, which is what SDXL is run at everywhere. At float32
+the weights alone are 10.3 GiB.
 
-**Half precision works.** A tensor's declared `TensorDataType` is honored end to
-end, so float16 weights load as float16 and results come back as float16. The
-SDXL UNet is 5.2 GiB at half precision against 10.3 GiB at single, which is the
-difference between fitting on a 16 GiB card with room for activations and not.
-`samples/dtypes.py` shows both. This sample stays at float32 throughout: the SDXL
-VAE is known to overflow in float16, which is why `madebyollin/sdxl-vae-fp16-fix`
-exists.
+**It does not fit in one graph.** DirectML folds a model's `OWNED_BY_DML` weights
+into a single persistent buffer, and a single D3D12 buffer stops at 4 GiB --
+allocating one past that removes the device (`DXGI_ERROR_DEVICE_REMOVED`) rather
+than failing the allocation. The threshold is exact: a graph carrying 3.75 GiB of
+weights initializes, one carrying 4.00 GiB does not. The UNet is 4.78 GiB.
 
-One thing still wants fixing before the UNet: `Binding` keeps a CPU copy of every
-weight for the lifetime of the model, even after DirectML has taken the data.
-`compile()` drops the arrays the graph was built from, which is 2.8 GiB back for
-bigG, but the Binding copies need a change on the C++ side. Fine at 320 MiB, not
-fine at 10.3 GiB.
+So it is two graphs, split at the mid block:
+
+| | |
+| --- | --- |
+| `conv_in`, both embeddings, three down blocks, mid block | 2.31 GiB |
+| three up blocks, `conv_out` | 2.47 GiB |
+
+What crosses between them is the mid-block result, the timestep embedding, and
+nine skip connections -- about 54 MiB at 1024x1024, which is a millisecond of
+PCIe each way against a 2.1 second forward pass. The split is invisible from
+outside `unet.UNet`.
+
+There is no NumPy reference for the UNet the way there is for the VAE and the
+text encoders: 2.57 billion parameters at float32 is 10.3 GiB and minutes per
+forward pass. `generate.py` is its test instead. Every part of the pipeline has
+to be right for a prompt to come out as a picture of what it asked for -- a wrong
+skip order, a transposed attention, the penultimate CLIP layer taken from the
+wrong end, and the result is noise rather than a slightly worse image.
+
+## Still missing
+
+- Only the deterministic Euler sampler. Ancestral and `s_churn` variants, and
+  every other scheduler, are left out.
+- The refiner model, and the img2img and inpainting paths.
+- Batching. Everything is batch 1, so classifier-free guidance is two dispatches
+  per step rather than one on a batch of two.
+- Single-file checkpoints. This reads the diffusers layout; the single-file
+  format that ComfyUI and A1111 use has its own key names and would need a
+  mapping table.

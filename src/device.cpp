@@ -271,7 +271,17 @@ std::vector<pydml::TensorData*> Device::Dispatch(
             void* dest = uploadHeapData + inputBindings[i].offset;
             const void* src = inputs[i]->data.Get();
 
-            assert(inputs[i]->data.buffer.size() == bufferDesc.totalTensorSizeInBytes);
+            if (inputs[i]->data.buffer.size() != bufferDesc.totalTensorSizeInBytes)
+            {
+                // Almost always a binding whose CPU copy was released and then
+                // needed again. Guarding the memcpy rather than asserting it,
+                // since NDEBUG compiles the assert away.
+                throw std::invalid_argument(
+                    "input " + std::to_string(i) + " holds " +
+                    std::to_string(inputs[i]->data.buffer.size()) + " bytes but the tensor needs " +
+                    std::to_string(bufferDesc.totalTensorSizeInBytes) +
+                    "; rebind it if its data was released");
+            }
 
             memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
         }
@@ -513,7 +523,17 @@ void Device::Initialize(
             void* dest = uploadHeapData + inputBinding.bindings[i].offset;
             const void* src = inputs[i]->data.Get();
 
-            assert(inputs[i]->data.buffer.size() == bufferDesc.totalTensorSizeInBytes);
+            if (inputs[i]->data.buffer.size() != bufferDesc.totalTensorSizeInBytes)
+            {
+                // Almost always a binding whose CPU copy was released and then
+                // needed again. Guarding the memcpy rather than asserting it,
+                // since NDEBUG compiles the assert away.
+                throw std::invalid_argument(
+                    "input " + std::to_string(i) + " holds " +
+                    std::to_string(inputs[i]->data.buffer.size()) + " bytes but the tensor needs " +
+                    std::to_string(bufferDesc.totalTensorSizeInBytes) +
+                    "; rebind it if its data was released");
+            }
 
             memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
         }

@@ -41,6 +41,21 @@ def load_text_encoders(repo=SDXL_REPO):
     }
 
 
+def load_unet(repo=SDXL_REPO, half=True):
+    """Download (or reuse) the UNet. 5.1 GiB at half precision, 10.3 at single.
+
+    Half is not an approximation of what SDXL does -- it is what SDXL is run at
+    everywhere -- and it is the difference between the weights fitting on a
+    16 GiB card alongside their activations and not.
+    """
+    variant = ".fp16" if half else ""
+    path = hf_hub_download(repo, f"unet/diffusion_pytorch_model{variant}.safetensors")
+    tensors = load_file(path)
+    if not half:
+        return {name: as_float32(t) for name, t in tensors.items()}
+    return {name: np.ascontiguousarray(t, np.float16) for name, t in tensors.items()}
+
+
 def load_tokenizers(repo=SDXL_REPO):
     """The two BPE tokenizers, from transformers. No PyTorch involved."""
     from transformers import CLIPTokenizer

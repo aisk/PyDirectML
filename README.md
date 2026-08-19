@@ -14,8 +14,9 @@ PyDirectML is an open source Python binding library for DirectML written to faci
 - `average_pooling` takes `dilations` and `mean_variance_normalization` takes `normalize_mean`, in the position the DirectMLX signature gives them. The samples are updated to match.
 - `activation_soft_max` is spelled `activation_softmax` and takes an `axes` argument, binding `DML_ACTIVATION_SOFTMAX1`. The old binding normalized a flattened 2-D view and could not express softmax over the last axis of a 4-D tensor, which attention needs. `activation_gelu` is bound as well.
 - A tensor's declared `TensorDataType` is honored on both ends. `Binding` converts what you hand it to that type and refuses conversions that cross a dtype kind unsafely; results come back as that type instead of always as float32. Upstream forced float32 in and read float32 out, which reads out of bounds for any narrower type. Half precision works: see `samples/dtypes.py`.
+- `Binding.release_data` frees a binding's CPU copy, which is only dead weight once DirectML holds the data. That copy is gigabytes for anything model-sized.
 - `Device.initialize` and `Device.dispatch` are separate, and the persistent resource belongs to the model rather than to the device. `compute` initializes on first use and dispatches after that, so a tensor flagged `OWNED_BY_DML` is uploaded once and then stays on the GPU. Upstream re-ran initialization on every `compute`, re-uploading every weight each time.
-- Buffers grow by a fixed step once they pass 256 MiB instead of doubling forever. Doubling turned a 2.1 GiB request into a 4 GiB single resource, which removes the device (`DXGI_ERROR_DEVICE_REMOVED`) rather than failing the allocation. `ThrowIfFailed` also reports the HRESULT now; it used to throw a bare `std::exception`, which reached Python as "Unknown exception".
+- Buffers grow by a fixed step once they pass 256 MiB instead of doubling forever. A single D3D12 buffer stops at 4 GiB — allocating one past that removes the device (`DXGI_ERROR_DEVICE_REMOVED`) rather than failing the allocation — and doubling turned a 2.1 GiB request into exactly that. `ThrowIfFailed` also reports the HRESULT now; it used to throw a bare `std::exception`, which reached Python as "Unknown exception".
 
 ## Prerequisites
 
@@ -47,7 +48,7 @@ The samples under `samples/` need NumPy, the image samples additionally need Pil
 
 `samples/matmul.py` is the smallest thing that works, and `samples/dtypes.py` runs one graph at float32 and at float16 and shows what `Binding` refuses. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `candy.py` and `superres.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them.
 
-[`samples/sdxl/`](./samples/sdxl/) is a Stable Diffusion XL pipeline built on these bindings: the VAE in both directions, both CLIP text encoders, and the Euler sampler, all against the real SDXL weights and all checked against a NumPy reference implementation that ships with it. Only the UNet is still missing.
+[`samples/sdxl/`](./samples/sdxl/) is Stable Diffusion XL built on these bindings — both CLIP text encoders, the UNet, the VAE, and the Euler sampler — running against the real SDXL weights. `python generate.py "a prompt"` produces a 1024×1024 image in 107 seconds on a Radeon RX 6800. The VAE and the text encoders are checked against a NumPy reference implementation that ships with it.
 
 If the repository was cloned without `--recursive`, run `git submodule update --init --recursive` first. The build needs both the `pybind11` and `gpgmm` submodules.
 
