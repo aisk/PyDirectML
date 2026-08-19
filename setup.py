@@ -69,5 +69,8 @@ setup(
     cmdclass=dict(build_ext=CMakeBuild),
     keywords='DirectML Python samples',
     setup_requires=['cmake'],
+    # What the samples under samples/ need: NumPy everywhere, Pillow for the
+    # image samples, and the hub and safetensors readers for the SDXL sample.
+    extras_require={'dev': ['numpy', 'pillow', 'safetensors', 'huggingface_hub']},
     zip_safe=False
 )

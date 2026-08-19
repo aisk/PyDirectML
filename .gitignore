@@ -20,3 +20,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Sample outputs
+samples/sdxl/*.png

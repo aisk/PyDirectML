@@ -33,7 +33,18 @@ cd PyDirectML
 $env:CMAKE_POLICY_VERSION_MINIMUM = '3.5'
 
 pip install . --no-build-isolation
+
+# To run the samples, install the extra dependencies as well.
+pip install .[dev] --no-build-isolation
 ```
+
+The samples under `samples/` need NumPy, the image samples additionally need Pillow, and `samples/sdxl/` needs `safetensors` and `huggingface_hub`. The `dev` extra pulls in all of them.
+
+## Samples
+
+`samples/matmul.py` is the smallest thing that works. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `candy.py` and `superres.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them.
+
+[`samples/sdxl/`](./samples/sdxl/) is a Stable Diffusion XL pipeline built on these bindings. It has the VAE — encoder and decoder, against the real `stabilityai/sdxl-vae` weights — and the Euler sampler, checked against a NumPy reference implementation that ships with it. The UNet is not there yet; the sample's README explains what has to change in the bindings first.
 
 If the repository was cloned without `--recursive`, run `git submodule update --init --recursive` first. The build needs both the `pybind11` and `gpgmm` submodules.
 
