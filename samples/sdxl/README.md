@@ -303,10 +303,22 @@ epsilon prediction, which is what SDXL and its finetunes are trained with.
 - Euler and Euler ancestral only, with two timestep spacings. `s_churn`, Karras
   sigmas, DPM++ and the rest are left out. `euler_a` has the unresolved artifact
   described above.
-- Stability at 1024x1360. Three of seven runs at that size died partway through
-  sampling with `DXGI_ERROR_DEVICE_REMOVED` from a dispatch that had already
-  succeeded a few times, which is a hang or a driver reset rather than an
-  allocation failure. 1024x1024 and the in-bucket sizes have never done it.
+- Stability at 1024x1360. Runs at that size regularly die partway through
+  sampling -- five of nine so far -- with `DXGI_ERROR_DEVICE_HUNG`, from a
+  dispatch that had already succeeded several times. 1024x1024 and the in-bucket
+  sizes have never done it.
+
+  It is a hang, not a failed allocation, but memory is the likely trigger: peak
+  dedicated VRAM measured over a run is 9.6 GiB at 1024x1024 and 14.4 GiB at
+  1024x1360, against 16 GiB on the card and a couple of gigabytes already spoken
+  for by the desktop. That close to full the driver is paging resources in and
+  out, and a dispatch waiting on that can sit long enough to be declared hung.
+
+  The attention score matrices are what grows: they scale with the square of the
+  token count, not with pixels, so the level-1 self-attention matrix goes from
+  4096^2 x 10 heads to 5440^2 x 10 between those two sizes -- 335 MB to 592 MB,
+  each one materialized in full because `gemm`, `softmax` and `gemm` are three
+  separate operators here with nothing fused between them.
 - The refiner model, and the img2img and inpainting paths.
 - Batching. Everything is batch 1, so classifier-free guidance is two dispatches
   per step rather than one on a batch of two.

@@ -8,16 +8,62 @@
 
 #include <gpgmm_d3d12.h>
 
+// The HRESULTs worth spelling out. Device removal is the one this hits in
+// practice, and its reason code says whether the GPU hung, was reset out from
+// under us, or the driver failed something on its own.
+inline const char* HresultName(HRESULT hr)
+{
+    switch (hr)
+    {
+    case DXGI_ERROR_DEVICE_HUNG:           return "DXGI_ERROR_DEVICE_HUNG";
+    case DXGI_ERROR_DEVICE_REMOVED:        return "DXGI_ERROR_DEVICE_REMOVED";
+    case DXGI_ERROR_DEVICE_RESET:          return "DXGI_ERROR_DEVICE_RESET";
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR: return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+    case DXGI_ERROR_INVALID_CALL:          return "DXGI_ERROR_INVALID_CALL";
+    case E_OUTOFMEMORY:                    return "E_OUTOFMEMORY";
+    default:                               return nullptr;
+    }
+}
+
+inline std::string DescribeHresult(HRESULT hr)
+{
+    char code[24];
+    snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned int>(hr));
+
+    auto name = HresultName(hr);
+    return name ? std::string(name) + " (" + code + ")" : "HRESULT " + std::string(code);
+}
+
+// A removed device is not reported by whatever caused it. The next call to touch
+// the device fails with DXGI_ERROR_DEVICE_REMOVED, which says nothing about why;
+// only the device itself knows, and only until it is released.
+inline void ThrowIfDeviceRemoved(ID3D12Device* device)
+{
+    auto reason = device->GetDeviceRemovedReason();
+    if (FAILED(reason))
+    {
+        throw std::runtime_error("the device was removed: " + DescribeHresult(reason));
+    }
+}
+
 inline void ThrowIfFailed(HRESULT hr)
 {
     if (FAILED(hr))
     {
         // Without the code this surfaces in Python as "Unknown exception", which
         // says nothing about whether a device call failed or an allocation did.
-        char message[32];
-        snprintf(message, sizeof(message), "HRESULT 0x%08X", static_cast<unsigned int>(hr));
-        throw std::runtime_error(message);
+        throw std::runtime_error(DescribeHresult(hr));
     }
+}
+
+// Same, for calls made against a device that can be asked why it went away.
+inline void ThrowIfFailed(HRESULT hr, ID3D12Device* device)
+{
+    if (hr == DXGI_ERROR_DEVICE_REMOVED && device)
+    {
+        ThrowIfDeviceRemoved(device);
+    }
+    ThrowIfFailed(hr);
 }
 
 inline void ThrowIfNull(void* p)
