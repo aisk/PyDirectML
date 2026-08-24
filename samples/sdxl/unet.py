@@ -21,8 +21,9 @@ import numpy as np
 import directml as dml
 
 from dml_layers import (
-    Model, broadcast, conv2d, diffusers_attention, geglu, group_norm, layer_norm,
-    linear, silu, sizes, to_channels, to_image, to_tokens, upsample_nearest)
+    Model, broadcast, conv2d, crop_to, diffusers_attention, geglu, group_norm,
+    layer_norm, linear, silu, sizes, to_channels, to_image, to_tokens,
+    upsample_nearest)
 
 LATENT_CHANNELS = 4
 BLOCK_OUT_CHANNELS = (320, 640, 1280)
@@ -167,7 +168,12 @@ def up_block(model, x, skips, temb, context, params, prefix, heads, layers, upsa
                                heads, layers)
 
     if upsample:
-        x = conv2d(model, upsample_nearest(x),
+        # A level that halved an odd extent on the way down cannot get back to it
+        # by doubling, so the upsample is trimmed to whatever the next skip
+        # connection is, before the convolution rather than after -- which is
+        # what diffusers does by handing Upsample2D an output size.
+        _, _, height, width = sizes(skips[-1])
+        x = conv2d(model, crop_to(upsample_nearest(x), height, width),
                    params[f"{prefix}.upsamplers.0.conv.weight"],
                    params[f"{prefix}.upsamplers.0.conv.bias"])
     return x

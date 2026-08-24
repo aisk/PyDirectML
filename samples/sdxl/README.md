@@ -15,6 +15,7 @@ pip install .[dev] --no-build-isolation   # from the repository root
 cd samples\sdxl
 
 python generate.py "a prompt"             # a prompt to an image
+python generate.py "a prompt" --size 832x1216 --sampler euler_a --spacing linspace
 python roundtrip.py                       # encode and decode an image
 python encode_prompt.py "a prompt"        # a prompt to the UNet's conditioning
 python check.py                           # verify the graphs against NumPy
@@ -154,16 +155,46 @@ probability-flow ODE is `dx/dsigma = (x - x0) / sigma`, and a model trained to
 predict epsilon returns that right-hand side directly, so one Euler step is one
 multiply-add. The content is in the sigma schedule, not the step.
 
-`euler.py` is `diffusers.EulerDiscreteScheduler` under SDXL's published config:
-scaled-linear betas, epsilon prediction, leading timestep spacing, linear sigma
-interpolation. Ancestral and stochastic (`s_churn`) variants are left out on
-purpose.
+`euler.py` is `diffusers.EulerDiscreteScheduler` under SDXL's published config --
+scaled-linear betas, epsilon prediction, linear sigma interpolation -- and
+`EulerAncestralDiscreteScheduler` beside it, the `euler_a` that ComfyUI and A1111
+default to. The ancestral step integrates *past* the next sigma, down to
+`sigma_down`, and then adds fresh noise back up to where it was going, splitting
+the two so that `sigma_down^2 + sigma_up^2 == sigma_next^2`. The stochastic
+`s_churn` variant is left out.
 
-Its self test uses the fact that Euler is *exact* on the trajectory the schedule
-defines: if a latent really is `clean + sigma * noise` and the model returns that
-noise, every step lands exactly on `clean + sigma_next * noise`. Any sign,
-ordering, or off-by-one error in the schedule breaks it. Thirty steps land on the
-clean latent to 3e-6.
+`--spacing` picks which timesteps to visit. `leading` is SDXL's published config;
+`linspace` walks the whole range from 999 down to 0, which is the schedule
+ComfyUI calls `normal` -- it starts at the model's true `sigma_max` of 14.61
+rather than 11.81 at 27 steps, and finishes at 0.029 rather than 0.041.
+
+**That choice matters much more to `euler_a` than to plain Euler**, and there is
+an open problem behind it. One prompt, one seed, 27 steps, `prefectIllustriousXL`:
+
+| | 1024x1024 | 1024x1360 |
+| --- | --- | --- |
+| `euler`, `leading` | clean | -- |
+| `euler`, `linspace` | clean | clean |
+| `euler_a`, `leading` | fine black mesh over every flat area | same mesh |
+| `euler_a`, `linspace` | clean | same mesh |
+
+Deterministic Euler is clean everywhere it was tried, including 1024x1080,
+896x1152 and 896x1160. `euler_a` is not, and `linspace` only rescues it at
+1024x1024. **Why is not resolved.** It is not the arithmetic of the ancestral
+step -- the oracle test below pins that exactly -- and it is not the non-square
+path, because deterministic Euler at the same 1024x1360 comes out clean. ComfyUI
+produces a clean image from these settings at this size with its own
+`euler_ancestral`, so something else still differs.
+
+The self test comes in three parts. Euler is *exact* on the trajectory the
+schedule defines: if a latent really is `clean + sigma * noise` and the model
+returns that noise, every step lands exactly on `clean + sigma_next * noise`, and
+any sign, ordering or off-by-one error breaks it. That cannot be used on the
+ancestral sampler, whose injected noise is not the noise the latent started with,
+so the ancestral split is checked against the variance identity, and both
+samplers are then run against an *oracle* denoiser -- one handed the clean latent,
+which can return the true epsilon for whatever the sample happens to be. Both
+have to arrive exactly at the clean latent, and they do, to 1e-8.
 
 `sample(scheduler, denoiser, latents)` takes any callable as the denoiser. The
 UNet drops in there.
@@ -199,6 +230,21 @@ What crosses between them is the mid-block result, the timestep embedding, and
 nine skip connections -- about 54 MiB at 1024x1024, which is a millisecond of
 PCIe each way against a 2.1 second forward pass. The split is invisible from
 outside `unet.UNet`.
+
+`--size` takes a `WIDTHxHEIGHT`, not just a square. A level that halves an odd
+extent on the way down cannot get back to it by doubling on the way up, so at
+1024x1360 -- latent 128x170, halving to 64x85 and then to 32x43 -- the up path
+comes out a pixel taller than the skip connection it has to be concatenated with.
+The upsample is trimmed to the next skip's size before its convolution, which is
+what diffusers does by handing `Upsample2D` an output size; cropping a
+nearest-neighbour 2x upsample to `2n - 1` picks the same source pixel for every
+destination as a nearest resize to `2n - 1` would, so nothing is approximated.
+
+Deterministic Euler at 1024x1360, 1024x1080 and 896x1160 -- all of which take
+that path -- comes out clean, which is what says the crop is right. What SDXL
+does at those sizes is a separate matter: its training buckets are all about a
+megapixel, and away from them it starts duplicating the subject, which 896x1160
+does.
 
 There is no NumPy reference for the UNet the way there is for the VAE and the
 text encoders: 2.57 billion parameters at float32 is 10.3 GiB and minutes per
@@ -254,8 +300,13 @@ epsilon prediction, which is what SDXL and its finetunes are trained with.
 
 ## Still missing
 
-- Only the deterministic Euler sampler. Ancestral and `s_churn` variants, and
-  every other scheduler, are left out.
+- Euler and Euler ancestral only, with two timestep spacings. `s_churn`, Karras
+  sigmas, DPM++ and the rest are left out. `euler_a` has the unresolved artifact
+  described above.
+- Stability at 1024x1360. Three of seven runs at that size died partway through
+  sampling with `DXGI_ERROR_DEVICE_REMOVED` from a dispatch that had already
+  succeeded a few times, which is a hang or a driver reset rather than an
+  allocation failure. 1024x1024 and the in-bucket sizes have never done it.
 - The refiner model, and the img2img and inpainting paths.
 - Batching. Everything is batch 1, so classifier-free guidance is two dispatches
   per step rather than one on a batch of two.

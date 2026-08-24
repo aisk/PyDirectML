@@ -278,6 +278,23 @@ def upsample_nearest(x, scale=2):
                             dml.InterpolationMode.NEAREST_NEIGHBOR)
 
 
+def crop_to(x, height, width):
+    """Trim an image tensor to ``height`` by ``width``, from the top left.
+
+    A level that halved an odd extent on the way down cannot get back to it by
+    doubling on the way up, so the up path can come out a pixel wider or taller
+    than the skip connection it has to be concatenated with. Cropping a
+    nearest-neighbour 2x upsample to ``2n - 1`` is exactly a nearest-neighbour
+    resize to ``2n - 1`` -- the two pick the same source pixel for every
+    destination -- which is what diffusers does by handing the upsampler the
+    size it is aiming for.
+    """
+    batch, channels, current_height, current_width = sizes(x)
+    if (current_height, current_width) == (height, width):
+        return x
+    return dml.slice(x, [0, 0, 0, 0], [batch, channels, height, width], [1, 1, 1, 1])
+
+
 # --- Transformer pieces, used by the text encoders -------------------------
 
 

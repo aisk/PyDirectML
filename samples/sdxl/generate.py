@@ -32,6 +32,20 @@ from weights import load_text_encoders, load_tokenizers, load_unet, load_vae
 DEFAULT_PROMPT = "an astronaut riding a horse on mars, highly detailed"
 
 
+def dimensions(text):
+    """``1024`` or ``1024x1360``: a width and a height, each a multiple of 8."""
+    parts = text.lower().split("x")
+    if len(parts) not in (1, 2) or not all(part.strip().isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(f"expected WIDTH or WIDTHxHEIGHT, got {text!r}")
+
+    width, height = int(parts[0]), int(parts[-1])
+    for value in (width, height):
+        if value <= 0 or value % vae.SCALE_FACTOR:
+            raise argparse.ArgumentTypeError(
+                f"each side must be a positive multiple of {vae.SCALE_FACTOR}")
+    return width, height
+
+
 def encode_prompts(device, prompt, negative, checkpoint=None):
     """Run both CLIP towers over both prompts, then let them go."""
     encoders = TextEncoders(device, load_text_encoders(checkpoint), load_tokenizers())
@@ -46,8 +60,15 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("prompt", nargs="?", default=DEFAULT_PROMPT)
     parser.add_argument("--negative", default="", help="what to steer away from")
-    parser.add_argument("--size", type=int, default=1024,
-                        help="square size, a multiple of 8 (default: 1024, what SDXL was trained at)")
+    parser.add_argument("--size", type=dimensions, default=(1024, 1024),
+                        help="WIDTH or WIDTHxHEIGHT in pixels, each a multiple of 8 "
+                             "(default: 1024x1024, what SDXL was trained at)")
+    parser.add_argument("--sampler", choices=("euler", "euler_a"), default="euler",
+                        help="euler_a adds fresh noise back at every step, which is "
+                             "what ComfyUI and A1111 default to")
+    parser.add_argument("--spacing", choices=("leading", "linspace"), default="leading",
+                        help="which timesteps to visit: leading is SDXL's published "
+                             "config, linspace is what ComfyUI calls the normal schedule")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance", type=float, default=5.0,
                         help="how far to push from the negative prompt towards the prompt")
@@ -57,9 +78,7 @@ def main():
                         help="a single-file LDM checkpoint -- the format ComfyUI "
                              "and A1111 use -- instead of the hub weights")
     args = parser.parse_args()
-
-    if args.size % vae.SCALE_FACTOR:
-        parser.error(f"--size must be a multiple of {vae.SCALE_FACTOR}")
+    width, height = args.size
 
     device = dml.Device(use_gpu=True)
     started = time.perf_counter()
@@ -70,30 +89,34 @@ def main():
     print(f"  {list(embeds.shape)} sequence, {list(pooled.shape)} pooled "
           f"[{time.perf_counter() - started:.0f} s]")
 
-    scheduler = euler.EulerDiscreteScheduler()
+    if args.sampler == "euler_a":
+        scheduler = euler.EulerAncestralDiscreteScheduler(seed=args.seed, spacing=args.spacing)
+    else:
+        scheduler = euler.EulerDiscreteScheduler(spacing=args.spacing)
     scheduler.set_timesteps(args.steps)
 
-    latent_size = args.size // vae.SCALE_FACTOR
     rng = np.random.RandomState(args.seed)
-    latents = (rng.randn(1, vae.LATENT_CHANNELS, latent_size, latent_size)
+    latents = (rng.randn(1, vae.LATENT_CHANNELS,
+                         height // vae.SCALE_FACTOR, width // vae.SCALE_FACTOR)
                * scheduler.init_noise_sigma).astype(np.float32)
 
     print("Building the UNet")
     params = load_unet(args.checkpoint)
-    model = unet_module.UNet(device, params, args.size, args.size)
+    model = unet_module.UNet(device, params, height, width)
     params.clear()
     gc.collect()
     print(f"  {model.input_count} graph inputs across two graphs "
           f"[{time.perf_counter() - started:.0f} s]")
 
     # SDXL conditions on the resolution it is pretending to have been cropped
-    # from as well as on the prompt.
-    resolution = (args.size, args.size)
+    # from as well as on the prompt, height first.
+    resolution = (height, width)
     inputs = [unet_module.conditioning(0, p, resolution, (0, 0), resolution)[1]
               for p in (negative_pooled, pooled)]
     contexts = [e.reshape(1, 1, *e.shape) for e in (negative_embeds, embeds)]
 
-    print(f"Sampling, {args.steps} steps")
+    print(f"Sampling {width}x{height}, {args.steps} steps of {args.sampler}, "
+          f"{args.spacing} spacing")
     for step, timestep in enumerate(scheduler.timesteps):
         model_input = scheduler.scale_model_input(latents, step)
         time_input, _ = unet_module.conditioning(timestep, pooled, resolution, (0, 0), resolution)
@@ -111,7 +134,7 @@ def main():
     gc.collect()
 
     print("Decoding")
-    decoder = vae.decoder(device, load_vae(args.checkpoint), args.size, args.size)
+    decoder = vae.decoder(device, load_vae(args.checkpoint), height, width)
     image, = decoder.run(latents / vae.SCALING_FACTOR)
 
     print(f"Wrote {save_image(image, args.output)} [{time.perf_counter() - started:.0f} s]")
