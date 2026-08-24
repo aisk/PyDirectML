@@ -46,6 +46,9 @@ def main():
                         help="square size to work at, a multiple of 8 (default: 512)")
     parser.add_argument("--output", default="roundtrip.png")
     parser.add_argument("--latents", help="also write the latent to this .npy file")
+    parser.add_argument("--checkpoint",
+                        help="a single-file LDM checkpoint -- the format ComfyUI "
+                             "and A1111 use -- instead of the hub weights")
     args = parser.parse_args()
 
     if args.size % vae.SCALE_FACTOR:
@@ -54,7 +57,7 @@ def main():
         parser.error(f"no such image: {args.image}")
 
     original = load_image(args.image, args.size)
-    params = load_vae()
+    params = load_vae(args.checkpoint)
     device = dml.Device(use_gpu=True, use_debug_layer=False)
     print(f"{device}")
 

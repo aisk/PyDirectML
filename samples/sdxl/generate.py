@@ -32,9 +32,9 @@ from weights import load_text_encoders, load_tokenizers, load_unet, load_vae
 DEFAULT_PROMPT = "an astronaut riding a horse on mars, highly detailed"
 
 
-def encode_prompts(device, prompt, negative):
+def encode_prompts(device, prompt, negative, checkpoint=None):
     """Run both CLIP towers over both prompts, then let them go."""
-    encoders = TextEncoders(device, load_text_encoders(), load_tokenizers())
+    encoders = TextEncoders(device, load_text_encoders(checkpoint), load_tokenizers())
     conditioning = [encoders.encode(text) for text in (negative, prompt)]
     del encoders
     gc.collect()
@@ -53,6 +53,9 @@ def main():
                         help="how far to push from the negative prompt towards the prompt")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="generated.png")
+    parser.add_argument("--checkpoint",
+                        help="a single-file LDM checkpoint -- the format ComfyUI "
+                             "and A1111 use -- instead of the hub weights")
     args = parser.parse_args()
 
     if args.size % vae.SCALE_FACTOR:
@@ -63,7 +66,7 @@ def main():
 
     print("Encoding the prompt")
     (negative_embeds, negative_pooled), (embeds, pooled) = encode_prompts(
-        device, args.prompt, args.negative)
+        device, args.prompt, args.negative, args.checkpoint)
     print(f"  {list(embeds.shape)} sequence, {list(pooled.shape)} pooled "
           f"[{time.perf_counter() - started:.0f} s]")
 
@@ -76,7 +79,7 @@ def main():
                * scheduler.init_noise_sigma).astype(np.float32)
 
     print("Building the UNet")
-    params = load_unet()
+    params = load_unet(args.checkpoint)
     model = unet_module.UNet(device, params, args.size, args.size)
     params.clear()
     gc.collect()
@@ -108,7 +111,7 @@ def main():
     gc.collect()
 
     print("Decoding")
-    decoder = vae.decoder(device, load_vae(), args.size, args.size)
+    decoder = vae.decoder(device, load_vae(args.checkpoint), args.size, args.size)
     image, = decoder.run(latents / vae.SCALING_FACTOR)
 
     print(f"Wrote {save_image(image, args.output)} [{time.perf_counter() - started:.0f} s]")

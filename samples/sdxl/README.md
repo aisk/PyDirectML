@@ -21,6 +21,9 @@ python check.py                           # verify the graphs against NumPy
 python euler.py                           # the sampler's schedule and self test
 ```
 
+Every one of those takes `--checkpoint model.safetensors` to run against a
+single-file checkpoint instead of the hub weights.
+
 Weights download from the Hugging Face hub on first use and land in the usual
 `~/.cache/huggingface` directory: 320 MiB for the VAE, 3.3 GiB for the two text
 encoders, 5.1 GiB for the UNet at half precision. `check.py --part vae` skips
@@ -58,9 +61,10 @@ to survive the trip through this decoder.
 | `text_encoder.py` | Both CLIP towers, and the tokenizing that feeds them |
 | `unet.py` | The UNet, as two graphs |
 | `euler.py` | `EulerDiscreteScheduler`, in NumPy |
+| `ldm.py` | The key names single-file checkpoints use, translated to these |
 | `reference.py` | The same VAE and text encoders in NumPy, line for line |
 | `check.py` | Runs both and compares |
-| `weights.py` | Checkpoint download and float32 conversion |
+| `weights.py` | Where the tensors come from: the hub, or one local file |
 | `generate.py` | The whole pipeline: a prompt to an image |
 | `roundtrip.py`, `encode_prompt.py` | Demos of the VAE and the text encoders on their own |
 
@@ -203,6 +207,51 @@ to be right for a prompt to come out as a picture of what it asked for -- a wron
 skip order, a transposed attention, the penultimate CLIP layer taken from the
 wrong end, and the result is noise rather than a slightly worse image.
 
+## Single-file checkpoints
+
+Everything above reads diffusers' layout: a directory with one safetensors file
+per model, under the names these graphs use. ComfyUI and A1111 use a single file
+holding all three models under the names of Stability's latent-diffusion code,
+and `--checkpoint` takes one of those.
+
+    python generate.py "1girl, solo, cherry blossoms" --checkpoint model.safetensors
+
+`ldm.py` is the translation, and it is only renaming -- no graph changes, because
+the architecture does not change. Three of the renames are more than a name:
+OpenCLIP keeps one fused QKV matrix per layer where HF keeps three, its text
+projection is stored transposed, and the VAE's attention projections are 1x1
+convolutions where diffusers has plain linears. The rest is index arithmetic. LDM
+numbers the down and up paths as one flat list of blocks and stores the decoder's
+resolutions in the opposite order, so `input_blocks.7.1.transformer_blocks.3` has
+to come back out as `down_blocks.2.attentions.0.transformer_blocks.3`.
+
+Which kind of block a tensor belongs to is read off its own name rather than its
+position, because the sub-index that would say so shifts depending on whether the
+level has attention at all.
+
+Renaming 2641 keys is the kind of thing that goes wrong quietly, and the UNet has
+no NumPy reference to catch it. So `check.py --part layout` compares every
+converted name and shape against what diffusers publishes:
+
+```
+ok   vae              248 tensors
+ok   text_encoder     196 tensors
+ok   text_encoder_2   517 tensors
+ok   unet            1680 tensors
+```
+
+and `check.py --checkpoint` runs the usual numeric comparison on the
+checkpoint's own weights. One threshold moves: a finetuned CLIP sits wherever its
+training left it, so the pooled-similarity check asks only that a paraphrase beat
+an unrelated prompt rather than clearing an absolute bar. Against
+`prefectIllustriousXL_v8` that is 0.953 to 0.926, where base SDXL is 0.823 to
+0.292 -- the ordering survives, the margin does not.
+
+Two things a checkpoint does not carry. The tokenizers still come from the hub:
+the file holds weights only, and the 49408-entry vocabulary is not among them.
+And there is no scheduler config in it either, so `euler.py` keeps assuming
+epsilon prediction, which is what SDXL and its finetunes are trained with.
+
 ## Still missing
 
 - Only the deterministic Euler sampler. Ancestral and `s_churn` variants, and
@@ -210,6 +259,3 @@ wrong end, and the result is noise rather than a slightly worse image.
 - The refiner model, and the img2img and inpainting paths.
 - Batching. Everything is batch 1, so classifier-free guidance is two dispatches
   per step rather than one on a batch of two.
-- Single-file checkpoints. This reads the diffusers layout; the single-file
-  format that ComfyUI and A1111 use has its own key names and would need a
-  mapping table.

@@ -48,7 +48,7 @@ The samples under `samples/` need NumPy, the image samples additionally need Pil
 
 `samples/matmul.py` is the smallest thing that works, and `samples/dtypes.py` runs one graph at float32 and at float16 and shows what `Binding` refuses. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `candy.py` and `superres.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them.
 
-[`samples/sdxl/`](./samples/sdxl/) is Stable Diffusion XL built on these bindings — both CLIP text encoders, the UNet, the VAE, and the Euler sampler — running against the real SDXL weights. `python generate.py "a prompt"` produces a 1024×1024 image in 107 seconds on a Radeon RX 6800. The VAE and the text encoders are checked against a NumPy reference implementation that ships with it.
+[`samples/sdxl/`](./samples/sdxl/) is Stable Diffusion XL built on these bindings — both CLIP text encoders, the UNet, the VAE, and the Euler sampler — running against the real SDXL weights. `python generate.py "a prompt"` produces a 1024×1024 image in 107 seconds on a Radeon RX 6800. It reads either the weights diffusers publishes or, with `--checkpoint`, a single-file checkpoint of the kind ComfyUI and A1111 use. The VAE and the text encoders are checked against a NumPy reference implementation that ships with it.
 
 If the repository was cloned without `--recursive`, run `git submodule update --init --recursive` first. The build needs both the `pybind11` and `gpgmm` submodules.
 

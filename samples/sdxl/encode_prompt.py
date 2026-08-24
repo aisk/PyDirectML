@@ -33,12 +33,15 @@ def main():
     parser.add_argument("prompt", nargs="?", default=DEFAULT_PROMPT)
     parser.add_argument("--compare", help="a second prompt, to compare the pooled vectors")
     parser.add_argument("--save", help="write the conditioning to this .npz")
+    parser.add_argument("--checkpoint",
+                        help="a single-file LDM checkpoint -- the format ComfyUI "
+                             "and A1111 use -- instead of the hub weights")
     args = parser.parse_args()
 
     device = dml.Device(use_gpu=True)
 
     print("Loading weights (3.3 GiB as float32)")
-    weights = load_text_encoders()
+    weights = load_text_encoders(args.checkpoint)
     for name, config in CONFIGS.items():
         total = sum(v.size for v in weights[name].values())
         print(f"  {name:<16} {total / 1e6:5.0f}M params, "
