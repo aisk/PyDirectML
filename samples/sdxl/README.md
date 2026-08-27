@@ -253,6 +253,70 @@ to be right for a prompt to come out as a picture of what it asked for -- a wron
 skip order, a transposed attention, the penultimate CLIP layer taken from the
 wrong end, and the result is noise rather than a slightly worse image.
 
+## Where the memory goes
+
+`Model.temporary_size` and `Model.persistent_size` report what
+`IDMLCompiledOperator::GetBindingProperties` says a compiled graph needs: scratch
+for one dispatch, and the bytes DirectML holds between dispatches, which is the
+weights in whatever layout the operators wanted them in. `generate.py` prints
+both. Against `prefectIllustriousXL`:
+
+| | scratch | weights |
+| --- | --- | --- |
+| UNet, 1024x1024 | 0.90 GiB | 5.42 GiB |
+| UNet, 1024x1360 | 1.56 GiB | **8.75 GiB** |
+| UNet, 1024x1408 | 1.65 GiB | 5.42 GiB |
+| VAE decoder, 1024x1024 | 5.80 GiB | 0.18 GiB |
+| VAE decoder, 1024x1360 | 8.60 GiB | 0.18 GiB |
+
+Both surprises are in that table, and neither is the attention score matrices
+that were the obvious suspect -- those live in the scratch column, which stays
+under two gigabytes.
+
+**The UNet's weights are not supposed to depend on the image size, and at
+1024x1360 there are 3.3 GiB more of them.** DirectML lays a `gemm`'s weight out
+for the shape it is about to be multiplied by, and when the row count is not a
+multiple of 64 it keeps a second, repacked copy rather than reusing the one it
+already has. The rows are tokens. Isolated, one 1280x1280 `gemm` whose weight is
+3.125 MiB reports a persistent size of exactly 3.125 MiB for every token count
+divisible by 64 of the 96 tried between 64 and 1600, and exactly 6.250 MiB for
+all 72 that are not.
+
+Thirty of the UNet's seventy transformer layers are 1280 wide and sit at the
+deepest level, where the token count is 1024 at 1024x1024, 1376 at 1024x1360 and
+1408 at 1024x1408. Only the middle one is off a multiple of 64, and building the
+down half a stage at a time puts the growth exactly where that predicts: nothing
+through level 1, +1137 MiB across level 2's twenty transformer layers, +569 MiB
+across the mid block's ten. Fifty-seven megabytes per layer, which is the size of
+one layer's weights.
+
+So **1024x1408 is the larger image and needs 3.3 GiB less memory than
+1024x1360.** `unet.weights_are_duplicated` says whether a size pays for the
+second copy, and `generate.py` warns before it loads anything, naming a nearby
+size that does not. It is a warning and not an error: the size still runs.
+
+The rule is not "a multiple of 64" -- it is a multiple of 64 *at the deepest
+level*, which is a thirty-second of the image. Two sides that are each a multiple
+of 256 always satisfy it; most other sizes do not, including six of SDXL's own
+nine training buckets:
+
+| | deepest tokens | |
+| --- | --- | --- |
+| 1024x1024, 1536x640, 640x1536 | 1024, 960 | 5.42 GiB |
+| 896x1152, 1152x896, 1344x768, 768x1344 | 1008 | 8.75 GiB |
+| 1216x832, 832x1216 | 988 | 8.89 GiB |
+| 1280x1280 | 1600 | 5.42 GiB |
+
+1280x1280 has 1.56 times the pixels of 1024x1024 and the same weights; 896x1152
+has fewer pixels than either and 3.3 GiB more.
+
+**The VAE decoder's scratch is the largest single allocation an aligned run
+makes** -- larger, at 1024x1024, than the whole UNet's weights. It runs at the
+full image size with up to 512 channels, and every intermediate is a full-size
+image. It is not added to the UNet's peak, since `generate.py` releases the UNet
+before compiling the decoder, but it is a second peak of the same height. Tiled
+decoding is the way out and is not implemented.
+
 ## Single-file checkpoints
 
 Everything above reads diffusers' layout: a directory with one safetensors file
@@ -308,17 +372,17 @@ epsilon prediction, which is what SDXL and its finetunes are trained with.
   dispatch that had already succeeded several times. 1024x1024 and the in-bucket
   sizes have never done it.
 
-  It is a hang, not a failed allocation, but memory is the likely trigger: peak
-  dedicated VRAM measured over a run is 9.6 GiB at 1024x1024 and 14.4 GiB at
-  1024x1360, against 16 GiB on the card and a couple of gigabytes already spoken
-  for by the desktop. That close to full the driver is paging resources in and
-  out, and a dispatch waiting on that can sit long enough to be declared hung.
+  That size is one of the ones that pays for the duplicated weights above, which
+  accounts for 3.3 GiB of the 4.8 GiB gap between its 14.4 GiB peak of dedicated
+  VRAM and 1024x1024's 9.6 GiB, on a 16 GiB card with a couple of gigabytes
+  already spoken for by the desktop. Two mechanisms fit: that close to full the
+  driver is paging resources in and out and a dispatch waiting on that can sit
+  long enough to be declared hung, and separately the down half's persistent
+  buffer is 4.29 GiB there, over the 4 GiB line described above -- though it
+  initializes and dispatches, which that line says it should not.
 
-  The attention score matrices are what grows: they scale with the square of the
-  token count, not with pixels, so the level-1 self-attention matrix goes from
-  4096^2 x 10 heads to 5440^2 x 10 between those two sizes -- 335 MB to 592 MB,
-  each one materialized in full because `gemm`, `softmax` and `gemm` are three
-  separate operators here with nothing fused between them.
+  Avoiding the size avoids both. 1024x1408 is larger, aligned, and came out
+  clean, but that is one run and not yet evidence of stability.
 - The refiner model, and the img2img and inpainting paths.
 - Batching. Everything is batch 1, so classifier-free guidance is two dispatches
   per step rather than one on a batch of two.

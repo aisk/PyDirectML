@@ -40,6 +40,46 @@ NORM_EPSILON = 1e-5
 # resnets use.
 TRANSFORMER_NORM_EPSILON = 1e-6
 
+# DirectML lays a gemm's weight out for the shape it is about to be multiplied
+# by, and when the row count is not a multiple of this it keeps a second,
+# repacked copy in the graph's persistent resource instead of reusing the one it
+# already has. The rows are tokens, so this is a property of the image size.
+GEMM_ROW_ALIGNMENT = 64
+
+
+def deepest_tokens(height, width):
+    """Tokens the 1280-wide level sees, which is the row count of its gemms."""
+    def extent(size):
+        # The latent, halved once per downsampled level. A stride-2 convolution
+        # with one pixel of padding rounds up.
+        size //= 8
+        for _ in range(len(BLOCK_OUT_CHANNELS) - 1):
+            size = -(-size // 2)
+        return size
+
+    return extent(height) * extent(width)
+
+
+def weights_are_duplicated(height, width):
+    """Whether this size makes DirectML keep a second copy of the widest weights.
+
+    Thirty of the UNet's seventy transformer layers are 1280 wide, and a second
+    copy of them costs 1.7 GiB in each of the two graphs -- 5.4 GiB of weights
+    becoming 8.8, which on a 16 GiB card is the difference between a size that
+    works and one that hangs the device. 1024x1408 needs less memory than
+    1024x1360 for this reason, despite being the larger image.
+    """
+    return deepest_tokens(height, width) % GEMM_ROW_ALIGNMENT != 0
+
+
+def nearby_aligned(height, width, reach=256):
+    """The closest height to ``height`` that does not, or None if there is none."""
+    for offset in range(8, reach + 1, 8):
+        for candidate in (height - offset, height + offset):
+            if candidate > 0 and not weights_are_duplicated(candidate, width):
+                return candidate
+    return None
+
 
 def timestep_embedding(timesteps, dim, flip_sin_to_cos=True, freq_shift=0, max_period=10000):
     """Sinusoidal timestep features, computed on the CPU.
@@ -258,6 +298,17 @@ class UNet:
     @property
     def input_count(self):
         return self.down.input_count + self.up.input_count
+
+    @property
+    def temporary_size(self):
+        # One temporary buffer belongs to the device and is resized to whatever
+        # the dispatch in front of it asks for, and the halves are dispatched one
+        # after the other, so the peak is the larger of the two rather than a sum.
+        return max(self.down.temporary_size, self.up.temporary_size)
+
+    @property
+    def persistent_size(self):
+        return self.down.persistent_size + self.up.persistent_size
 
     def __call__(self, latent, time_input, add_input, context):
         """Predict the noise in ``latent``."""

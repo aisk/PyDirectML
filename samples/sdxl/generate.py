@@ -32,6 +32,10 @@ from weights import load_text_encoders, load_tokenizers, load_unet, load_vae
 DEFAULT_PROMPT = "an astronaut riding a horse on mars, highly detailed"
 
 
+def gibibytes(size):
+    return f"{size / (1 << 30):.2f} GiB"
+
+
 def dimensions(text):
     """``1024`` or ``1024x1360``: a width and a height, each a multiple of 8."""
     parts = text.lower().split("x")
@@ -62,7 +66,9 @@ def main():
     parser.add_argument("--negative", default="", help="what to steer away from")
     parser.add_argument("--size", type=dimensions, default=(1024, 1024),
                         help="WIDTH or WIDTHxHEIGHT in pixels, each a multiple of 8 "
-                             "(default: 1024x1024, what SDXL was trained at)")
+                             "(default: 1024x1024, what SDXL was trained at). Two "
+                             "sides that are each a multiple of 256 need 3.3 GiB "
+                             "less than most other sizes; anything else warns")
     parser.add_argument("--sampler", choices=("euler", "euler_a"), default="euler",
                         help="euler_a adds fresh noise back at every step, which is "
                              "what ComfyUI and A1111 default to")
@@ -79,6 +85,18 @@ def main():
                              "and A1111 use -- instead of the hub weights")
     args = parser.parse_args()
     width, height = args.size
+
+    # Not an error -- the size runs. It just spends 3.3 GiB more than it has
+    # to, and more where a shallower level is off its own alignment as well,
+    # which on a 16 GiB card can be the difference between running and hanging
+    # the device. Warned here rather than where the UNet is built so it arrives
+    # before the fifteen seconds of loading instead of after.
+    if unet_module.weights_are_duplicated(height, width):
+        alternative = unet_module.nearby_aligned(height, width)
+        instead = f" {width}x{alternative} does not." if alternative else ""
+        print(f"warning: at {width}x{height} DirectML keeps a second copy of the "
+              f"UNet's widest weights, at least 3.3 GiB more than the size "
+              f"needs.{instead}")
 
     device = dml.Device(use_gpu=True)
     started = time.perf_counter()
@@ -105,7 +123,9 @@ def main():
     model = unet_module.UNet(device, params, height, width)
     params.clear()
     gc.collect()
-    print(f"  {model.input_count} graph inputs across two graphs "
+    print(f"  {model.input_count} graph inputs across two graphs, "
+          f"{gibibytes(model.persistent_size)} of weights and "
+          f"{gibibytes(model.temporary_size)} of scratch "
           f"[{time.perf_counter() - started:.0f} s]")
 
     # SDXL conditions on the resolution it is pretending to have been cropped
@@ -135,6 +155,10 @@ def main():
 
     print("Decoding")
     decoder = vae.decoder(device, load_vae(args.checkpoint), height, width)
+    # The decoder holds few weights and enormous intermediates: it runs at the
+    # full image size with up to 512 channels, so its scratch is the largest
+    # single allocation an aligned run makes.
+    print(f"  {gibibytes(decoder.temporary_size)} of scratch")
     image, = decoder.run(latents / vae.SCALING_FACTOR)
 
     print(f"Wrote {save_image(image, args.output)} [{time.perf_counter() - started:.0f} s]")

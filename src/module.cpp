@@ -256,7 +256,22 @@ PYBIND11_MODULE(directml, module)
             return new pydml::CompiledModel(self, flags, outputs);
             }, "Compile the expressions to a compiled operator.");
 
-    py::class_<pydml::CompiledModel>(module, "Model");
+    py::class_<pydml::CompiledModel>(module, "Model")
+        .def_property_readonly("temporary_size", [](pydml::CompiledModel& self) {
+            return self.op->GetBindingProperties().TemporaryResourceSize;
+            },
+            "Bytes of scratch memory one dispatch of this graph needs. Every "
+            "intermediate tensor lives here, so this is the number that grows with "
+            "the size of the input rather than with the size of the weights.")
+        .def_property_readonly("persistent_size", [](pydml::CompiledModel& self) {
+            return self.op->GetBindingProperties().PersistentResourceSize;
+            },
+            "Bytes this graph keeps between dispatches: the OWNED_BY_DML tensors, "
+            "in whatever layout the operators wanted them in.")
+        .def_property_readonly("descriptor_count", [](pydml::CompiledModel& self) {
+            return self.op->GetBindingProperties().RequiredDescriptorCount;
+            },
+            "Descriptors one dispatch of this graph binds.");
 
     py::class_<dml::TensorPolicy>(module, "TensorPolicy")
         .def_property_readonly_static("default", [](py::object) { return dml::TensorPolicy::Default(); })

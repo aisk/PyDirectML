@@ -140,6 +140,16 @@ class Model:
     def input_count(self):
         return len(self._bindings)
 
+    @property
+    def temporary_size(self):
+        """Scratch bytes one dispatch needs -- where the intermediates live."""
+        return self._operator.temporary_size
+
+    @property
+    def persistent_size(self):
+        """Bytes the weights occupy once DirectML has laid them out."""
+        return self._operator.persistent_size
+
 
 def broadcast(expression, shape):
     """View ``expression`` as ``shape``, repeating any axis whose extent is 1."""
