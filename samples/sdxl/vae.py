@@ -9,6 +9,8 @@ Architecture and weight names follow ``diffusers.AutoencoderKL`` with the config
 published at ``stabilityai/sdxl-vae``.
 """
 
+import numpy as np
+
 import directml as dml
 
 from dml_layers import (
@@ -110,3 +112,101 @@ def encoder(device, params, height, width):
     model = Model(device)
     _, latent = build_encoder(model, params, [1, 3, height, width])
     return model.compile([latent])
+
+
+# --------------------------------------------------------------------------
+# Decoding in tiles
+
+# The decoder is the largest single allocation a generation makes -- 8.45 GiB of
+# scratch at 1024x1344, against the UNet's 1.53 -- because every intermediate is
+# a full-size image and the widest of them carry 512 channels. Decoding one tile
+# at a time replaces that with a fixed cost per tile.
+#
+# It is an approximation, not a refactoring. GroupNorm normalizes over the whole
+# feature map, so a tile decoded alone sees different statistics than the same
+# region does inside a whole-image decode. Overlapping the tiles and crossfading
+# between them is what hides the difference, and is what diffusers does as well.
+TILE_LATENT = 64
+TILE_OVERLAP = 8
+
+
+def _tile_starts(extent, tile, overlap):
+    """Evenly spaced tile origins covering ``extent``, every tile the same size.
+
+    Even spacing rather than a fixed stride with a short tile at the end: one
+    compiled graph then serves every tile, and the seams come out equally wide
+    instead of leaving the last one much narrower than the rest.
+    """
+    if extent <= tile:
+        return [0]
+    count = -(-(extent - overlap) // (tile - overlap))
+    span = extent - tile
+    return [round(i * span / (count - 1)) for i in range(count)]
+
+
+def _crossfade(starts, tile):
+    """Per-axis weights: a linear ramp across whatever the tiles actually share."""
+    weight = np.ones(tile, np.float32)
+    if len(starts) > 1:
+        overlap = tile - min(b - a for a, b in zip(starts, starts[1:]))
+        ramp = np.linspace(0.0, 1.0, overlap + 2, dtype=np.float32)[1:-1]
+        weight[:overlap] = ramp
+        weight[tile - overlap:] = ramp[::-1]
+    return weight
+
+
+class TiledDecoder:
+    """A decoder that runs one tile-sized graph over the whole latent.
+
+    Same ``run`` as the whole-image decoder: one latent in, one image out. The
+    graph is compiled once and dispatched per tile, so what grows with the image
+    is the number of dispatches rather than the size of any allocation.
+    """
+
+    def __init__(self, device, params, height, width,
+                 tile=TILE_LATENT, overlap=TILE_OVERLAP):
+        self.height, self.width = height, width
+        self.tile = min(tile, height // SCALE_FACTOR, width // SCALE_FACTOR)
+        overlap = min(overlap, self.tile // 2)
+
+        self.rows = _tile_starts(height // SCALE_FACTOR, self.tile, overlap)
+        self.columns = _tile_starts(width // SCALE_FACTOR, self.tile, overlap)
+
+        side = self.tile * SCALE_FACTOR
+        self.model = decoder(device, params, side, side)
+        self.window = np.outer(
+            _crossfade([row * SCALE_FACTOR for row in self.rows], side),
+            _crossfade([column * SCALE_FACTOR for column in self.columns], side))
+
+    @property
+    def tiles(self):
+        return len(self.rows) * len(self.columns)
+
+    @property
+    def input_count(self):
+        return self.model.input_count
+
+    @property
+    def temporary_size(self):
+        return self.model.temporary_size
+
+    @property
+    def persistent_size(self):
+        return self.model.persistent_size
+
+    def run(self, latent):
+        side = self.tile * SCALE_FACTOR
+        image = np.zeros((1, 3, self.height, self.width), np.float32)
+        weight = np.zeros((1, 1, self.height, self.width), np.float32)
+
+        for top in self.rows:
+            for left in self.columns:
+                piece, = self.model.run(
+                    latent[:, :, top:top + self.tile, left:left + self.tile])
+                y, x = top * SCALE_FACTOR, left * SCALE_FACTOR
+                image[:, :, y:y + side, x:x + side] += piece * self.window
+                weight[:, :, y:y + side, x:x + side] += self.window
+
+        # Two crossfades meeting sum to one, but a ramp on the outer border has
+        # no neighbour to complete it, so the weights are divided back out.
+        return [image / weight]

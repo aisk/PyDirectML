@@ -16,6 +16,7 @@ cd samples\sdxl
 
 python generate.py "a prompt"             # a prompt to an image
 python generate.py "a prompt" --size 832x1216 --sampler euler_a --spacing linspace
+python generate.py "a prompt" --size 1024x1408 --tile-decode   # a bounded decode
 python roundtrip.py                       # encode and decode an image
 python encode_prompt.py "a prompt"        # a prompt to the UNet's conditioning
 python check.py                           # verify the graphs against NumPy
@@ -310,12 +311,37 @@ nine training buckets:
 1280x1280 has 1.56 times the pixels of 1024x1024 and the same weights; 896x1152
 has fewer pixels than either and 3.3 GiB more.
 
-**The VAE decoder's scratch is the largest single allocation an aligned run
-makes** -- larger, at 1024x1024, than the whole UNet's weights. It runs at the
+**The VAE decoder's scratch was the largest single allocation an aligned run
+made** -- larger, at 1024x1024, than the whole UNet's weights. It runs at the
 full image size with up to 512 channels, and every intermediate is a full-size
 image. It is not added to the UNet's peak, since `generate.py` releases the UNet
-before compiling the decoder, but it is a second peak of the same height. Tiled
-decoding is the way out and is not implemented.
+before compiling the decoder, but it was a second peak of the same height.
+
+`--tile-decode` bounds it. The latent is cut into overlapping tiles, one
+tile-sized graph is compiled and dispatched over each of them, and the results
+are crossfaded back together. What grows with the image is then the number of
+dispatches rather than the size of any allocation:
+
+| | scratch | time | |
+| --- | --- | --- | --- |
+| 1024x1024, whole | 5.80 GiB | 1.0 s | |
+| 1024x1024, 9 tiles of 512 px | 1.45 GiB | 1.5 s | 42.98 dB against the whole decode |
+| 1024x1344, whole | 8.45 GiB | 2 s | |
+| 1024x1344, 9 tiles of 512 px | 1.45 GiB | 2 s | 44.16 dB, mean difference 1.12/255 |
+
+So the peak of an aligned generation stops being the decode and goes back to
+being the UNet at 7.0 GiB, and it stops growing with the image at all.
+
+It is an approximation and not a refactoring: GroupNorm normalizes over the whole
+feature map, so a tile decoded alone sees different statistics than the same
+region does inside a whole-image decode. That is why it is a flag and not the
+default. What the crossfade has to earn is that the error stays diffuse rather
+than collecting at the seams, and it does -- at 1024x1024 the column-mean
+difference at the two tile boundaries is 0.8 and 1.5 standard deviations above
+the profile immediately around them, while the largest column difference in the
+whole image is at `x=1`, the outer border, where a tile has the least context to
+normalize against. The reconstruction PSNR of a round trip goes from 36.25 dB to
+36.08.
 
 ## Single-file checkpoints
 

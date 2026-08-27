@@ -32,6 +32,12 @@ def load_image(path, size):
     return array.transpose(2, 0, 1)[None] * 2.0 - 1.0
 
 
+def psnr(a, b):
+    """Between two images in [-1, 1], as decibels."""
+    a, b = (np.clip(x * 0.5 + 0.5, 0.0, 1.0) for x in (a, b))
+    return 10.0 * np.log10(1.0 / max(float(((a - b) ** 2).mean()), 1e-12))
+
+
 def save_image(array, path):
     array = np.clip(array[0].transpose(1, 2, 0) * 0.5 + 0.5, 0.0, 1.0)
     Image.fromarray((array * 255.0 + 0.5).astype(np.uint8)).save(path)
@@ -46,6 +52,10 @@ def main():
                         help="square size to work at, a multiple of 8 (default: 512)")
     parser.add_argument("--output", default="roundtrip.png")
     parser.add_argument("--latents", help="also write the latent to this .npy file")
+    parser.add_argument("--tile-decode", action="store_true",
+                        help="decode a second time in overlapping tiles and report "
+                             "what the tiling cost in memory and in fidelity "
+                             "(needs --size above 512 to tile at all)")
     parser.add_argument("--checkpoint",
                         help="a single-file LDM checkpoint -- the format ComfyUI "
                              "and A1111 use -- instead of the hub weights")
@@ -81,10 +91,20 @@ def main():
     decoded, = decoder.run(scaled / vae.SCALING_FACTOR)
     print(f"  {time.perf_counter() - start:.1f} s")
 
-    a = np.clip(original * 0.5 + 0.5, 0.0, 1.0)
-    b = np.clip(decoded * 0.5 + 0.5, 0.0, 1.0)
-    psnr = 10.0 * np.log10(1.0 / max(float(((a - b) ** 2).mean()), 1e-12))
-    print(f"Reconstruction PSNR {psnr:.2f} dB")
+    print(f"Reconstruction PSNR {psnr(original, decoded):.2f} dB")
+
+    if args.tile_decode:
+        print("Decoding again in tiles")
+        tiled = vae.TiledDecoder(device, params, args.size, args.size)
+        start = time.perf_counter()
+        in_tiles, = tiled.run(scaled / vae.SCALING_FACTOR)
+        print(f"  {tiled.tiles} tiles of {tiled.tile * vae.SCALE_FACTOR} px, "
+              f"{time.perf_counter() - start:.1f} s")
+        print(f"  scratch {tiled.temporary_size / (1 << 30):.2f} GiB against "
+              f"{decoder.temporary_size / (1 << 30):.2f} GiB whole")
+        print(f"  against the whole-image decode {psnr(decoded, in_tiles):.2f} dB, "
+              f"against the original {psnr(original, in_tiles):.2f} dB")
+
     print(f"Wrote {save_image(decoded, args.output)}")
 
     return 0

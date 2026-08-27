@@ -79,6 +79,10 @@ def main():
     parser.add_argument("--guidance", type=float, default=5.0,
                         help="how far to push from the negative prompt towards the prompt")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tile-decode", action="store_true",
+                        help="decode in overlapping tiles, which cuts the largest "
+                             "allocation a run makes down to a fixed cost, at the "
+                             "price of an approximation across the seams")
     parser.add_argument("--output", default="generated.png")
     parser.add_argument("--checkpoint",
                         help="a single-file LDM checkpoint -- the format ComfyUI "
@@ -154,11 +158,17 @@ def main():
     gc.collect()
 
     print("Decoding")
-    decoder = vae.decoder(device, load_vae(args.checkpoint), height, width)
     # The decoder holds few weights and enormous intermediates: it runs at the
     # full image size with up to 512 channels, so its scratch is the largest
-    # single allocation an aligned run makes.
-    print(f"  {gibibytes(decoder.temporary_size)} of scratch")
+    # single allocation an aligned run makes, and tiling is what bounds it.
+    params = load_vae(args.checkpoint)
+    if args.tile_decode:
+        decoder = vae.TiledDecoder(device, params, height, width)
+        print(f"  {decoder.tiles} tiles of {decoder.tile * vae.SCALE_FACTOR} px, "
+              f"{gibibytes(decoder.temporary_size)} of scratch")
+    else:
+        decoder = vae.decoder(device, params, height, width)
+        print(f"  {gibibytes(decoder.temporary_size)} of scratch")
     image, = decoder.run(latents / vae.SCALING_FACTOR)
 
     print(f"Wrote {save_image(image, args.output)} [{time.perf_counter() - started:.0f} s]")
