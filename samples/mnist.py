@@ -39,24 +39,21 @@ ndarray_image = np.expand_dims(img_array, axis = (0, 1))
 rescaled_image = ndarray_image / ndarray_image.max()
 
 # Create a GPU device, and build a model graph.
-device = dml.Device(True, True)
-builder = dml.GraphBuilder(device)
-
-data_type = dml.TensorDataType.FLOAT32
-flags = dml.TensorFlags.OWNED_BY_DML
+device = dml.Device(use_gpu=True, use_debug_layer=True)
+graph = dml.Graph(device)
 
 def load(file_name):
     return np.load(tensor_data_path + "/" + file_name)
 
-input = dml.input_tensor(builder, 0, dml.TensorDesc(data_type, [1, 1, 28, 28]))
+input = graph.input([1, 1, 28, 28])
 
 # convolution28
-convolution28_weight = dml.input_tensor(builder, 1, dml.TensorDesc(data_type, flags, [8, 1, 5, 5]))
-convolution28_bias = dml.input_tensor(builder, 2, dml.TensorDesc(data_type, flags, [1, 8, 1, 1]))
+convolution28_weight = graph.input([8, 1, 5, 5], owned=True)
+convolution28_bias = graph.input([1, 8, 1, 1], owned=True)
 convolution28 = dml.convolution(input, convolution28_weight, convolution28_bias, strides = [1, 1], start_padding = [2, 2], end_padding = [2, 2])
 
 # plus30
-plus30_param6 = dml.input_tensor(builder, 3, dml.TensorDesc(data_type, [1, 8, 28, 28], [8, 1, 0, 0]))
+plus30_param6 = graph.input([1, 8, 28, 28], strides=[8, 1, 0, 0])
 plus30 = dml.add(convolution28, plus30_param6)
 
 # relu32
@@ -66,12 +63,12 @@ relu32 = dml.activation_relu(plus30)
 pooling66 = dml.max_pooling(relu32, strides = [2, 2], window_sizes = [2, 2])
 
 # convolution110
-convolution110_weight = dml.input_tensor(builder, 4, dml.TensorDesc(data_type, flags, [16, 8, 5, 5]))
-convolution110_bias = dml.input_tensor(builder, 5, dml.TensorDesc(data_type, flags, [1, 16, 1, 1]))
+convolution110_weight = graph.input([16, 8, 5, 5], owned=True)
+convolution110_bias = graph.input([1, 16, 1, 1], owned=True)
 convolution110 = dml.convolution(pooling66.values, convolution110_weight, convolution110_bias, strides = [1, 1], start_padding = [2, 2], end_padding = [2, 2])
 
 # plus112
-plus112_param88 = dml.input_tensor(builder, 6, dml.TensorDesc(data_type, [1, 16, 14, 14], [16, 1, 0, 0]))
+plus112_param88 = graph.input([1, 16, 14, 14], strides=[16, 1, 0, 0])
 plus112 = dml.add(convolution110, plus112_param88)
 
 # relu114
@@ -81,23 +78,23 @@ relu114 = dml.activation_relu(plus112)
 pooling160 = dml.max_pooling(relu114, strides = [3, 3], window_sizes = [3, 3])
 
 # times212_reshape0
-times212_reshape0 = dml.reinterpret(pooling160.values, dml.TensorDataType.FLOAT32, [1, 1, 1, 256], [256, 256, 256, 1])
+times212_reshape0 = dml.reinterpret(pooling160.values, [1, 1, 1, 256], [256, 256, 256, 1])
 
 # times212_reshape1
-times212_reshape1_param193 = dml.input_tensor(builder, 7, dml.TensorDesc(data_type, flags, [16, 4, 4, 10]))
+times212_reshape1_param193 = graph.input([16, 4, 4, 10], owned=True)
 identity = dml.activation_identity(times212_reshape1_param193)
-times212_reshape1 = dml.reinterpret(identity, dml.TensorDataType.FLOAT32, [1, 1, 256, 10], [2560, 2560, 10, 1])
+times212_reshape1 = dml.reinterpret(identity, [1, 1, 256, 10], [2560, 2560, 10, 1])
 
 # times212
 times212 = dml.gemm(times212_reshape0, times212_reshape1)
 
 # plus214
-plus214_param194 = dml.input_tensor(builder, 8, dml.TensorDesc(data_type, flags, [1, 1, 1, 10]))
+plus214_param194 = graph.input([1, 1, 1, 10], owned=True)
 plus214 = dml.add(times212, plus214_param194)
 
 softmax = dml.activation_softmax(plus214)
 # Compile the expression graph into a compiled operator
-op = builder.build(dml.ExecutionFlags.NONE, [softmax])
+op = graph.compile([softmax])
 
 # The weights DirectML owns are read once here; the rest ride along with each
 # dispatch.

@@ -14,7 +14,7 @@ import numpy as np
 import directml as dml
 
 from dml_layers import (
-    Model, attention_block, conv2d, group_norm, resnet_block, silu, sizes,
+    Model, attention_block, conv2d, group_norm, resnet_block, silu,
     upsample_nearest)
 
 BLOCK_OUT_CHANNELS = (128, 256, 512, 512)
@@ -94,8 +94,10 @@ def build_encoder(model, params, image_shape):
                params["encoder.conv_out.bias"])
     moments = conv2d(model, h, params["quant_conv.weight"], params["quant_conv.bias"], padding=0)
 
-    _, _, height, width = sizes(moments)
-    mean = dml.slice(moments, [0, 0, 0, 0], [1, LATENT_CHANNELS, height, width], [1, 1, 1, 1])
+    _, _, height, width = moments.shape
+    mean = dml.slice(moments, input_window_offsets=[0, 0, 0, 0],
+                     input_window_sizes=[1, LATENT_CHANNELS, height, width],
+                     input_window_strides=[1, 1, 1, 1])
     return image, mean
 
 

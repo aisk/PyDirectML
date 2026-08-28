@@ -22,7 +22,7 @@ import directml as dml
 
 from dml_layers import (
     Model, broadcast, conv2d, crop_to, diffusers_attention, geglu, group_norm,
-    layer_norm, linear, silu, sizes, to_channels, to_image, to_tokens,
+    layer_norm, linear, silu, to_channels, to_image, to_tokens,
     upsample_nearest)
 
 LATENT_CHANNELS = 4
@@ -131,7 +131,7 @@ def resnet_block(model, x, temb, params, prefix):
 
     projected = linear(model, silu(temb), params[f"{prefix}.time_emb_proj.weight"],
                        params[f"{prefix}.time_emb_proj.bias"])
-    h = dml.add(h, broadcast(to_channels(projected), sizes(h)))
+    h = dml.add(h, broadcast(to_channels(projected), h.shape))
 
     h = conv2d(model, silu(group_norm(model, h, params[f"{prefix}.norm2.weight"],
                                       params[f"{prefix}.norm2.bias"],
@@ -163,7 +163,7 @@ def transformer_block(model, x, context, params, prefix, heads):
 
 def transformer_2d(model, x, context, params, prefix, heads, layers):
     """A stack of transformer blocks wrapped in a norm, a reshape and a residual."""
-    _, _, height, width = sizes(x)
+    _, _, height, width = x.shape
     residual = x
 
     tokens = to_tokens(group_norm(model, x, params[f"{prefix}.norm.weight"],
@@ -212,7 +212,7 @@ def up_block(model, x, skips, temb, context, params, prefix, heads, layers, upsa
         # by doubling, so the upsample is trimmed to whatever the next skip
         # connection is, before the convolution rather than after -- which is
         # what diffusers does by handing Upsample2D an output size.
-        _, _, height, width = sizes(skips[-1])
+        _, _, height, width = skips[-1].shape
         x = conv2d(model, crop_to(upsample_nearest(x), height, width),
                    params[f"{prefix}.upsamplers.0.conv.weight"],
                    params[f"{prefix}.upsamplers.0.conv.bias"])
@@ -285,16 +285,16 @@ class UNet:
     """
 
     def __init__(self, device, params, height, width,
-                 tensor_type=dml.TensorDataType.FLOAT16, tokens=77, batch=1):
+                 dtype=np.float16, tokens=77, batch=1):
         self.batch = batch
         latent_shape = [batch, LATENT_CHANNELS, height // 8, width // 8]
 
-        self.down = Model(device, tensor_type)
+        self.down = Model(device, dtype)
         _, outputs = build_down(self.down, params, latent_shape, tokens)
-        shapes = [sizes(o) for o in outputs]
+        shapes = [list(o.shape) for o in outputs]
         self.down.compile(outputs)
 
-        self.up = Model(device, tensor_type)
+        self.up = Model(device, dtype)
         noise = build_up(self.up, params, shapes[0], shapes[1], shapes[2:], tokens)
         self.up.compile([noise])
 

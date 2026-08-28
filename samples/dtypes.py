@@ -18,12 +18,12 @@ import directml as dml
 
 def gemm(device, data_type, a, b):
     """Multiply two matrices with every tensor declared as ``data_type``."""
-    graph = dml.GraphBuilder(device)
-    lhs = dml.input_tensor(graph, 0, dml.TensorDesc(data_type, [1, 1, *a.shape]))
-    rhs = dml.input_tensor(graph, 1, dml.TensorDesc(data_type, [1, 1, *b.shape]))
+    graph = dml.Graph(device)
+    lhs = graph.input([1, 1, *a.shape], data_type)
+    rhs = graph.input([1, 1, *b.shape], data_type)
     product = dml.gemm(lhs, rhs)
 
-    op = graph.build(dml.ExecutionFlags.NONE, [product])
+    op = graph.compile([product])
     output, = op({lhs: a, rhs: b})
 
     # No dtype is named here: the result carries the tensor's own.
@@ -44,9 +44,9 @@ def main():
               f"{product.nbytes} bytes, max error {error:.2e}")
 
     print("\nWhat dispatch accepts")
-    graph = dml.GraphBuilder(device)
-    tensor = dml.input_tensor(graph, 0, dml.TensorDesc(dml.TensorDataType.FLOAT32, [1, 1, 2, 2]))
-    op = graph.build(dml.ExecutionFlags.NONE, [dml.activation_identity(tensor)])
+    graph = dml.Graph(device)
+    tensor = graph.input([1, 1, 2, 2])
+    op = graph.compile([dml.activation_identity(tensor)])
 
     cases = [
         ("float64 array", np.zeros((2, 2), np.float64)),

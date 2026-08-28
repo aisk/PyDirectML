@@ -36,34 +36,32 @@ img_4 = np.expand_dims(np.expand_dims(img_ndarray, axis=0), axis=0)
 img_5 = img_4.astype(np.float32) / 255.0
 
 # Create an executing device and build a model
-device = dml.Device(True, True)
-builder = dml.GraphBuilder(device)
+device = dml.Device(use_gpu=True, use_debug_layer=True)
+graph = dml.Graph(device)
 
-data_type = dml.TensorDataType.FLOAT32
-input = dml.input_tensor(builder, 0, dml.TensorDesc(data_type, [batch_size,1,224,224]));
-flags = dml.TensorFlags.OWNED_BY_DML
+input = graph.input([batch_size, 1, 224, 224])
 
 # conv1
-conv1_filter = dml.input_tensor(builder, 1, dml.TensorDesc(data_type, flags, [64, 1, 5, 5]))
-conv1_bias = dml.input_tensor(builder, 2, dml.TensorDesc(data_type, flags, [1,64,1,1]))
-conv1 = dml.convolution(input, conv1_filter, conv1_bias, start_padding = [2,2], end_padding = [2,2], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
+conv1_filter = graph.input([64, 1, 5, 5], owned=True)
+conv1_bias = graph.input([1,64,1,1], owned=True)
+conv1 = dml.convolution(input, conv1_filter, conv1_bias, start_padding = [2,2], end_padding = [2,2], fused_activation = dml.FusedActivation.relu())
 
 # conv2
-conv2_filter = dml.input_tensor(builder, 3, dml.TensorDesc(data_type, flags, [64,64,3,3]))
-conv2_bias = dml.input_tensor(builder, 4, dml.TensorDesc(data_type, flags, [1,64,1,1]))
-conv2 = dml.convolution(conv1, conv2_filter, conv2_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
+conv2_filter = graph.input([64,64,3,3], owned=True)
+conv2_bias = graph.input([1,64,1,1], owned=True)
+conv2 = dml.convolution(conv1, conv2_filter, conv2_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation.relu())
 
 # conv3
-conv3_filter = dml.input_tensor(builder, 5, dml.TensorDesc(data_type, flags, [32,64,3,3]))
-conv3_bias = dml.input_tensor(builder, 6, dml.TensorDesc(data_type, flags, [1,32,1,1]))
-conv3 = dml.convolution(conv2, conv3_filter, conv3_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
+conv3_filter = graph.input([32,64,3,3], owned=True)
+conv3_bias = graph.input([1,32,1,1], owned=True)
+conv3 = dml.convolution(conv2, conv3_filter, conv3_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation.relu())
 
-conv4_filter = dml.input_tensor(builder, 7, dml.TensorDesc(data_type, flags, [9, 32, 3, 3]))
-conv4_bias = dml.input_tensor(builder, 8, dml.TensorDesc(data_type, flags, [1,9,1,1]))
-conv4 = dml.convolution(conv3, conv4_filter, conv4_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
+conv4_filter = graph.input([9, 32, 3, 3], owned=True)
+conv4_bias = graph.input([1,9,1,1], owned=True)
+conv4 = dml.convolution(conv3, conv4_filter, conv4_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation.relu())
 
 # Compile the expression graph into a compiled operator
-op = builder.build(dml.ExecutionFlags.NONE, [conv4])
+op = graph.compile([conv4])
 
 # Model inputs in the previously designated order
 inputs = [

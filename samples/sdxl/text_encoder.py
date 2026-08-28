@@ -24,7 +24,7 @@ import numpy as np
 import directml as dml
 
 from dml_layers import (
-    UINT32, Model, layer_norm, linear, multi_head_attention, quick_gelu)
+    Model, layer_norm, linear, multi_head_attention, quick_gelu)
 
 MAX_TOKENS = 77
 LAYER_NORM_EPSILON = 1e-5
@@ -75,7 +75,7 @@ def build_text_encoder(model, params, config):
     wants_pooled = config["projection"] is not None
 
     table = params["text_model.embeddings.token_embedding.weight"]
-    tokens = model.placeholder([1, 1, 1, MAX_TOKENS], UINT32)
+    tokens = model.placeholder([1, 1, 1, MAX_TOKENS], np.uint32)
     x = dml.gather(model.constant(table, shape=[1, 1, table.shape[0], width]),
                    tokens, axis=2, index_dimensions=1)
     x = dml.add(x, model.constant(params["text_model.embeddings.position_embedding.weight"],

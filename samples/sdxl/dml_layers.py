@@ -26,83 +26,54 @@ import numpy as np
 
 import directml as dml
 
-FLOAT32 = dml.TensorDataType.FLOAT32
-UINT32 = dml.TensorDataType.UINT32
-
-NUMPY_DTYPES = {
-    FLOAT32: np.float32,
-    dml.TensorDataType.FLOAT16: np.float16,
-    UINT32: np.uint32,
-    dml.TensorDataType.INT32: np.int32,
-}
-
-
-def sizes(expression):
-    """The shape of an expression's output, as a list."""
-    return list(expression.desc.sizes)
-
-
-def data_type(expression):
-    """The element type of an expression's output.
-
-    Every reshape below reads this off the expression rather than assuming
-    float32, so the same layer code builds a half-precision graph.
-    """
-    return expression.desc.data_type
-
 
 class Model:
     """A graph under construction, plus the arrays bound to its weights.
 
-    Weights are registered with :meth:`constant` and carry their data with them.
-    Anything fed per run -- the latent, the image -- is registered with
+    Weights are registered with :meth:`constant` and carry their data with
+    them. Anything fed per run -- the latent, the image -- is registered with
     :meth:`placeholder` and supplied to :meth:`run`. This is the part that
-    belongs to the model domain: naming which array feeds which input. The
-    index bookkeeping, dtype conversion and validation all live in the library.
+    belongs to the model domain: naming which array feeds which input.
+    Everything else -- index bookkeeping, dtype conversion, validation --
+    lives in the library.
     """
 
-    def __init__(self, device, tensor_type=FLOAT32):
-        self.tensor_type = tensor_type
-        self.data_type = NUMPY_DTYPES[tensor_type]
-        self.graph = dml.GraphBuilder(device)
+    def __init__(self, device, dtype=np.float32):
+        self.dtype = np.dtype(dtype)
+        self.graph = dml.Graph(device)
         self.weights = {}        # Expression -> ndarray, handed over at compile
         self._placeholders = []  # the run() arguments, in order
         self.input_count = 0
         self._operator = None
 
-    def _add_input(self, flags, data_type, shape):
-        desc = dml.TensorDesc(data_type, flags, list(shape))
-        expression = dml.input_tensor(self.graph, self.input_count, desc)
-        self.input_count += 1
-        return expression
-
     def constant(self, array, shape=None):
         """Register a weight, reshaped to ``shape`` if given.
 
-        OWNED_BY_DML hands the tensor to DirectML at initialization, which is
-        once per model, and it stays on the GPU from then on. Without the flag
-        it would be re-uploaded on every dispatch.
+        ``owned=True`` hands the tensor to DirectML at initialization, which is
+        once per model, and it stays on the GPU from then on. Without it the
+        weight would be re-uploaded on every dispatch.
         """
-        array = np.ascontiguousarray(array, self.data_type)
+        array = np.ascontiguousarray(array, self.dtype)
         if shape is not None:
             array = array.reshape(shape)
-        expression = self._add_input(dml.TensorFlags.OWNED_BY_DML, self.tensor_type, array.shape)
+        expression = self.graph.input(array.shape, self.dtype, owned=True)
+        self.input_count += 1
         self.weights[expression] = array
         return expression
 
-    def placeholder(self, shape, data_type=None):
+    def placeholder(self, shape, dtype=None):
         """Register an input whose data is supplied to :meth:`run`.
 
-        Token indices are the reason this takes a data type: ``gather`` wants an
+        Token indices are the reason this takes a dtype: ``gather`` wants an
         integer tensor.
         """
-        data_type = self.tensor_type if data_type is None else data_type
-        expression = self._add_input(dml.TensorFlags.NONE, data_type, shape)
+        expression = self.graph.input(shape, self.dtype if dtype is None else dtype)
+        self.input_count += 1
         self._placeholders.append(expression)
         return expression
 
     def compile(self, outputs):
-        self._operator = self.graph.build(dml.ExecutionFlags.NONE, list(outputs))
+        self._operator = self.graph.compile(list(outputs))
         # Uploads every weight and hands it to DirectML. The library keeps no
         # copy, so dropping ours here leaves exactly one, on the GPU -- that is
         # 5.1 GiB for the UNet at half precision.
@@ -131,11 +102,11 @@ class Model:
 
 def broadcast(expression, shape):
     """View ``expression`` as ``shape``, repeating any axis whose extent is 1."""
-    source = sizes(expression)
-    if source == list(shape):
+    source = expression.shape
+    if list(source) == list(shape):
         return expression
     if len(source) != len(shape):
-        raise ValueError(f"cannot broadcast {source} to {list(shape)}: rank differs")
+        raise ValueError(f"cannot broadcast {list(source)} to {list(shape)}: rank differs")
 
     packed = [1] * len(source)
     for i in range(len(source) - 2, -1, -1):
@@ -148,25 +119,25 @@ def broadcast(expression, shape):
         elif size == 1:
             strides.append(0)
         else:
-            raise ValueError(f"cannot broadcast {source} to {list(shape)}: axis of {size}")
+            raise ValueError(f"cannot broadcast {list(source)} to {list(shape)}: axis of {size}")
 
-    return dml.reinterpret(expression, data_type(expression), list(shape), strides)
+    return dml.reinterpret(expression, list(shape), strides)
 
 
 def to_tokens(expression):
     """View ``[1, C, H, W]`` as ``[1, 1, H*W, C]`` -- a transpose, not a copy."""
-    n, c, h, w = sizes(expression)
-    return dml.reinterpret(expression, data_type(expression), [n, 1, h * w, c],
-                       [c * h * w, c * h * w, 1, h * w])
+    n, c, h, w = expression.shape
+    return dml.reinterpret(expression, [n, 1, h * w, c],
+                           [c * h * w, c * h * w, 1, h * w])
 
 
 def to_image(expression, height, width):
     """The inverse of :func:`to_tokens`."""
-    n, _, tokens, c = sizes(expression)
+    n, _, tokens, c = expression.shape
     if tokens != height * width:
         raise ValueError(f"{tokens} tokens do not fill {height}x{width}")
-    return dml.reinterpret(expression, data_type(expression), [n, c, height, width],
-                       [c * tokens, 1, width * c, c])
+    return dml.reinterpret(expression, [n, c, height, width],
+                           [c * tokens, 1, width * c, c])
 
 
 def silu(expression):
@@ -197,28 +168,26 @@ def linear(model, x, weight, bias=None):
 
     # A gemm wants both operands to agree on the batch axes, and a weight has
     # none of its own, so it is repeated across the batch at a stride of zero.
-    batch = sizes(x)[0]
+    batch = x.shape[0]
     if batch != 1:
         weights = broadcast(weights, [batch, 1, out_features, weight.shape[1]])
     if bias is None:
         return dml.gemm(x, weights, trans_b=transpose)
 
     biases = model.constant(bias, shape=[1, 1, 1, out_features])
-    shape = sizes(x)[:-1] + [out_features]
+    shape = [*x.shape[:-1], out_features]
     return dml.gemm(x, weights, broadcast(biases, shape), trans_b=transpose)
 
 
 def group_norm(model, x, weight, bias, groups=32, epsilon=1e-6):
     """GroupNorm over ``[1, C, H, W]``, affine applied per channel afterwards."""
-    n, c, h, w = shape = sizes(x)
+    n, c, h, w = shape = list(x.shape)
     if c % groups:
         raise ValueError(f"{c} channels do not divide into {groups} groups")
 
-    grouped = dml.reinterpret(x, data_type(x), [n, groups, c // groups, h * w], None)
-    normalized = dml.mean_variance_normalization(
-        grouped, None, None, [2, 3],
-        normalize_variance=True, normalize_mean=True, epsilon=epsilon)
-    normalized = dml.reinterpret(normalized, data_type(x), shape, None)
+    grouped = dml.reinterpret(x, [n, groups, c // groups, h * w])
+    normalized = dml.mean_variance_normalization(grouped, axes=[2, 3], epsilon=epsilon)
+    normalized = dml.reinterpret(normalized, shape)
 
     scale = broadcast(model.constant(weight, shape=[1, c, 1, 1]), shape)
     shift = broadcast(model.constant(bias, shape=[1, c, 1, 1]), shape)
@@ -247,7 +216,7 @@ def attention_block(model, x, params, prefix, epsilon=1e-6):
     The projections run in token layout so the whole block is four matrix
     multiplies and a softmax; the only reshapes are stride tricks.
     """
-    _, channels, height, width = sizes(x)
+    _, channels, height, width = x.shape
 
     normalized = group_norm(model, x, params[f"{prefix}.group_norm.weight"],
                             params[f"{prefix}.group_norm.bias"], epsilon=epsilon)
@@ -259,7 +228,7 @@ def attention_block(model, x, params, prefix, epsilon=1e-6):
 
     scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
                       alpha=1.0 / math.sqrt(channels))
-    attended = dml.gemm(dml.activation_softmax(scores, [3]), value)
+    attended = dml.gemm(dml.activation_softmax(scores, axes=[3]), value)
 
     projected = linear(model, attended, params[f"{prefix}.to_out.0.weight"],
                        params[f"{prefix}.to_out.0.bias"])
@@ -268,8 +237,8 @@ def attention_block(model, x, params, prefix, epsilon=1e-6):
 
 def upsample_nearest(x, scale=2):
     """Nearest-neighbour upsampling, the only interpolation the VAE uses."""
-    return dml.up_sample_2d(x, dml.Size2D(scale, scale),
-                            dml.InterpolationMode.NEAREST_NEIGHBOR)
+    return dml.upsample_2d(x, scale_size=(scale, scale),
+                           interpolation_mode=dml.InterpolationMode.NEAREST_NEIGHBOR)
 
 
 def crop_to(x, height, width):
@@ -283,10 +252,12 @@ def crop_to(x, height, width):
     destination -- which is what diffusers does by handing the upsampler the
     size it is aiming for.
     """
-    batch, channels, current_height, current_width = sizes(x)
+    batch, channels, current_height, current_width = x.shape
     if (current_height, current_width) == (height, width):
         return x
-    return dml.slice(x, [0, 0, 0, 0], [batch, channels, height, width], [1, 1, 1, 1])
+    return dml.slice(x, input_window_offsets=[0, 0, 0, 0],
+                     input_window_sizes=[batch, channels, height, width],
+                     input_window_strides=[1, 1, 1, 1])
 
 
 # --- Transformer pieces, used by the text encoders -------------------------
@@ -298,11 +269,9 @@ def layer_norm(model, x, weight, bias, epsilon=1e-5):
     Same shape rule as :func:`group_norm`: the affine cannot ride along on the
     normalization, because the axis it varies over is the axis being normalized.
     """
-    shape = sizes(x)
+    shape = list(x.shape)
     leading = [1] * (len(shape) - 1)
-    normalized = dml.mean_variance_normalization(
-        x, None, None, [len(shape) - 1],
-        normalize_variance=True, normalize_mean=True, epsilon=epsilon)
+    normalized = dml.mean_variance_normalization(x, axes=[len(shape) - 1], epsilon=epsilon)
 
     scale = broadcast(model.constant(weight, shape=leading + [shape[-1]]), shape)
     shift = broadcast(model.constant(bias, shape=leading + [shape[-1]]), shape)
@@ -311,16 +280,16 @@ def layer_norm(model, x, weight, bias, epsilon=1e-5):
 
 def quick_gelu(x):
     """x * sigmoid(1.702x), the approximation CLIP ViT-L was trained with."""
-    return dml.multiply(x, dml.activation_sigmoid(dml.activation_linear(x, 1.702, 0.0)))
+    return dml.multiply(x, dml.activation_sigmoid(dml.activation_linear(x, alpha=1.702, beta=0.0)))
 
 
 def split_heads(x, heads):
     """View ``[1, 1, T, C]`` as ``[1, heads, T, C/heads]``. No copy."""
-    n, _, tokens, channels = sizes(x)
+    n, _, tokens, channels = x.shape
     if channels % heads:
         raise ValueError(f"{channels} channels do not divide into {heads} heads")
     dim = channels // heads
-    return dml.reinterpret(x, data_type(x), [n, heads, tokens, dim],
+    return dml.reinterpret(x, [n, heads, tokens, dim],
                            [tokens * channels, dim, channels, 1])
 
 
@@ -334,11 +303,11 @@ def merge_heads(x):
     then let an identity operator write it out packed, after which the last
     reshape is free.
     """
-    n, heads, tokens, dim = sizes(x)
-    transposed = dml.reinterpret(x, data_type(x), [n, tokens, heads, dim],
+    n, heads, tokens, dim = x.shape
+    transposed = dml.reinterpret(x, [n, tokens, heads, dim],
                                  [heads * tokens * dim, dim, tokens * dim, 1])
     packed = dml.activation_identity(transposed)
-    return dml.reinterpret(packed, data_type(x), [n, 1, tokens, heads * dim], None)
+    return dml.reinterpret(packed, [n, 1, tokens, heads * dim])
 
 
 def attend(query, key, value, heads, mask=None):
@@ -347,11 +316,12 @@ def attend(query, key, value, heads, mask=None):
     Key and value may carry a different number of tokens than the query, which
     is what makes this cross-attention as well as self-attention.
     """
-    dim = sizes(query)[-1] // heads
+    dim = query.shape[-1] // heads
     if mask is None:
         # One operator instead of three. The score matrix stays inside it rather
         # than becoming a tensor the graph has to find room for twice.
-        return dml.multihead_attention(query, key, value, heads, 1.0 / math.sqrt(dim))
+        return dml.multihead_attention(query, key, value, head_count=heads,
+                                       scale=1.0 / math.sqrt(dim))
 
     # DML_MULTIHEAD_ATTENTION_MASK_TYPE has no additive mask, and CLIP's is
     # additive and causal, so a masked attention is still written out by hand.
@@ -359,9 +329,9 @@ def attend(query, key, value, heads, mask=None):
 
     scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
                       alpha=1.0 / math.sqrt(dim))
-    scores = dml.add(scores, broadcast(mask, sizes(scores)))
+    scores = dml.add(scores, broadcast(mask, scores.shape))
 
-    return merge_heads(dml.gemm(dml.activation_softmax(scores, [3]), value))
+    return merge_heads(dml.gemm(dml.activation_softmax(scores, axes=[3]), value))
 
 
 def multi_head_attention(model, x, params, prefix, heads, mask=None):
@@ -392,19 +362,21 @@ def diffusers_attention(model, x, params, prefix, heads, context=None):
 
 def to_channels(expression):
     """View ``[1, 1, 1, C]`` as ``[1, C, 1, 1]``, ready to broadcast over an image."""
-    n, _, _, c = sizes(expression)
-    return dml.reinterpret(expression, data_type(expression), [n, c, 1, 1], None)
+    n, _, _, c = expression.shape
+    return dml.reinterpret(expression, [n, c, 1, 1])
 
 
 def geglu(model, x, params, prefix):
     """The UNet's feed-forward: project to twice the width, gate one half by the other."""
     projected = linear(model, x, params[f"{prefix}.net.0.proj.weight"],
                        params[f"{prefix}.net.0.proj.bias"])
-    n, _, tokens, doubled = sizes(projected)
+    n, _, tokens, doubled = projected.shape
     inner = doubled // 2
 
     def half(offset):
-        return dml.slice(projected, [0, 0, 0, offset], [n, 1, tokens, inner], [1, 1, 1, 1])
+        return dml.slice(projected, input_window_offsets=[0, 0, 0, offset],
+                         input_window_sizes=[n, 1, tokens, inner],
+                         input_window_strides=[1, 1, 1, 1])
 
     gated = dml.multiply(half(0), dml.activation_gelu(half(inner)))
     return linear(model, gated, params[f"{prefix}.net.2.weight"], params[f"{prefix}.net.2.bias"])

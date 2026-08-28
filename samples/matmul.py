@@ -20,17 +20,13 @@ def matmul(a, b):
     b = np.ascontiguousarray(b, np.float32)
 
     device = dml.Device(use_gpu=True)
-    graph = dml.GraphBuilder(device)
+    graph = dml.Graph(device)
 
-    def matrix_input(index, matrix):
-        desc = dml.TensorDesc(dml.TensorDataType.FLOAT32, [1, 1, *matrix.shape])
-        return dml.input_tensor(graph, index, desc)
-
-    lhs = matrix_input(0, a)
-    rhs = matrix_input(1, b)
+    lhs = graph.input([1, 1, *a.shape])
+    rhs = graph.input([1, 1, *b.shape])
     product = dml.gemm(lhs, rhs)
 
-    op = graph.build(dml.ExecutionFlags.NONE, [product])
+    op = graph.compile([product])
     output, = op({lhs: a, rhs: b})
 
     return output.reshape(a.shape[0], b.shape[1])

@@ -8,6 +8,7 @@ messages. The boundary of the library is ``import directml``, not the ``.pyd``.
 
 import importlib.metadata
 import math
+import typing
 
 import numpy as np
 
@@ -227,3 +228,179 @@ def _operator_dispatch(self, inputs=None):
 _core.CompiledOperator.initialize = _operator_initialize
 _core.CompiledOperator.dispatch = _operator_dispatch
 _core.CompiledOperator.__call__ = _operator_dispatch
+
+
+# --- Graph.input and TensorDesc ----------------------------------------------
+
+
+def _graph_input(self, sizes=None, dtype=None, *, owned=False, strides=None, desc=None):
+    """Add an input tensor to the graph and return its Expression.
+
+    The graph assigns the input's index; no caller ever writes one. ``dtype``
+    takes either a numpy dtype or a TensorDataType and defaults to float32.
+    ``owned=True`` marks the tensor DML_TENSOR_FLAG_OWNED_BY_DML: its data is
+    handed over once, at initialize(), and lives on the GPU from then on.
+
+    For full control (``total_tensor_size_in_bytes``,
+    ``guaranteed_base_offset_alignment``) pass a complete ``desc=`` instead, in
+    which case every other argument is illegal -- a desc already answers them,
+    and answering twice would raise the question of which one wins.
+    """
+    if desc is not None:
+        if sizes is not None or dtype is not None or owned or strides is not None:
+            raise TypeError("desc= already describes the tensor; no other argument may be passed with it")
+        return self._input(desc)
+    if sizes is None:
+        raise TypeError("input() needs sizes, or a complete desc=")
+    flags = TensorFlags.OWNED_BY_DML if owned else TensorFlags.NONE
+    return self._input(_core.TensorDesc(
+        _to_data_type(np.float32 if dtype is None else dtype), list(sizes),
+        flags=flags, strides=None if strides is None else list(strides)))
+
+
+_core.Graph.input = _graph_input
+
+
+class TensorDesc(_core.TensorDesc):
+    """A tensor's element type, shape, strides and flags.
+
+    Same construction as ``_core.TensorDesc``, but ``data_type`` also accepts
+    numpy dtypes. ``graph.input(...)`` covers the common cases; this is for
+    precise control over strides, total size and alignment.
+    """
+
+    def __init__(self, data_type, sizes, *, flags=_core.TensorFlags.NONE,
+                 strides=None, total_tensor_size_in_bytes=None,
+                 guaranteed_base_offset_alignment=0, tensor_policy=None):
+        super().__init__(
+            _to_data_type(data_type), list(sizes), flags=flags,
+            strides=strides,
+            total_tensor_size_in_bytes=total_tensor_size_in_bytes,
+            guaranteed_base_offset_alignment=guaranteed_base_offset_alignment,
+            tensor_policy=tensor_policy)
+
+
+# --- Operator wrappers -------------------------------------------------------
+
+
+def reinterpret(input, sizes, strides=None, dtype=None):
+    """View the same bytes through different sizes, strides or dtype.
+
+    ``dtype=None`` keeps the input's type, which is what almost every
+    reinterpret wants. The element count implied by the arguments must match
+    the input's.
+    """
+    return _core.reinterpret(input, list(sizes), strides,
+                             None if dtype is None else _to_data_type(dtype))
+
+
+class MaxPoolingOutputs(typing.NamedTuple):
+    values: _core.Expression
+    indices: typing.Optional[_core.Expression]
+
+
+class GRUOutputs(typing.NamedTuple):
+    sequence: typing.Optional[_core.Expression]
+    single: typing.Optional[_core.Expression]
+
+
+def max_pooling(input, *, window_sizes, strides=(), start_padding=(),
+                end_padding=(), dilations=(), output_indices=False):
+    """Max pooling. Returns ``MaxPoolingOutputs(values, indices)``; ``indices``
+    is None unless ``output_indices=True``."""
+    return MaxPoolingOutputs(*_core.max_pooling(
+        input, window_sizes=list(window_sizes), strides=list(strides),
+        start_padding=list(start_padding), end_padding=list(end_padding),
+        dilations=list(dilations), output_indices=output_indices))
+
+
+def gru(input, weight, recurrence, bias=None, hidden_init=None,
+        sequence_lengths=None, *, activation_descs,
+        direction=RecurrentNetworkDirection.FORWARD, linear_before_reset=True,
+        output_options=GRUOutputOptions.Both):
+    """A one-layer gated recurrent unit. Returns ``GRUOutputs(sequence,
+    single)``; each output not requested by ``output_options`` is None."""
+    return GRUOutputs(*_core.gru(
+        input, weight, recurrence, bias, hidden_init, sequence_lengths,
+        activation_descs=list(activation_descs), direction=direction,
+        linear_before_reset=linear_before_reset, output_options=output_options))
+
+
+# --- FusedActivation factories -----------------------------------------------
+# One per activation DirectMLX can fuse, so an activation's parameters get
+# names instead of riding as bare positional floats -- and an operator that
+# cannot be fused never gets constructed as one. Copied 1:1 from DirectMLX.h's
+# FusedActivation statics, defaults included.
+
+
+def _fused_none():
+    return FusedActivation(OperatorType.INVALID)
+
+def _fused_elu(alpha=1.0):
+    return FusedActivation(OperatorType.ACTIVATION_ELU, alpha)
+
+def _fused_hard_sigmoid(alpha=0.2, beta=0.5):
+    return FusedActivation(OperatorType.ACTIVATION_HARD_SIGMOID, alpha, beta)
+
+def _fused_identity():
+    return FusedActivation(OperatorType.ACTIVATION_IDENTITY)
+
+def _fused_leaky_relu(alpha=0.01):
+    return FusedActivation(OperatorType.ACTIVATION_LEAKY_RELU, alpha)
+
+def _fused_linear(alpha, beta):
+    return FusedActivation(OperatorType.ACTIVATION_LINEAR, alpha, beta)
+
+def _fused_parametric_softplus(alpha, beta):
+    return FusedActivation(OperatorType.ACTIVATION_PARAMETRIC_SOFTPLUS, alpha, beta)
+
+def _fused_relu():
+    return FusedActivation(OperatorType.ACTIVATION_RELU)
+
+def _fused_scaled_elu(alpha=1.67326319217681884765625,
+                      gamma=1.05070102214813232421875):
+    return FusedActivation(OperatorType.ACTIVATION_SCALED_ELU, alpha, gamma)
+
+def _fused_scaled_tanh(alpha=1.0, beta=0.5):
+    return FusedActivation(OperatorType.ACTIVATION_SCALED_TANH, alpha, beta)
+
+def _fused_sigmoid():
+    return FusedActivation(OperatorType.ACTIVATION_SIGMOID)
+
+def _fused_softplus(steepness=1.0):
+    return FusedActivation(OperatorType.ACTIVATION_SOFTPLUS, steepness)
+
+def _fused_softsign():
+    return FusedActivation(OperatorType.ACTIVATION_SOFTSIGN)
+
+def _fused_tanh():
+    return FusedActivation(OperatorType.ACTIVATION_TANH)
+
+def _fused_thresholded_relu(alpha=1.0):
+    return FusedActivation(OperatorType.ACTIVATION_THRESHOLDED_RELU, alpha)
+
+def _fused_shrink(bias=0.0, threshold=0.5):
+    return FusedActivation(OperatorType.ACTIVATION_SHRINK, bias, threshold)
+
+def _fused_celu(alpha=1.0):
+    return FusedActivation(OperatorType.ACTIVATION_CELU, alpha)
+
+def _fused_gelu():
+    return FusedActivation(OperatorType.ACTIVATION_GELU)
+
+
+for _name, _factory in [
+    ("none", _fused_none), ("elu", _fused_elu),
+    ("hard_sigmoid", _fused_hard_sigmoid), ("identity", _fused_identity),
+    ("leaky_relu", _fused_leaky_relu), ("linear", _fused_linear),
+    ("parametric_softplus", _fused_parametric_softplus), ("relu", _fused_relu),
+    ("scaled_elu", _fused_scaled_elu), ("scaled_tanh", _fused_scaled_tanh),
+    ("sigmoid", _fused_sigmoid), ("softplus", _fused_softplus),
+    ("softsign", _fused_softsign), ("tanh", _fused_tanh),
+    ("thresholded_relu", _fused_thresholded_relu), ("shrink", _fused_shrink),
+    ("celu", _fused_celu), ("gelu", _fused_gelu),
+]:
+    _factory.__name__ = _name
+    _factory.__qualname__ = f"FusedActivation.{_name}"
+    setattr(FusedActivation, _name, staticmethod(_factory))
+del _name, _factory
