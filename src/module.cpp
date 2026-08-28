@@ -6,9 +6,9 @@
 
 #include "precomp.h"
 
-PYBIND11_MODULE(directml, module)
+PYBIND11_MODULE(_core, module)
 {
-    module.doc() = "Python binding for DirectML";
+    module.doc() = "C++ core of the directml package. Import directml, not this.";
 
     // Enumerations
     //
@@ -166,8 +166,122 @@ PYBIND11_MODULE(directml, module)
         .value("ONE_HOT", DML_OPERATOR_ONE_HOT)
         .value("RESAMPLE", DML_OPERATOR_RESAMPLE);
 
-    // Classes
+    // Classes, registered before the module-level functions and ordered so that
+    // every type is registered before another definition mentions it. pybind11
+    // renders a definition's signature string at the moment of the def; a type
+    // that is not registered yet shows up as its raw C++ name, which is not
+    // valid Python and breaks the generated stubs.
     //
+    py::class_<dml::TensorPolicy>(module, "TensorPolicy")
+        .def_property_readonly_static("default", [](py::object) { return dml::TensorPolicy::Default(); })
+        .def_property_readonly_static("interleaved_channel", [](py::object) { return dml::TensorPolicy::InterleavedChannel(); });
+
+    py::class_<dml::TensorDesc>(module, "TensorDesc")
+        .def(py::init<DML_TENSOR_DATA_TYPE, dml::TensorDimensions, const dml::TensorPolicy&>(),
+            py::arg("data_type"),
+            py::arg("sizes"),
+            py::arg("tensor_policy") = dml::TensorPolicy::Default())
+        .def(py::init<DML_TENSOR_DATA_TYPE, DML_TENSOR_FLAGS, dml::TensorDimensions, const dml::TensorPolicy&>(),
+            py::arg("data_type"),
+            py::arg("flags"),
+            py::arg("sizes"),
+            py::arg("tensor_policy") = dml::TensorPolicy::Default())
+        .def(py::init([](DML_TENSOR_DATA_TYPE dataType, dml::TensorDimensions sizes, dml::Optional<dml::TensorDimensions> strides) {
+            return std::unique_ptr<dml::TensorDesc>(new dml::TensorDesc(
+                dataType,
+                DML_TENSOR_FLAG_NONE,
+                std::move(sizes),
+                std::move(strides),
+                DMLCalcBufferTensorSize(
+                    dataType,
+                    static_cast<uint32_t>(sizes.size()),
+                    sizes.data(),
+                    strides ? std::move(strides)->data() : nullptr),
+                0));
+            }),
+            py::arg("data_type"),
+            py::arg("sizes"),
+            py::arg("strides"))
+        .def(py::init<DML_TENSOR_DATA_TYPE, DML_TENSOR_FLAGS, dml::TensorDimensions, dml::Optional<dml::TensorDimensions>, uint64_t, uint32_t>(),
+            py::arg("data_type"),
+            py::arg("flags"),
+            py::arg("sizes"),
+            py::arg("strides"),
+            py::arg("total_tensor_size_in_bytes"),
+            py::arg("guaranteed_base_offset_alignment"))
+        .def_readonly("data_type", &dml::TensorDesc::dataType)
+        .def_readonly("flags", &dml::TensorDesc::flags)
+        .def_readonly("sizes", &dml::TensorDesc::sizes)
+        .def_readonly("strides", &dml::TensorDesc::strides)
+        .def_readonly("total_tensor_size_in_bytes", &dml::TensorDesc::totalTensorSizeInBytes)
+        .def_readonly("guaranteed_base_offset_alignment", &dml::TensorDesc::guaranteedBaseOffsetAlignment)
+        .def("__repr__",
+            [](dml::TensorDesc const& tensorDesc) {
+                return  "dml.TensorDesc of type " + std::to_string(tensorDesc.dataType) +
+                        " and shape [" + UintVectorToString(tensorDesc.sizes) + ']' +
+                        " with flags " + std::to_string(tensorDesc.flags);
+            });
+
+    py::class_<dml::Expression>(module, "Expression")
+        .def("get_output_desc", &dml::Expression::GetOutputDesc, "Get the expression's output descriptor.")
+        .def(py::self + py::self)
+        .def(py::self - py::self)
+        .def(py::self * py::self)
+        .def(py::self / py::self)
+        .def(py::self % py::self)
+        .def(py::self += py::self)
+        .def(py::self -= py::self)
+        .def(py::self *= py::self)
+        .def(py::self /= py::self)
+        .def(py::self %= py::self)
+        .def(py::self + float())
+        .def(py::self - float())
+        .def(py::self * float())
+        .def(py::self / float())
+        .def(float() + py::self)
+        .def(float() - py::self)
+        .def(float() * py::self)
+        .def(float() / py::self)
+        .def(py::self += float())
+        .def(py::self -= float())
+        .def(py::self *= float())
+        .def(py::self /= float())
+        .def(-py::self);
+
+    py::class_<DML_SIZE_2D>(module, "Size2D")
+        .def(py::init([](uint32_t width, uint32_t height) {
+            return new DML_SIZE_2D { width, height };
+            }),
+            py::arg("width"),
+            py::arg("height"))
+        .def_readwrite("width", &DML_SIZE_2D::Width)
+        .def_readwrite("height", &DML_SIZE_2D::Height);
+
+    py::class_<dml::FusedActivation>(module, "FusedActivation")
+        .def(py::init<DML_OPERATOR_TYPE, float, float>(),
+            py::arg("activation"),
+            py::arg("param_1") = 0,
+            py::arg("param_2") = 0);
+
+    py::class_<dml::MaxPoolingOutputs>(module, "MaxPoolingOutputs")
+        .def_readwrite("values", &dml::MaxPoolingOutputs::values)
+        .def_readwrite("indices", &dml::MaxPoolingOutputs::indices);
+
+    py::class_<dml::GRUOutputs>(module, "GRUOutputs")
+        .def_readwrite("sequence", &dml::GRUOutputs::sequence)
+        .def_readwrite("single", &dml::GRUOutputs::single);
+
+    py::class_<pydml::TensorData>(module, "TensorData", py::buffer_protocol())
+        .def_buffer([](pydml::TensorData& self) -> py::buffer_info {
+            return py::buffer_info(
+                self.Get(),
+                self.itemSize,
+                self.format,
+                self.dimensions,
+                self.shape,
+                self.strides
+                ); });
+
     py::class_<pydml::Binding>(module, "Binding")
         .def(py::init([](dml::Expression& expression, py::array data) {
             auto const& type = GetDataType(expression.GetOutputDesc().dataType);
@@ -201,6 +315,23 @@ PYBIND11_MODULE(directml, module)
             "tensor once the model has been initialized, since DirectML holds the "
             "data from then on. Dispatching a released binding that is not owned "
             "by DirectML raises.");
+
+    py::class_<pydml::CompiledModel>(module, "Model")
+        .def_property_readonly("temporary_size", [](pydml::CompiledModel& self) {
+            return self.op->GetBindingProperties().TemporaryResourceSize;
+            },
+            "Bytes of scratch memory one dispatch of this graph needs. Every "
+            "intermediate tensor lives here, so this is the number that grows with "
+            "the size of the input rather than with the size of the weights.")
+        .def_property_readonly("persistent_size", [](pydml::CompiledModel& self) {
+            return self.op->GetBindingProperties().PersistentResourceSize;
+            },
+            "Bytes this graph keeps between dispatches: the OWNED_BY_DML tensors, "
+            "in whatever layout the operators wanted them in.")
+        .def_property_readonly("descriptor_count", [](pydml::CompiledModel& self) {
+            return self.op->GetBindingProperties().RequiredDescriptorCount;
+            },
+            "Descriptors one dispatch of this graph binds.");
 
     py::class_<pydml::Device>(module, "Device")
         .def(py::init<bool, bool>(),
@@ -254,132 +385,10 @@ PYBIND11_MODULE(directml, module)
             py::arg("device"))
         .def("build", [](dml::Graph& self, DML_EXECUTION_FLAGS flags, std::vector<dml::Expression> outputs) {
             return new pydml::CompiledModel(self, flags, outputs);
-            }, "Compile the expressions to a compiled operator.");
-
-    py::class_<pydml::CompiledModel>(module, "Model")
-        .def_property_readonly("temporary_size", [](pydml::CompiledModel& self) {
-            return self.op->GetBindingProperties().TemporaryResourceSize;
             },
-            "Bytes of scratch memory one dispatch of this graph needs. Every "
-            "intermediate tensor lives here, so this is the number that grows with "
-            "the size of the input rather than with the size of the weights.")
-        .def_property_readonly("persistent_size", [](pydml::CompiledModel& self) {
-            return self.op->GetBindingProperties().PersistentResourceSize;
-            },
-            "Bytes this graph keeps between dispatches: the OWNED_BY_DML tensors, "
-            "in whatever layout the operators wanted them in.")
-        .def_property_readonly("descriptor_count", [](pydml::CompiledModel& self) {
-            return self.op->GetBindingProperties().RequiredDescriptorCount;
-            },
-            "Descriptors one dispatch of this graph binds.");
-
-    py::class_<dml::TensorPolicy>(module, "TensorPolicy")
-        .def_property_readonly_static("default", [](py::object) { return dml::TensorPolicy::Default(); })
-        .def_property_readonly_static("interleaved_channel", [](py::object) { return dml::TensorPolicy::InterleavedChannel(); });
-
-    py::class_<dml::TensorDesc>(module, "TensorDesc")
-        .def(py::init<DML_TENSOR_DATA_TYPE, dml::TensorDimensions, const dml::TensorPolicy&>(),
-            py::arg("data_type"),
-            py::arg("sizes"),
-            py::arg("tensor_policy") = dml::TensorPolicy::Default())
-        .def(py::init<DML_TENSOR_DATA_TYPE, DML_TENSOR_FLAGS, dml::TensorDimensions, const dml::TensorPolicy&>(),
-            py::arg("data_type"),
+            "Compile the expressions to a compiled operator.",
             py::arg("flags"),
-            py::arg("sizes"),
-            py::arg("tensor_policy") = dml::TensorPolicy::Default())
-        .def(py::init([](DML_TENSOR_DATA_TYPE dataType, dml::TensorDimensions sizes, dml::Optional<dml::TensorDimensions> strides) {
-            return std::unique_ptr<dml::TensorDesc>(new dml::TensorDesc(
-                dataType,
-                DML_TENSOR_FLAG_NONE,
-                std::move(sizes),
-                std::move(strides),
-                DMLCalcBufferTensorSize(
-                    dataType,
-                    static_cast<uint32_t>(sizes.size()),
-                    sizes.data(),
-                    strides ? std::move(strides)->data() : nullptr),
-                0));
-            }),
-            py::arg("data_type"),
-            py::arg("sizes"),
-            py::arg("strides"))
-        .def(py::init<DML_TENSOR_DATA_TYPE, DML_TENSOR_FLAGS, dml::TensorDimensions, dml::Optional<dml::TensorDimensions>, uint64_t, uint32_t>(),
-            py::arg("data_type"),
-            py::arg("flags"),
-            py::arg("sizes"),
-            py::arg("strides"),
-            py::arg("total_tensor_size_in_bytes"),
-            py::arg("guaranteed_base_offset_alignment"))
-        .def_readonly("data_type", &dml::TensorDesc::dataType)
-        .def_readonly("flags", &dml::TensorDesc::flags)
-        .def_readonly("sizes", &dml::TensorDesc::sizes)
-        .def_readonly("strides", &dml::TensorDesc::strides)
-        .def_readonly("total_tensor_size_in_bytes", &dml::TensorDesc::totalTensorSizeInBytes)
-        .def_readonly("guaranteed_base_offset_alignment", &dml::TensorDesc::guaranteedBaseOffsetAlignment)
-        .def("__repr__",
-            [](dml::TensorDesc const& tensorDesc) {
-                return  "dml.TensorDesc of type " + std::to_string(tensorDesc.dataType) + 
-                        " and shape [" + UintVectorToString(tensorDesc.sizes) + ']' +
-                        " with flags " + std::to_string(tensorDesc.flags);
-            });
-
-    py::class_<pydml::TensorData>(module, "TensorData", py::buffer_protocol())
-        .def_buffer([](pydml::TensorData& self) -> py::buffer_info {
-            return py::buffer_info(
-                self.Get(),
-                self.itemSize,
-                self.format,
-                self.dimensions,
-                self.shape,
-                self.strides
-                ); });
-
-    py::class_<dml::Expression>(module, "Expression")
-        .def("get_output_desc", &dml::Expression::GetOutputDesc, "Get the expression's output descriptor.")
-        .def(py::self + py::self)
-        .def(py::self - py::self)
-        .def(py::self * py::self)
-        .def(py::self / py::self)
-        .def(py::self % py::self)
-        .def(py::self += py::self)
-        .def(py::self -= py::self)
-        .def(py::self *= py::self)
-        .def(py::self /= py::self)
-        .def(py::self %= py::self)
-        .def(py::self + float())
-        .def(py::self - float())
-        .def(py::self * float())
-        .def(py::self / float())
-        .def(float() + py::self)
-        .def(float() - py::self)
-        .def(float() * py::self)
-        .def(float() / py::self)
-        .def(py::self += float())
-        .def(py::self -= float())
-        .def(py::self *= float())
-        .def(py::self /= float())
-        .def(-py::self);
-
-    py::class_<DML_SIZE_2D>(module, "Size2D")
-        .def(py::init([](uint32_t width, uint32_t height) {
-            return new DML_SIZE_2D { width, height };
-            }))
-        .def_readwrite("width", &DML_SIZE_2D::Width)
-        .def_readwrite("height", &DML_SIZE_2D::Height);
-
-    py::class_<dml::FusedActivation>(module, "FusedActivation")
-        .def(py::init<DML_OPERATOR_TYPE, float, float>(),
-            py::arg("activation"),
-            py::arg("param_1") = 0,
-            py::arg("param_2") = 0);
-
-    py::class_<dml::MaxPoolingOutputs>(module, "MaxPoolingOutputs")
-        .def_readwrite("values", &dml::MaxPoolingOutputs::values)
-        .def_readwrite("indices", &dml::MaxPoolingOutputs::indices);
-
-    py::class_<dml::GRUOutputs>(module, "GRUOutputs")
-        .def_readwrite("sequence", &dml::GRUOutputs::sequence)
-        .def_readwrite("single", &dml::GRUOutputs::single);
+            py::arg("outputs"));
 
     // Functions
     //

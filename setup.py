@@ -4,7 +4,7 @@ import sys
 import platform
 import subprocess
 
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
 
 class CMakeExtension(Extension):
@@ -65,7 +65,8 @@ setup(
     url="https://github.com/aisk/PyDirectML",
     license='MIT',
     python_requires='>=3.6',
-    ext_modules=[CMakeExtension('directml')],
+    packages=['directml'],
+    ext_modules=[CMakeExtension('directml._core')],
     cmdclass=dict(build_ext=CMakeBuild),
     keywords='DirectML Python samples',
     setup_requires=['cmake'],

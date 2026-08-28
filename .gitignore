@@ -23,3 +23,6 @@ venv/
 
 # Sample outputs
 samples/sdxl/*.png
+
+# Built extension copied into the package by build_ext --inplace
+directml/*.pyd

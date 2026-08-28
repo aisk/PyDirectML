@@ -29,12 +29,12 @@ add_subdirectory(gpgmm)
 add_subdirectory(pybind11)
 
 pybind11_add_module(
-    directml
+    _core
     src/util.cpp
     src/module.cpp
     src/device.cpp
     )
 
-target_compile_options(directml PRIVATE /W4 /WX)
-target_include_directories(directml PRIVATE pybind11/include gpgmm/src/include gpgmm/ third_party)
-target_link_libraries(directml PRIVATE gpgmm dxgi.lib d3d12.lib directml.lib)
+target_compile_options(_core PRIVATE /W4 /WX)
+target_include_directories(_core PRIVATE pybind11/include gpgmm/src/include gpgmm/ third_party)
+target_link_libraries(_core PRIVATE gpgmm dxgi.lib d3d12.lib directml.lib)
