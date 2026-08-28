@@ -357,11 +357,11 @@ PYBIND11_MODULE(_core, module)
             "Add an input with the next free index; the public input() with its "
             "defaults lives in the wrapper layer.",
             py::arg("desc"))
-        .def("compile", [](pydml::Graph& self, std::vector<dml::Expression> outputs, DML_EXECUTION_FLAGS flags) {
+        .def("_compile", [](pydml::Graph& self, std::vector<dml::Expression> outputs, DML_EXECUTION_FLAGS flags) {
             return new pydml::CompiledOperator(self, flags, outputs);
             },
-            "Compile the graph into a CompiledOperator whose outputs are fixed "
-            "here, in this order.",
+            "Compile the graph; the public compile() with its docstring lives "
+            "in the wrapper layer.",
             py::arg("outputs"),
             py::kw_only(),
             py::arg("flags") = DML_EXECUTION_FLAG_NONE);

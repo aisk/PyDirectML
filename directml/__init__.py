@@ -194,22 +194,49 @@ def _converted(op, staged):
 
 
 def _operator_initialize(self, weights):
-    """Upload the OWNED_BY_DML inputs and run the operator initializer.
+    """Upload the ``owned=True`` inputs and run the operator initializer.
 
-    ``weights`` maps each owned input Expression to its array. The data is read
-    once, here, and lives on the GPU from then on; the library keeps no copy.
-    To change an owned input's data afterwards, call initialize() again.
+    The data is read once, here, and lives on the GPU from then on; the
+    library keeps no copy. To change an owned input's data afterwards, call
+    initialize() again -- the previous contents are replaced wholesale.
+
+    Args:
+        weights: A dict mapping every owned input Expression to its array.
+            Arrays are converted to each tensor's dtype under the same rules
+            as dispatch().
+
+    Raises:
+        ValueError: A key is not an input of this graph, is not owned, an
+            owned input is missing, an array's dtype would convert unsafely
+            (cross-kind and not NumPy-safe), or an array does not fit its
+            tensor.
     """
     staged = _validate(self, weights, owned=True, verb="initialize")
     self._initialize(_converted(self, staged))
 
 
 def _operator_dispatch(self, inputs=None):
-    """Run the operator and return its outputs as numpy arrays.
+    """Run the operator. Calling the operator is the same as dispatching it.
 
-    ``inputs`` maps each non-owned input Expression to its array. A graph
-    without owned inputs initializes itself on the first call; one with owned
-    inputs must be initialize()d explicitly first.
+    A graph without owned inputs initializes itself on the first call; one
+    with owned inputs must be initialize()d explicitly first.
+
+    Args:
+        inputs: A dict mapping every non-owned input Expression to its array.
+            Each array is converted to its tensor's dtype if the conversion
+            stays within a dtype kind or NumPy calls it safe; anything else
+            must be an explicit astype(). A packed array short of DirectML's
+            4-byte rounding is padded.
+
+    Returns:
+        One numpy array per output of compile(), in that order, already
+        shaped and typed by the output's descriptor.
+
+    Raises:
+        ValueError: The operator has owned inputs but was never initialized,
+            a key is not an input of this graph or is owned, an input is
+            missing, a dtype would convert unsafely, or an array does not
+            fit its tensor.
     """
     table = _slot_table(self)
     if not self.initialized:
@@ -236,15 +263,28 @@ _core.CompiledOperator.__call__ = _operator_dispatch
 def _graph_input(self, sizes=None, dtype=None, *, owned=False, strides=None, desc=None):
     """Add an input tensor to the graph and return its Expression.
 
-    The graph assigns the input's index; no caller ever writes one. ``dtype``
-    takes either a numpy dtype or a TensorDataType and defaults to float32.
-    ``owned=True`` marks the tensor DML_TENSOR_FLAG_OWNED_BY_DML: its data is
-    handed over once, at initialize(), and lives on the GPU from then on.
+    The graph assigns the input's index; no caller ever writes one.
 
-    For full control (``total_tensor_size_in_bytes``,
-    ``guaranteed_base_offset_alignment``) pass a complete ``desc=`` instead, in
-    which case every other argument is illegal -- a desc already answers them,
-    and answering twice would raise the question of which one wins.
+    Args:
+        sizes: The tensor's shape.
+        dtype: A numpy dtype or TensorDataType. Defaults to float32.
+        owned: Mark the tensor DML_TENSOR_FLAG_OWNED_BY_DML: its data is
+            handed over once, at initialize(), and lives on the GPU from
+            then on. Without it the data rides along with every dispatch.
+        strides: Element strides for a non-packed view; a stride of 0 repeats
+            an axis, which is how a broadcast input is declared.
+        desc: A complete TensorDesc, for the controls input() does not take
+            (total_tensor_size_in_bytes, guaranteed_base_offset_alignment).
+            Every other argument is illegal with it -- a desc already answers
+            them, and answering twice would raise the question of which wins.
+
+    Returns:
+        The input's Expression, which is also its binding key at
+        initialize() and dispatch().
+
+    Raises:
+        TypeError: Neither sizes nor desc was given, or desc was combined
+            with another argument.
     """
     if desc is not None:
         if sizes is not None or dtype is not None or owned or strides is not None:
@@ -258,7 +298,26 @@ def _graph_input(self, sizes=None, dtype=None, *, owned=False, strides=None, des
         flags=flags, strides=None if strides is None else list(strides)))
 
 
+def _graph_compile(self, outputs, *, flags=ExecutionFlags.NONE):
+    """Compile the graph into a CompiledOperator.
+
+    The outputs are fixed here, in this order, and are not named again at
+    dispatch. The operator is self-contained: it snapshots what it needs from
+    the graph, so the graph can be dropped as soon as this returns.
+
+    Args:
+        outputs: The Expressions to compute, in the order dispatch() returns
+            them.
+        flags: DML_EXECUTION_FLAGS for the compilation.
+
+    Returns:
+        A CompiledOperator, ready for initialize() and dispatch().
+    """
+    return self._compile(list(outputs), flags=flags)
+
+
 _core.Graph.input = _graph_input
+_core.Graph.compile = _graph_compile
 
 
 class TensorDesc(_core.TensorDesc):
@@ -292,6 +351,28 @@ def reinterpret(input, sizes, strides=None, dtype=None):
     """
     return _core.reinterpret(input, list(sizes), strides,
                              None if dtype is None else _to_data_type(dtype))
+
+
+def local_response_normalization(input, *, cross_channel, local_size, alpha,
+                                 beta, bias):
+    """Normalize each element by its neighbourhood's energy, AlexNet-style.
+
+    Computes ``output = input / (bias + (alpha / local_size) * sum) ** beta``
+    where ``sum`` adds the squares of the ``local_size`` elements around each
+    element.
+
+    Args:
+        cross_channel: True takes the window across channels at one pixel;
+            False takes it over a square spatial patch within one channel.
+        local_size: How many elements the window spans.
+        alpha: Scale on the summed squares, divided by ``local_size``.
+        beta: The exponent on the whole denominator.
+        bias: Constant added to the scaled sum before exponentiation, keeping
+            the denominator away from zero.
+    """
+    return _core.local_response_normalization(
+        input, cross_channel=cross_channel, local_size=local_size, alpha=alpha,
+        beta=beta, bias=bias)
 
 
 class MaxPoolingOutputs(typing.NamedTuple):

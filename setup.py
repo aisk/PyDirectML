@@ -66,6 +66,7 @@ setup(
     license='MIT',
     python_requires='>=3.6',
     packages=['directml'],
+    package_data={'directml': ['py.typed', '*.pyi']},
     ext_modules=[CMakeExtension('directml._core')],
     cmdclass=dict(build_ext=CMakeBuild),
     keywords='DirectML Python samples',
