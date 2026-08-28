@@ -31,7 +31,7 @@ def gemm(device, data_type, a, b):
 
 
 def main():
-    device = dml.Device(use_gpu=True)
+    device = dml.Device()
     a = (np.arange(1, 13).reshape(3, 4) / 7.0)
     b = (np.arange(1, 21).reshape(4, 5) / 7.0)
     expected = a @ b

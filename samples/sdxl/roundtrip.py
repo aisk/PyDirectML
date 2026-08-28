@@ -68,7 +68,7 @@ def main():
 
     original = load_image(args.image, args.size)
     params = load_vae(args.checkpoint)
-    device = dml.Device(use_gpu=True, use_debug_layer=False)
+    device = dml.Device()
     print(f"{device}")
 
     latent_size = args.size // vae.SCALE_FACTOR

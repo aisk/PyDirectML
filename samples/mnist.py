@@ -39,7 +39,7 @@ ndarray_image = np.expand_dims(img_array, axis = (0, 1))
 rescaled_image = ndarray_image / ndarray_image.max()
 
 # Create a GPU device, and build a model graph.
-device = dml.Device(use_gpu=True, use_debug_layer=True)
+device = dml.Device(use_debug_layer=True)
 graph = dml.Graph(device)
 
 def load(file_name):
@@ -100,9 +100,9 @@ op = graph.compile([softmax])
 # dispatch.
 op.initialize({
     convolution28_weight: load("Parameter5.npy"),
-    convolution28_bias: np.zeros([1, 8, 1, 1], np.float32),
+    convolution28_bias: np.zeros([1, 8, 1, 1]),
     convolution110_weight: load("Parameter87.npy"),
-    convolution110_bias: np.zeros([1, 16, 1, 1], np.float32),
+    convolution110_bias: np.zeros([1, 16, 1, 1]),
     times212_reshape1_param193: load("Parameter193.npy"),
     plus214_param194: load("Parameter194.npy"),
 })

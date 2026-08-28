@@ -36,7 +36,7 @@ img_4 = np.expand_dims(np.expand_dims(img_ndarray, axis=0), axis=0)
 img_5 = img_4.astype(np.float32) / 255.0
 
 # Create an executing device and build a model
-device = dml.Device(use_gpu=True, use_debug_layer=True)
+device = dml.Device(use_debug_layer=True)
 graph = dml.Graph(device)
 
 input = graph.input([batch_size, 1, 224, 224])

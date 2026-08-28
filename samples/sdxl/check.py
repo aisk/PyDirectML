@@ -193,7 +193,7 @@ def main():
         print("PASS" if passed else "FAIL")
         return 0 if passed else 1
 
-    device = dml.Device(use_gpu=True, use_debug_layer=False)
+    device = dml.Device()
     passed = True
     if args.part in ("all", "vae"):
         passed &= check_vae(device, args.size, args.seed, args.checkpoint)

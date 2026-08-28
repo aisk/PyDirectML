@@ -51,7 +51,7 @@ def append_input_tensor(graph: dml.Graph, sizes: list, owned: bool, file_name: s
     return tensor
 
 # Create a GPU device, and build a model graph.
-device = dml.Device(use_gpu=True)
+device = dml.Device()
 graph = dml.Graph(device)
 
 input = graph.input([1,3,224,224])

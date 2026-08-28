@@ -38,7 +38,7 @@ def main():
                              "and A1111 use -- instead of the hub weights")
     args = parser.parse_args()
 
-    device = dml.Device(use_gpu=True)
+    device = dml.Device()
 
     print("Loading weights (3.3 GiB as float32)")
     weights = load_text_encoders(args.checkpoint)

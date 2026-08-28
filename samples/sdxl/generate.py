@@ -106,7 +106,7 @@ def main():
               f"UNet's widest weights, at least 3.3 GiB more than the size "
               f"needs.{instead}")
 
-    device = dml.Device(use_gpu=True)
+    device = dml.Device()
     started = time.perf_counter()
 
     print("Encoding the prompt")
