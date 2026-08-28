@@ -621,6 +621,23 @@ PYBIND11_MODULE(directml, module)
         py::arg("input"),
         py::arg("axes") = std::vector<uint32_t>{});
 
+    module.def("multihead_attention", [](
+        dml::Expression query,
+        dml::Expression key,
+        dml::Expression value,
+        uint32_t head_count,
+        float scale) {
+            return pydml::MultiHeadAttention(query, key, value, head_count, scale);
+        },
+        "Scaled dot-product attention over token tensors, as one operator rather "
+        "than a gemm, a softmax and a gemm. The score matrix never becomes a "
+        "tensor of its own, which is what makes this cheaper than writing it out.",
+        py::arg("query"),
+        py::arg("key"),
+        py::arg("value"),
+        py::arg("head_count"),
+        py::arg("scale"));
+
     module.def("join", [](
         std::vector<dml::Expression> inputs,
         uint32_t axis) {

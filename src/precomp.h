@@ -50,6 +50,7 @@ namespace py = pybind11;
 #define IID_GRAPHICS_PPV_ARGS IID_PPV_ARGS
 #include "d3dx12.h"
 #include "util.h"
+#include "attention.h"
 #include "model.h"
 #include "typeconvert.h"
 #include "device.h"

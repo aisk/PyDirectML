@@ -6,7 +6,7 @@ Euler sampler that ties them together.
 
     python generate.py "an astronaut riding a horse on mars, highly detailed"
 
-107 seconds for a 1024x1024 image at 20 steps on a Radeon RX 6800.
+63 seconds for a 1024x1024 image at 20 steps on a Radeon RX 6800.
 
 ## Running it
 
@@ -31,13 +31,13 @@ Weights download from the Hugging Face hub on first use and land in the usual
 encoders, 5.1 GiB for the UNet at half precision. `check.py --part vae` skips
 everything but the small one.
 
-Where a 1024x1024 image at 20 steps spends its 107 seconds:
+Where a 1024x1024 image at 20 steps spends its 63 seconds:
 
 | | |
 | --- | --- |
-| Encoding the prompt | 14 s, once |
+| Encoding the prompt | 7 s, once |
 | Building and initializing the UNet | 7 s, once |
-| Sampling | 85 s -- 40 UNet forwards at 2.1 s, two per step for guidance |
+| Sampling | 48 s -- 40 UNet forwards at 1.2 s, two per step for guidance |
 | Decoding | 1 s, once |
 
 `roundtrip.py` pushes an image through the encoder and back through the decoder.
@@ -95,9 +95,9 @@ no copy involved. That is what `broadcast()` builds.
 
 **Transposing is the same trick with non-zero strides.** Attention wants tokens,
 not pixels: `[1, C, H, W]` read as `[1, 1, H*W, C]` with strides
-`[.., .., 1, H*W]` is the NCHW-to-tokens reshape, again with no copy. So the
-whole attention block is four matrix multiplies and a softmax, and the reshapes
-around them are free.
+`[.., .., 1, H*W]` is the NCHW-to-tokens reshape, again with no copy. So an
+attention block is two matrix multiplies around one attention operator, and the
+reshapes between them are free.
 
 **And one reshape strides cannot express.** Splitting attention heads is a stride
 trick -- `[1, 1, T, C]` read as `[1, heads, T, C/heads]` -- but putting them back
@@ -107,12 +107,19 @@ the buffer as `[1, T, heads, dim]`, which *is* affine, lets an identity operator
 write that out packed, and then the last reshape is free. One copy per attention
 block, and only in that direction.
 
-Two operators had to be bound for this sample. `activation_softmax` gained an
+That last one is now only on the masked path. Attention was written out here as a
+`gemm`, a softmax and a `gemm` until `multihead_attention` was bound, and the head
+split and merge existed to feed those; **DirectML has a single operator for the
+three, and using it made a 1024x1024 image 107 seconds instead of 63.** See
+"One operator for attention" below.
+
+Three operators had to be bound for this sample. `activation_softmax` gained an
 `axes` argument: the old binding called `DML_ACTIVATION_SOFTMAX`, which normalizes
 a flattened 2-D view and fails outright on the 4-D score matrix attention
 produces, where `DML_ACTIVATION_SOFTMAX1` takes axes and does the right thing.
 `activation_gelu` is the exact erf form, which is what both the UNet's GEGLU and
-OpenCLIP's MLP were trained with.
+OpenCLIP's MLP were trained with. And `multihead_attention` is
+`DML_OPERATOR_MULTIHEAD_ATTENTION`.
 
 ## The text encoders
 
@@ -229,7 +236,7 @@ So it is two graphs, split at the mid block:
 
 What crosses between them is the mid-block result, the timestep embedding, and
 nine skip connections -- about 54 MiB at 1024x1024, which is a millisecond of
-PCIe each way against a 2.1 second forward pass. The split is invisible from
+PCIe each way against a 1.2 second forward pass. The split is invisible from
 outside `unet.UNet`.
 
 `--size` takes a `WIDTHxHEIGHT`, not just a square. A level that halves an odd
@@ -254,6 +261,52 @@ to be right for a prompt to come out as a picture of what it asked for -- a wron
 skip order, a transposed attention, the penultimate CLIP layer taken from the
 wrong end, and the result is noise rather than a slightly worse image.
 
+## One operator for attention
+
+Attention here was a `gemm`, a softmax and a `gemm`, with the head split and
+merge around them. Three operators means the score matrix -- `heads` by tokens by
+tokens -- becomes a tensor the graph has to allocate, write, read, write and read
+again. DirectML has `DML_OPERATOR_MULTIHEAD_ATTENTION`, which does the three as
+one and never hands the score matrix out.
+
+DirectMLX has no helper that emits it, so `src/attention.h` builds the node from
+the raw descriptor, in the style of the helpers in `third_party/DirectMLX.h`:
+take the input tensor descriptors off the incoming expressions, work out the
+output shape, fill in `DML_MULTIHEAD_ATTENTION_OPERATOR_DESC`, and hand the
+graph builder an eleven-entry input array of which eight are null -- the stacked
+QKV forms, the bias, the mask, the relative position bias and the past key-value
+cache are all things this does not use.
+
+Two details are the whole of the work. The operator carries its batch in the
+second axis where these graphs carry it in the first, which is the same bytes in
+the same order but still has to be said, because both ends of a graph edge have
+to agree on the shape; `MoveBatchAxis` reinterprets it across and back, and does
+nothing at batch 1. And `DML_MULTIHEAD_ATTENTION_MASK_TYPE` has no additive mask,
+while CLIP's causal mask is additive, so `attend()` still writes out the three
+operators when it is given one. That is the text encoders only -- every attention
+in the UNet and the VAE is unmasked.
+
+It is worth 1.7x on a whole image:
+
+| | before | after |
+| --- | --- | --- |
+| 1024x1024, 20 steps, end to end | 107 s | **63 s** |
+| one UNet forward at 1024x1024 | 2.08 s | 1.18 s |
+| down half at 1024x1344, one dispatch | 0.99 s | 0.55 s |
+| up half at 1024x1344, one dispatch | 1.25 s | 0.64 s |
+| UNet scratch at 1024x1344 | 1.53 GiB | 1.02 GiB |
+
+The numbers agree with the reference implementation to 2.4e-07, which is what the
+three operators agree to as well.
+
+**An isolated benchmark of the operator says none of this**, and is worth
+recording as a way to be wrong: one level-1 self-attention at 1024x1344 measures
+28.1 ms as three operators and 27.5 ms as one, a difference of nothing. Both were
+bound by uploading the inputs and reading the output back over PCIe, which the
+UNet does once for the whole graph rather than once per attention. Only the
+scratch column showed anything -- 1148 MiB against 622 -- and that was the hint
+worth following.
+
 ## Where the memory goes
 
 `Model.temporary_size` and `Model.persistent_size` report what
@@ -264,15 +317,15 @@ both. Against `prefectIllustriousXL`:
 
 | | scratch | weights |
 | --- | --- | --- |
-| UNet, 1024x1024 | 0.90 GiB | 5.42 GiB |
-| UNet, 1024x1360 | 1.56 GiB | **8.75 GiB** |
-| UNet, 1024x1408 | 1.65 GiB | 5.42 GiB |
+| UNet, 1024x1024 | 0.61 GiB | 5.42 GiB |
+| UNet, 1024x1360 | 1.05 GiB | **8.75 GiB** |
+| UNet, 1024x1408 | 1.09 GiB | 5.42 GiB |
 | VAE decoder, 1024x1024 | 5.80 GiB | 0.18 GiB |
 | VAE decoder, 1024x1360 | 8.60 GiB | 0.18 GiB |
 
 Both surprises are in that table, and neither is the attention score matrices
 that were the obvious suspect -- those live in the scratch column, which stays
-under two gigabytes.
+around a gigabyte.
 
 **The UNet's weights are not supposed to depend on the image size, and at
 1024x1360 there are 3.3 GiB more of them.** DirectML lays a `gemm`'s weight out
@@ -356,36 +409,33 @@ It is slower. 768x768, 10 steps, one prompt:
 
 | | per step | weights | scratch |
 | --- | --- | --- | --- |
-| two dispatches | 1.22 s | 5.42 GiB | 0.34 GiB |
-| one batch of two | 1.78 s | 4.78 GiB | 0.67 GiB |
+| two dispatches | 1.00 s | 5.42 GiB | 0.27 GiB |
+| one batch of two | 1.33 s | 4.78 GiB | 0.49 GiB |
 
-**46% slower.** The GPU is already saturated at batch 1, so batching buys no
-parallelism and pays for the wider tensors. An isolated 5376x1280 by 1280x1280
-`gemm` says the same: 10.0 ms at batch 1 against 21.8 ms at batch 2, where twice
-the batch-1 time would be 19.9. It is not the broadcast weight -- duplicating the
-weight outright instead measures 22.0 ms, the same.
+**33% slower.** The GPU is already saturated at batch 1, so batching buys no
+parallelism and pays for the wider tensors. It is not the broadcast weight: an
+isolated 5376x1280 by 1280x1280 `gemm` measures 10.0 ms at batch 1 against
+21.8 ms at batch 2, where twice the batch-1 time would be 19.9, and duplicating
+the weight outright instead of broadcasting it measures 22.0 ms, the same.
 
-**And from 1024x1024 up it hangs the device**, immediately and reproducibly, on
-the first dispatch. That points at something more interesting than batching:
+**It also used to hang the device from 1024x1024 up**, immediately and
+reproducibly, on the first dispatch -- and that turned out to be the more
+interesting half of the result. Windows resets a GPU whose work has not returned
+within `TdrDelay`, two seconds by default and not overridden on this machine.
+Batching more than doubles the length of a dispatch:
 
-| 1024x1024 | one dispatch |
-| --- | --- |
-| down half, batch 1 | 0.96 s |
-| up half, batch 1 | 1.12 s |
-| either half, batch 2 | `DXGI_ERROR_DEVICE_HUNG` |
+| 1024x1024, one dispatch | three operators | one operator |
+| --- | --- | --- |
+| down half, batch 1 | 0.96 s | 0.56 s |
+| up half, batch 1 | 1.12 s | 0.62 s |
+| down half, batch 2 | `DXGI_ERROR_DEVICE_HUNG` | 1.55 s |
+| up half, batch 2 | `DXGI_ERROR_DEVICE_HUNG` | 1.70 s |
 
-Windows resets a GPU whose work has not returned within `TdrDelay`, two seconds
-by default and not overridden on this machine. Batching doubles the length of a
-dispatch, and 1024x1024 is exactly where doubled halves reach two seconds --
-768x768 batches fine at about 1.3 s a half, 1024x1024 does not at about 2.1. The
-boundary sits where that explanation puts it, though no event 4101 is logged for
-these hangs, so the mechanism is inferred from the timing rather than confirmed
-by the system.
-
-The same ceiling is the better explanation for the 1024x1360 failures below than
-memory pressure was: the up half is 1.25 s at 1024x1344, and the duplicated
-weights at 1024x1360 leave the driver paging on a 16 GiB card, which is exactly
-what stretches a dispatch that is already most of the way to the limit.
+The hangs were where doubled halves reached two seconds, and they stopped when
+the fused attention brought a half back under a second. No event 4101 is logged
+for these hangs, so the ceiling is inferred from the timing rather than confirmed
+by the system -- but the timing fits it twice, once going over and once coming
+back.
 
 `--cfg-batch` stays because the measurement is worth being able to repeat, and
 because `UNet(batch=n)` is the part that would pay off on a GPU that is not
@@ -441,24 +491,20 @@ epsilon prediction, which is what SDXL and its finetunes are trained with.
 - Euler and Euler ancestral only, with two timestep spacings. `s_churn`, Karras
   sigmas, DPM++ and the rest are left out. `euler_a` has the unresolved artifact
   described above.
-- Stability at 1024x1360. Runs at that size regularly die partway through
-  sampling -- five of nine so far -- with `DXGI_ERROR_DEVICE_HUNG`, from a
-  dispatch that had already succeeded several times. 1024x1024 and the in-bucket
-  sizes have never done it.
+- Stability at 1024x1360, which looks fixed but is not proven. Runs at that size
+  used to die partway through sampling -- five of nine -- with
+  `DXGI_ERROR_DEVICE_HUNG`, from a dispatch that had already succeeded several
+  times, while 1024x1024 and the in-bucket sizes never did.
 
-  The dispatch-length ceiling above is the best explanation. The up half is
-  already 1.25 s at 1024x1344, and 1024x1360 is one of the sizes that pays for
-  the duplicated weights -- 3.3 GiB of the 4.8 GiB gap between its 14.4 GiB peak
-  of dedicated VRAM and 1024x1024's 9.6, on a 16 GiB card with a couple of
-  gigabytes already spoken for by the desktop. That close to full the driver is
-  paging resources in and out, and a dispatch that is already most of the way to
-  two seconds does not have far to go. It fits the intermittency, which neither
-  memory alone nor a fixed limit does.
+  The dispatch-length ceiling above explains it: the up half was 1.25 s there,
+  and 1024x1360 is one of the sizes that pays for the duplicated weights, which
+  leaves the driver paging on a 16 GiB card -- and a dispatch already most of the
+  way to two seconds does not have far to go. That fits the intermittency, which
+  neither memory alone nor a fixed limit does. Fusing attention took the halves
+  to 0.55 and 0.63 s at that size, and three of three runs came out clean where
+  four of nine used to. Three runs is a signal, not a proof.
 
   A second thing is true at that size and unexplained: the down half's persistent
   buffer is 4.29 GiB, over the 4 GiB line described above, and it initializes and
   dispatches anyway, which that line says it should not.
-
-  Avoiding the size avoids both. 1024x1408 is larger, aligned, and came out
-  clean, but that is one run and not yet evidence of stability.
 - The refiner model, and the img2img and inpainting paths.

@@ -370,12 +370,18 @@ def attend(query, key, value, heads, mask=None):
     is what makes this cross-attention as well as self-attention.
     """
     dim = sizes(query)[-1] // heads
+    if mask is None:
+        # One operator instead of three. The score matrix stays inside it rather
+        # than becoming a tensor the graph has to find room for twice.
+        return dml.multihead_attention(query, key, value, heads, 1.0 / math.sqrt(dim))
+
+    # DML_MULTIHEAD_ATTENTION_MASK_TYPE has no additive mask, and CLIP's is
+    # additive and causal, so a masked attention is still written out by hand.
     query, key, value = (split_heads(t, heads) for t in (query, key, value))
 
     scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
                       alpha=1.0 / math.sqrt(dim))
-    if mask is not None:
-        scores = dml.add(scores, broadcast(mask, sizes(scores)))
+    scores = dml.add(scores, broadcast(mask, sizes(scores)))
 
     return merge_heads(dml.gemm(dml.activation_softmax(scores, [3]), value))
 
