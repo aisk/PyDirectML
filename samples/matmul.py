@@ -10,26 +10,16 @@ import directml as dml
 
 
 def matmul(a, b):
-    """Return the matrix product ``a @ b``, computed on the GPU."""
-    if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("both operands must be 2-D")
-    if a.shape[1] != b.shape[0]:
-        raise ValueError(f"shapes {a.shape} and {b.shape} are not aligned")
-
-    a = np.ascontiguousarray(a, np.float32)
-    b = np.ascontiguousarray(b, np.float32)
-
-    device = dml.Device(use_gpu=True)
+    """Return the matrix product ``a @ b`` of two 2-D arrays, computed on the GPU."""
+    device = dml.Device()
     graph = dml.Graph(device)
 
     lhs = graph.input([1, 1, *a.shape])
     rhs = graph.input([1, 1, *b.shape])
-    product = dml.gemm(lhs, rhs)
+    op = graph.compile([dml.gemm(lhs, rhs)])
 
-    op = graph.compile([product])
-    output, = op({lhs: a, rhs: b})
-
-    return output.reshape(a.shape[0], b.shape[1])
+    result, = op({lhs: a, rhs: b})
+    return result.reshape(a.shape[0], b.shape[1])
 
 
 def main():
