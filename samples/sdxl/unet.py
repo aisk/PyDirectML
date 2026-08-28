@@ -225,10 +225,12 @@ def build_down(model, params, latent_shape, tokens):
     Returns (inputs, outputs). The outputs are what the second half needs: the
     mid-block result, the timestep embedding, and every skip connection.
     """
+    batch = latent_shape[0]
     sample = model.placeholder(latent_shape)
-    time_input = model.placeholder([1, 1, 1, BLOCK_OUT_CHANNELS[0]])
-    add_input = model.placeholder([1, 1, 1, TIME_EMBED_DIM + 6 * ADDITION_TIME_EMBED_DIM])
-    context = model.placeholder([1, 1, tokens, CROSS_ATTENTION_DIM])
+    time_input = model.placeholder([batch, 1, 1, BLOCK_OUT_CHANNELS[0]])
+    add_input = model.placeholder(
+        [batch, 1, 1, TIME_EMBED_DIM + 6 * ADDITION_TIME_EMBED_DIM])
+    context = model.placeholder([batch, 1, tokens, CROSS_ATTENTION_DIM])
 
     temb = dml.add(_embedding_mlp(model, time_input, params, "time_embedding"),
                    _embedding_mlp(model, add_input, params, "add_embedding"))
@@ -255,7 +257,7 @@ def build_up(model, params, mid_shape, temb_shape, skip_shapes, tokens):
     """The second half: the up blocks and the output convolution."""
     x = model.placeholder(mid_shape)
     temb = model.placeholder(temb_shape)
-    context = model.placeholder([1, 1, tokens, CROSS_ATTENTION_DIM])
+    context = model.placeholder([mid_shape[0], 1, tokens, CROSS_ATTENTION_DIM])
     skips = [model.placeholder(shape) for shape in skip_shapes]
 
     levels = len(BLOCK_OUT_CHANNELS)
@@ -283,8 +285,9 @@ class UNet:
     """
 
     def __init__(self, device, params, height, width,
-                 tensor_type=dml.TensorDataType.FLOAT16, tokens=77):
-        latent_shape = [1, LATENT_CHANNELS, height // 8, width // 8]
+                 tensor_type=dml.TensorDataType.FLOAT16, tokens=77, batch=1):
+        self.batch = batch
+        latent_shape = [batch, LATENT_CHANNELS, height // 8, width // 8]
 
         self.down = Model(device, tensor_type)
         _, outputs = build_down(self.down, params, latent_shape, tokens)

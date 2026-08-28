@@ -216,6 +216,12 @@ def linear(model, x, weight, bias=None):
     out_features = weight.shape[0]
     weights = model.constant(weight, shape=[1, 1, out_features, weight.shape[1]])
     transpose = dml.MatrixTransform.TRANSPOSE
+
+    # A gemm wants both operands to agree on the batch axes, and a weight has
+    # none of its own, so it is repeated across the batch at a stride of zero.
+    batch = sizes(x)[0]
+    if batch != 1:
+        weights = broadcast(weights, [batch, 1, out_features, weight.shape[1]])
     if bias is None:
         return dml.gemm(x, weights, trans_b=transpose)
 

@@ -79,6 +79,10 @@ def main():
     parser.add_argument("--guidance", type=float, default=5.0,
                         help="how far to push from the negative prompt towards the prompt")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cfg-batch", action="store_true",
+                        help="run both classifier-free guidance passes as one batch "
+                             "of two. Measured slower, not faster, and it hangs the "
+                             "device from 1024x1024 up; see the README")
     parser.add_argument("--tile-decode", action="store_true",
                         help="decode in overlapping tiles, which cuts the largest "
                              "allocation a run makes down to a fixed cost, at the "
@@ -124,7 +128,8 @@ def main():
 
     print("Building the UNet")
     params = load_unet(args.checkpoint)
-    model = unet_module.UNet(device, params, height, width)
+    model = unet_module.UNet(device, params, height, width,
+                             batch=2 if args.cfg_batch else 1)
     params.clear()
     gc.collect()
     print(f"  {model.input_count} graph inputs across two graphs, "
@@ -139,14 +144,25 @@ def main():
               for p in (negative_pooled, pooled)]
     contexts = [e.reshape(1, 1, *e.shape) for e in (negative_embeds, embeds)]
 
+    # Guidance needs the prediction under both conditionings, and they differ
+    # only in those two tensors -- the latent and the timestep are the same. So
+    # they can go through as one batch of two instead of one after the other.
+    if model.batch == 2:
+        both_inputs, both_contexts = np.concatenate(inputs), np.concatenate(contexts)
+
     print(f"Sampling {width}x{height}, {args.steps} steps of {args.sampler}, "
           f"{args.spacing} spacing")
     for step, timestep in enumerate(scheduler.timesteps):
         model_input = scheduler.scale_model_input(latents, step)
         time_input, _ = unet_module.conditioning(timestep, pooled, resolution, (0, 0), resolution)
 
-        uncond, cond = (model(model_input, time_input, add_input, context).astype(np.float32)
-                        for add_input, context in zip(inputs, contexts))
+        if model.batch == 2:
+            both = model(np.concatenate([model_input] * 2),
+                         np.concatenate([time_input] * 2), both_inputs, both_contexts)
+            uncond, cond = both[0:1].astype(np.float32), both[1:2].astype(np.float32)
+        else:
+            uncond, cond = (model(model_input, time_input, add_input, context).astype(np.float32)
+                            for add_input, context in zip(inputs, contexts))
         prediction = uncond + args.guidance * (cond - uncond)
 
         latents = scheduler.step(prediction, step, latents)

@@ -343,6 +343,54 @@ whole image is at `x=1`, the outer border, where a tile has the least context to
 normalize against. The reconstruction PSNR of a round trip goes from 36.25 dB to
 36.08.
 
+## Batching guidance, and why it loses
+
+Classifier-free guidance runs the UNet twice per step, once under the negative
+conditioning and once under the positive, and the two differ only in two of the
+four input tensors. Putting them through as one batch of two is the obvious
+optimization, and `--cfg-batch` does it: every graph here already takes its batch
+from `sizes()`, so it needed only wider placeholders and one broadcast, since a
+`gemm` will not take a weight whose batch axis disagrees with its activation's.
+
+It is slower. 768x768, 10 steps, one prompt:
+
+| | per step | weights | scratch |
+| --- | --- | --- | --- |
+| two dispatches | 1.22 s | 5.42 GiB | 0.34 GiB |
+| one batch of two | 1.78 s | 4.78 GiB | 0.67 GiB |
+
+**46% slower.** The GPU is already saturated at batch 1, so batching buys no
+parallelism and pays for the wider tensors. An isolated 5376x1280 by 1280x1280
+`gemm` says the same: 10.0 ms at batch 1 against 21.8 ms at batch 2, where twice
+the batch-1 time would be 19.9. It is not the broadcast weight -- duplicating the
+weight outright instead measures 22.0 ms, the same.
+
+**And from 1024x1024 up it hangs the device**, immediately and reproducibly, on
+the first dispatch. That points at something more interesting than batching:
+
+| 1024x1024 | one dispatch |
+| --- | --- |
+| down half, batch 1 | 0.96 s |
+| up half, batch 1 | 1.12 s |
+| either half, batch 2 | `DXGI_ERROR_DEVICE_HUNG` |
+
+Windows resets a GPU whose work has not returned within `TdrDelay`, two seconds
+by default and not overridden on this machine. Batching doubles the length of a
+dispatch, and 1024x1024 is exactly where doubled halves reach two seconds --
+768x768 batches fine at about 1.3 s a half, 1024x1024 does not at about 2.1. The
+boundary sits where that explanation puts it, though no event 4101 is logged for
+these hangs, so the mechanism is inferred from the timing rather than confirmed
+by the system.
+
+The same ceiling is the better explanation for the 1024x1360 failures below than
+memory pressure was: the up half is 1.25 s at 1024x1344, and the duplicated
+weights at 1024x1360 leave the driver paging on a 16 GiB card, which is exactly
+what stretches a dispatch that is already most of the way to the limit.
+
+`--cfg-batch` stays because the measurement is worth being able to repeat, and
+because `UNet(batch=n)` is the part that would pay off on a GPU that is not
+already full. It is off by default.
+
 ## Single-file checkpoints
 
 Everything above reads diffusers' layout: a directory with one safetensors file
@@ -398,17 +446,19 @@ epsilon prediction, which is what SDXL and its finetunes are trained with.
   dispatch that had already succeeded several times. 1024x1024 and the in-bucket
   sizes have never done it.
 
-  That size is one of the ones that pays for the duplicated weights above, which
-  accounts for 3.3 GiB of the 4.8 GiB gap between its 14.4 GiB peak of dedicated
-  VRAM and 1024x1024's 9.6 GiB, on a 16 GiB card with a couple of gigabytes
-  already spoken for by the desktop. Two mechanisms fit: that close to full the
-  driver is paging resources in and out and a dispatch waiting on that can sit
-  long enough to be declared hung, and separately the down half's persistent
-  buffer is 4.29 GiB there, over the 4 GiB line described above -- though it
-  initializes and dispatches, which that line says it should not.
+  The dispatch-length ceiling above is the best explanation. The up half is
+  already 1.25 s at 1024x1344, and 1024x1360 is one of the sizes that pays for
+  the duplicated weights -- 3.3 GiB of the 4.8 GiB gap between its 14.4 GiB peak
+  of dedicated VRAM and 1024x1024's 9.6, on a 16 GiB card with a couple of
+  gigabytes already spoken for by the desktop. That close to full the driver is
+  paging resources in and out, and a dispatch that is already most of the way to
+  two seconds does not have far to go. It fits the intermittency, which neither
+  memory alone nor a fixed limit does.
+
+  A second thing is true at that size and unexplained: the down half's persistent
+  buffer is 4.29 GiB, over the 4 GiB line described above, and it initializes and
+  dispatches anyway, which that line says it should not.
 
   Avoiding the size avoids both. 1024x1408 is larger, aligned, and came out
   clean, but that is one run and not yet evidence of stability.
 - The refiner model, and the img2img and inpainting paths.
-- Batching. Everything is batch 1, so classifier-free guidance is two dispatches
-  per step rather than one on a batch of two.
