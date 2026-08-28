@@ -4,6 +4,8 @@
 #
 import directml as dml
 import numpy as np
+
+import tensor_data
 from PIL import Image, ImageOps
 import sys
 import os
@@ -75,15 +77,12 @@ inputs = [
         (conv4_bias,"conv4.bias.npy")
 ]
 
-input_bindings = []
-input_bindings.append(dml.Binding(input, img_5))
-for input, file_name in inputs:
-    input_bindings.append(dml.Binding(input, np.load(tensor_data_path + '/' + file_name)))
+# Every filter and bias is owned by DirectML, so they are all read once here.
+op.initialize({tensor: tensor_data.load(tensor_data_path + '/' + file_name)
+               for tensor, file_name in inputs})
 
 # Compute the result
-output_data = device.compute(op, input_bindings, [conv4])
-
-output_tensor = np.array(output_data[0])
+output_tensor, = op({input: img_5})
 output_tensor = np.reshape(output_tensor, [-1,1,3,3,224,224])
 output_tensor = output_tensor.transpose((0, 1, 4, 2, 5, 3))
 output_tensor = np.reshape(output_tensor, [-1,1,672,672])

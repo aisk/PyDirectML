@@ -5,6 +5,8 @@
 
 import directml as dml
 import numpy as np
+
+import tensor_data
 from PIL import Image, ImageOps
 import sys
 import os
@@ -321,16 +323,21 @@ inputs = [
     (scale_b, "scale_B.npy")
 ]
 
-input_bindings = []
-input_bindings.append(dml.Binding(input, transposed_image))
-for input, file_name in inputs:
-    input_bindings.append(dml.Binding(input, np.load(tensor_data_path +'/' + file_name)))
+# Split the table by ownership: what DirectML owns is read once at initialize,
+# the rest is bound per dispatch.
+weights = {}
+feeds = {input: transposed_image}
+for tensor, file_name in inputs:
+    array = tensor_data.load(tensor_data_path + '/' + file_name)
+    if tensor.desc.flags == dml.TensorFlags.OWNED_BY_DML:
+        weights[tensor] = array
+    else:
+        feeds[tensor] = array
+
+op.initialize(weights)
 
 # Compute the result
-
-output_data = device.compute(op, input_bindings, [output_image])
-
-output_tensor = np.array(output_data[0])
+output_tensor, = op(feeds)
 
 transposed_output_image = np.transpose(output_tensor, axes = [0,2,3,1]).squeeze()
 

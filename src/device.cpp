@@ -132,52 +132,155 @@ Device::Device(bool useGpu, bool useDebugLayer, DXGI_GPU_PREFERENCE gpuPreferenc
     ThrowIfFailed(m_dmlDevice->CreateBindingTable(nullptr, IID_PPV_ARGS(&m_bindingTable)));
 }
 
-std::vector<pydml::TensorData*> Device::Compute(
-    pydml::CompiledModel& model,
-    std::vector<pydml::Binding*>& inputs,
-    std::vector<dml::Expression*>& outputs
-    )
+Graph::Graph(std::shared_ptr<Device> device, dml::TensorPolicy tensorPolicy) :
+    device(std::move(device)),
+    graph(this->device->GetDevice(), std::move(tensorPolicy))
 {
-    // Initialization is per operator, not per dispatch: it reads the inputs flagged
-    // OWNED_BY_DML once and folds them into the model's persistent resource, where
-    // they stay. Running it again would only re-upload the same weights.
-    if (!model.initialized)
-    {
-        Initialize(model, inputs);
-    }
-    return Dispatch(model, inputs, outputs);
 }
 
-std::vector<pydml::TensorData*> Device::Dispatch(
-    pydml::CompiledModel& model,
-    std::vector<pydml::Binding*>& inputs,
-    std::vector<dml::Expression*>& outputs
+dml::Expression Graph::Input(uint32_t index, dml::TensorDesc desc)
+{
+    if (index != slots.size())
+    {
+        throw std::invalid_argument(
+            "input index " + std::to_string(index) + " is out of order; the graph's next input is " +
+            std::to_string(slots.size()));
+    }
+
+    auto expression = dml::InputTensor(graph, index, desc);
+    slots.push_back(InputSlot {
+        reinterpret_cast<uintptr_t>(expression.Impl()),
+        expression.GetOutputDesc(),
+        (desc.flags & DML_TENSOR_FLAG_OWNED_BY_DML) != 0 });
+    return expression;
+}
+
+CompiledOperator::CompiledOperator(
+    Graph& graph,
+    DML_EXECUTION_FLAGS flags,
+    std::vector<dml::Expression> const& outputs
+    ) :
+    op(graph.graph.Compile(flags, outputs, static_cast<uint32_t>(graph.slots.size()))),
+    device(graph.device),
+    inputs(graph.slots)
+{
+    outputDescs.reserve(outputs.size());
+    for (auto const& output : outputs)
+    {
+        outputDescs.push_back(output.GetOutputDesc());
+    }
+}
+
+void Device::UploadStagedInputs(
+    py::iterable staged,
+    std::vector<pydml::InputSlot> const& slots,
+    std::vector<DmlBufferBinding> const& bindings,
+    gpgmm::d3d12::ResourceAllocation* inputsResource,
+    uint64_t inputsResourceSize,
+    bool owned
+    )
+{
+    if (inputsResourceSize == 0)
+    {
+        return;
+    }
+
+    // Copy the data into the upload heap. The wrapper layer validated shapes and
+    // dtypes and converts one array at a time as this loop pulls on `staged`, so
+    // only one converted copy is alive at once; the guards below only keep a bad
+    // caller of the private API from corrupting a neighboring tensor's bytes.
+    byte* uploadHeapData = nullptr;
+    ThrowIfFailed(m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&uploadHeapData)));
+
+    try
+    {
+        for (py::handle item : staged)
+        {
+            auto pair = item.cast<std::pair<uint32_t, py::array>>();
+            uint32_t index = pair.first;
+            py::array const& array = pair.second;
+
+            if (index >= slots.size() || slots[index].owned != owned)
+            {
+                throw std::invalid_argument(
+                    "staged input " + std::to_string(index) + " is not bound in this phase");
+            }
+
+            auto const& binding = bindings[index];
+            py::buffer_info info = array.request();
+            auto sizeInBytes = static_cast<uint64_t>(info.size) * static_cast<uint64_t>(info.itemsize);
+
+            if ((array.flags() & py::array::c_style) == 0 || sizeInBytes > binding.sizeInBytes)
+            {
+                throw std::invalid_argument(
+                    "staged input " + std::to_string(index) +
+                    " is not a contiguous array that fits its tensor");
+            }
+
+            byte* dest = uploadHeapData + binding.offset;
+            memcpy(dest, info.ptr, static_cast<size_t>(sizeInBytes));
+
+            // DirectML rounds a tensor's size up to a 4-byte boundary, so a
+            // packed array can come up a few bytes short of it; the tail still
+            // has to hold defined values.
+            if (sizeInBytes < binding.sizeInBytes)
+            {
+                memset(dest + sizeInBytes, 0, static_cast<size_t>(binding.sizeInBytes - sizeInBytes));
+            }
+        }
+    }
+    catch (...)
+    {
+        m_uploadHeap->Unmap(0, nullptr);
+        throw;
+    }
+
+    m_uploadHeap->Unmap(0, nullptr);
+
+    // Record the copy from the upload heap into the inputs resource
+    m_commandList->ResourceBarrier(
+        1,
+        &CD3DX12_RESOURCE_BARRIER::Transition(
+            inputsResource->GetResource(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST)
+        );
+
+    m_commandList->CopyBufferRegion(inputsResource->GetResource(), 0, m_uploadHeap->GetResource(), 0, inputsResourceSize);
+
+    m_commandList->ResourceBarrier(
+        1,
+        &CD3DX12_RESOURCE_BARRIER::Transition(
+            inputsResource->GetResource(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        );
+}
+
+py::list Device::Dispatch(
+    pydml::CompiledOperator& model,
+    py::iterable staged
     )
 {
     if (!model.initialized)
     {
-        throw std::invalid_argument("the model must be initialized before it is dispatched");
+        throw std::invalid_argument("the operator must be initialized before it is dispatched");
     }
 
     IDMLCompiledOperator* op = model.op.Get();
 
-    std::vector<DmlBufferBinding> inputBindings(inputs.size());
+    std::vector<DmlBufferBinding> inputBindings(model.inputs.size());
     uint64_t inputsResourceSize = 0;
 
-    for (size_t i = 0; i < inputs.size(); ++i)
+    for (size_t i = 0; i < model.inputs.size(); ++i)
     {
-        auto input = inputs[i];
+        auto& slot = model.inputs[i];
 
-        if (!input)
+        // An input owned by DirectML lives in the persistent resource and is
+        // not bound at execution.
+        if (!slot.owned)
         {
-            continue; // null optional tensor
-        }
-
-        DmlBufferTensorDesc desc = *input->desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-
-        // If OWNED_BY_DML is *not* set, this input must be bound at execution
-        if (!(desc.flags & DML_TENSOR_FLAG_OWNED_BY_DML))
-        {
+            DmlBufferTensorDesc desc = *slot.desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
             uint32_t requiredAlignment = std::max(desc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
 
             // Bind to the end of the inputs resource (with appropriate alignment)
@@ -188,20 +291,12 @@ std::vector<pydml::TensorData*> Device::Dispatch(
         }
     }
 
-    std::vector<DmlBufferBinding> outputBindings(outputs.size());
+    std::vector<DmlBufferBinding> outputBindings(model.outputDescs.size());
     uint64_t outputsResourceSize = 0;
 
-    for (size_t i = 0; i < outputs.size(); ++i)
+    for (size_t i = 0; i < model.outputDescs.size(); ++i)
     {
-        auto output = outputs[i];
-
-        if (!output)
-        {
-            continue; // null optional tensor
-        }
-
-        dml::TensorDesc desc = output->GetOutputDesc();
-        DmlBufferTensorDesc bufferDesc = *desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
+        DmlBufferTensorDesc bufferDesc = *model.outputDescs[i].AsPtr<DML_BUFFER_TENSOR_DESC>();
 
         uint32_t requiredAlignment = std::max(bufferDesc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
 
@@ -248,65 +343,10 @@ std::vector<pydml::TensorData*> Device::Dispatch(
         m_temporaryResource->GetResource(),
         m_outputsResource->GetResource()
     };
-    
+
     ClearGpuBuffers(buffersToClear);
 
-    if (inputsResourceSize)
-    {
-        // Copy the data into the upload heap
-        byte* uploadHeapData = nullptr;
-
-        ThrowIfFailed(m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&uploadHeapData)));
-
-        for (size_t i = 0; i < inputs.size(); ++i)
-        {
-            if (!inputBindings[i].buffer)
-            {
-                // This input tensor doesn't need to be bound for initialize
-                continue;
-            }
-
-            DmlBufferTensorDesc bufferDesc = *inputs[i]->desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-
-            void* dest = uploadHeapData + inputBindings[i].offset;
-            const void* src = inputs[i]->data.Get();
-
-            if (inputs[i]->data.buffer.size() != bufferDesc.totalTensorSizeInBytes)
-            {
-                // Almost always a binding whose CPU copy was released and then
-                // needed again. Guarding the memcpy rather than asserting it,
-                // since NDEBUG compiles the assert away.
-                throw std::invalid_argument(
-                    "input " + std::to_string(i) + " holds " +
-                    std::to_string(inputs[i]->data.buffer.size()) + " bytes but the tensor needs " +
-                    std::to_string(bufferDesc.totalTensorSizeInBytes) +
-                    "; rebind it if its data was released");
-            }
-
-            memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
-        }
-
-        m_uploadHeap->Unmap(0, nullptr);
-
-        // Record the copy from the upload heap into the inputs resource
-        m_commandList->ResourceBarrier(
-            1,
-            &CD3DX12_RESOURCE_BARRIER::Transition(
-                m_inputsResource->GetResource(),
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_DEST)
-            );
-
-        m_commandList->CopyBufferRegion(m_inputsResource->GetResource(), 0, m_uploadHeap->GetResource(), 0, inputsResourceSize);
-
-        m_commandList->ResourceBarrier(
-            1,
-            &CD3DX12_RESOURCE_BARRIER::Transition(
-                m_inputsResource->GetResource(),
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-            );
-    }
+    UploadStagedInputs(staged, model.inputs, inputBindings, m_inputsResource.Get(), inputsResourceSize, false);
 
     // Bind for execution
     DmlTypeConverter<1024> converter;
@@ -359,7 +399,7 @@ std::vector<pydml::TensorData*> Device::Dispatch(
     ExecuteCommandListAndWait();
 
     // Read the output data back from the readback heap
-    return DownloadFromReadBackHeap(outputsResourceSize, outputs, outputBindings);
+    return DownloadFromReadBackHeap(outputsResourceSize, model.outputDescs, outputBindings);
 }
 
 void Device::RecordOutputReadBack(uint64_t outputsResourceSize)
@@ -387,13 +427,13 @@ void Device::RecordOutputReadBack(uint64_t outputsResourceSize)
     }
 }
 
-std::vector<pydml::TensorData*> Device::DownloadFromReadBackHeap(
-    uint64_t outputsResourceSize, 
-    std::vector<dml::Expression*>& outputs,
+py::list Device::DownloadFromReadBackHeap(
+    uint64_t outputsResourceSize,
+    std::vector<dml::TensorDesc> const& outputDescs,
     std::vector<DmlBufferBinding>& outputBindings
     )
 {
-    std::vector<pydml::TensorData*> outputData;
+    py::list outputs;
 
     if (outputsResourceSize != 0)
     {
@@ -403,37 +443,44 @@ std::vector<pydml::TensorData*> Device::DownloadFromReadBackHeap(
 
         ThrowIfFailed(m_readbackHeap->Map(0, &readRange, reinterpret_cast<void**>(&readbackHeapData)));
 
-        for (size_t i = 0; i < outputs.size(); ++i)
+        for (size_t i = 0; i < outputDescs.size(); ++i)
         {
-            auto output = outputs[i];
+            auto const& desc = outputDescs[i];
+            auto const& type = GetDataType(desc.dataType);
 
-            if (!output)
+            std::vector<py::ssize_t> shape(desc.sizes.begin(), desc.sizes.end());
+
+            // numpy strides are in bytes. An empty vector makes py::array
+            // compute packed C-order strides itself.
+            std::vector<py::ssize_t> strides;
+            if (desc.strides)
             {
-                // This output tensor is optional (and null)
-                continue;
+                strides.reserve(desc.strides->size());
+                for (auto stride : *desc.strides)
+                {
+                    strides.push_back(static_cast<py::ssize_t>(stride) * static_cast<py::ssize_t>(type.itemSize));
+                }
             }
 
-            dml::TensorDesc desc = output->GetOutputDesc();
-            DmlBufferTensorDesc bufferDesc = *desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-
-            auto data = new TensorData(&desc);
-            void* dest = data->Get();
-            const void* src = readbackHeapData + outputBindings[i].offset;
-
-            memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
-
-            outputData.push_back(data);
+            // This constructor copies: it views the mapped heap through the
+            // desc's shape and strides, then materializes a packed array that
+            // owns its data.
+            outputs.append(py::array(
+                py::dtype(type.numpyName),
+                shape,
+                strides,
+                readbackHeapData + outputBindings[i].offset));
         }
 
         m_readbackHeap->Unmap(0, nullptr);
     }
 
-    return outputData;
+    return outputs;
 }
 
 void Device::Initialize(
-    pydml::CompiledModel& model,
-    std::vector<pydml::Binding*>& inputs
+    pydml::CompiledOperator& model,
+    py::iterable staged
     )
 {
     IDMLCompiledOperator* op = model.op.Get();
@@ -442,25 +489,19 @@ void Device::Initialize(
     ThrowIfFailed(m_operatorInitializer->Reset(1, &op));
 
     DmlBufferArrayBinding inputBinding;
-    inputBinding.bindings.resize(inputs.size());
+    inputBinding.bindings.resize(model.inputs.size());
 
     // Fill in the offsets and sizes for each binding, which will also tell us how big we need to make our buffer
     uint64_t inputsResourceSize = 0;
 
-    for (size_t i = 0; i < inputs.size(); ++i)
+    for (size_t i = 0; i < model.inputs.size(); ++i)
     {
-        auto input = inputs[i];
+        auto& slot = model.inputs[i];
 
-        if (!input)
+        // Only the inputs owned by DirectML are bound at initialize.
+        if (slot.owned)
         {
-            continue; // null optional tensor
-        }
-
-        DmlBufferTensorDesc bufferDesc = *input->desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-
-        // If OWNED_BY_DML is set, this input must be bound at initialize
-        if (bufferDesc.flags & DML_TENSOR_FLAG_OWNED_BY_DML)
-        {
+            DmlBufferTensorDesc bufferDesc = *slot.desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
             uint32_t requiredAlignment = std::max(bufferDesc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
 
             // Bind to the end of the inputs resource (with appropriate alignment)
@@ -503,62 +544,7 @@ void Device::Initialize(
 
     ClearGpuBuffers(buffersToClear);
 
-    if (inputsResourceSize)
-    {
-        // Copy the data into the upload heap
-        byte* uploadHeapData = nullptr;
-
-        ThrowIfFailed(m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&uploadHeapData)));
-
-        for (size_t i = 0; i < inputs.size(); ++i)
-        {
-            if (!inputBinding.bindings[i].buffer)
-            {
-                // This input tensor doesn't need to be bound for initialize
-                continue;
-            }
-
-            DmlBufferTensorDesc bufferDesc = *inputs[i]->desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-
-            void* dest = uploadHeapData + inputBinding.bindings[i].offset;
-            const void* src = inputs[i]->data.Get();
-
-            if (inputs[i]->data.buffer.size() != bufferDesc.totalTensorSizeInBytes)
-            {
-                // Almost always a binding whose CPU copy was released and then
-                // needed again. Guarding the memcpy rather than asserting it,
-                // since NDEBUG compiles the assert away.
-                throw std::invalid_argument(
-                    "input " + std::to_string(i) + " holds " +
-                    std::to_string(inputs[i]->data.buffer.size()) + " bytes but the tensor needs " +
-                    std::to_string(bufferDesc.totalTensorSizeInBytes) +
-                    "; rebind it if its data was released");
-            }
-
-            memcpy(dest, src, static_cast<size_t>(bufferDesc.totalTensorSizeInBytes));
-        }
-
-        m_uploadHeap->Unmap(0, nullptr);
-
-        // Record the copy from the upload heap into the inputs resource
-        m_commandList->ResourceBarrier(
-            1,
-            &CD3DX12_RESOURCE_BARRIER::Transition(
-                m_inputsResource->GetResource(),
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_DEST)
-            );
-
-        m_commandList->CopyBufferRegion(m_inputsResource->GetResource(), 0, m_uploadHeap->GetResource(), 0, inputsResourceSize);
-
-        m_commandList->ResourceBarrier(
-            1,
-            &CD3DX12_RESOURCE_BARRIER::Transition(
-                m_inputsResource->GetResource(),
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-                );
-    }
+    UploadStagedInputs(staged, model.inputs, inputBinding.bindings, m_inputsResource.Get(), inputsResourceSize, true);
 
     // Bind for initialization
     DmlTypeConverter<1024> converter;

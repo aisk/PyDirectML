@@ -223,7 +223,28 @@ PYBIND11_MODULE(_core, module)
             });
 
     py::class_<dml::Expression>(module, "Expression")
-        .def("get_output_desc", &dml::Expression::GetOutputDesc, "Get the expression's output descriptor.")
+        .def_property_readonly("desc", &dml::Expression::GetOutputDesc,
+            "The TensorDesc describing this expression's output.")
+        .def_property_readonly("_node_id", [](dml::Expression const& self) {
+            return reinterpret_cast<std::uintptr_t>(self.Impl());
+            },
+            "The node pointer as an integer: the exact identity value hash() is "
+            "derived from. The wrapper layer matches dict keys against the input "
+            "slots with it.")
+        // Two Expressions are the same input if and only if they are the same
+        // node, so identity by node pointer is what lets a dict keyed by
+        // Expression replace bindings matched by position. The pointer is only
+        // ever compared, never dereferenced, which is why a key stays usable
+        // after its graph is destroyed.
+        .def("__hash__", [](dml::Expression const& self) {
+            return reinterpret_cast<std::uintptr_t>(self.Impl());
+            })
+        .def("__eq__", [](dml::Expression const& self, dml::Expression const& other) {
+            return self.Impl() == other.Impl();
+            }, py::is_operator())
+        .def("__ne__", [](dml::Expression const& self, dml::Expression const& other) {
+            return self.Impl() != other.Impl();
+            }, py::is_operator())
         .def(py::self + py::self)
         .def(py::self - py::self)
         .def(py::self * py::self)
@@ -271,120 +292,66 @@ PYBIND11_MODULE(_core, module)
         .def_readwrite("sequence", &dml::GRUOutputs::sequence)
         .def_readwrite("single", &dml::GRUOutputs::single);
 
-    py::class_<pydml::TensorData>(module, "TensorData", py::buffer_protocol())
-        .def_buffer([](pydml::TensorData& self) -> py::buffer_info {
-            return py::buffer_info(
-                self.Get(),
-                self.itemSize,
-                self.format,
-                self.dimensions,
-                self.shape,
-                self.strides
-                ); });
-
-    py::class_<pydml::Binding>(module, "Binding")
-        .def(py::init([](dml::Expression& expression, py::array data) {
-            auto const& type = GetDataType(expression.GetOutputDesc().dataType);
-            auto numpy = py::module_::import("numpy");
-            py::dtype target(type.numpyName);
-
-            // Narrowing within a kind is fine -- float64 to float32 is what
-            // np.zeros() lands on and the samples rely on it, float32 to float16
-            // is how half-precision weights get loaded -- and so is any cast NumPy
-            // calls safe. Crossing kinds any other way, int32 into a float32
-            // tensor above all, is the silent-wrong-answer case, and has to be
-            // spelled out with an explicit astype. NumPy's own 'same_kind' rule is
-            // no help here: it permits int32 to float32.
-            auto sameKind = data.dtype().kind() == target.kind();
-            auto safe = numpy.attr("can_cast")(data.dtype(), target, "safe").cast<bool>();
-
-            if (!sameKind && !safe)
-            {
-                throw std::invalid_argument(
-                    "cannot bind a " + py::str(data.dtype()).cast<std::string>() +
-                    " array to a " + type.numpyName + " tensor; convert it explicitly with astype()");
-            }
-
-            auto converted = numpy.attr("ascontiguousarray")(data, target).cast<py::array>();
-            return new pydml::Binding(expression, converted.request());
-            }),
-            py::arg("expr"),
-            py::arg("data"))
-        .def("release_data", [](pydml::Binding& self) { self.data.Release(); },
-            "Free this binding's CPU copy of the data. Safe for an OWNED_BY_DML "
-            "tensor once the model has been initialized, since DirectML holds the "
-            "data from then on. Dispatching a released binding that is not owned "
-            "by DirectML raises.");
-
-    py::class_<pydml::CompiledModel>(module, "Model")
-        .def_property_readonly("temporary_size", [](pydml::CompiledModel& self) {
-            return self.op->GetBindingProperties().TemporaryResourceSize;
-            },
-            "Bytes of scratch memory one dispatch of this graph needs. Every "
-            "intermediate tensor lives here, so this is the number that grows with "
-            "the size of the input rather than with the size of the weights.")
-        .def_property_readonly("persistent_size", [](pydml::CompiledModel& self) {
-            return self.op->GetBindingProperties().PersistentResourceSize;
-            },
-            "Bytes this graph keeps between dispatches: the OWNED_BY_DML tensors, "
-            "in whatever layout the operators wanted them in.")
-        .def_property_readonly("descriptor_count", [](pydml::CompiledModel& self) {
-            return self.op->GetBindingProperties().RequiredDescriptorCount;
-            },
-            "Descriptors one dispatch of this graph binds.");
-
-    py::class_<pydml::Device>(module, "Device")
+    py::class_<pydml::Device, std::shared_ptr<pydml::Device>>(module, "Device")
         .def(py::init<bool, bool>(),
             py::arg("use_gpu") = true,
             py::arg("use_debug_layer") = false)
-        .def("compute", [](
-            pydml::Device& self,
-            pydml::CompiledModel& model,
-            std::vector<pydml::Binding*> inputs,
-            std::vector<dml::Expression*> outputs) {
-                return self.Compute(model, inputs, outputs);
-            },
-            "Calculate the output of the operator from the input data. Initializes "
-            "the model on the first call, so a tensor flagged OWNED_BY_DML is read "
-            "once and then lives on the GPU; rebind one and call initialize() to "
-            "make the new data take effect.",
-            py::arg("model"),
-            py::arg("inputs"),
-            py::arg("outputs"))
-        .def("initialize", [](
-            pydml::Device& self,
-            pydml::CompiledModel& model,
-            std::vector<pydml::Binding*> inputs) {
-                self.Initialize(model, inputs);
-            },
-            "Upload the tensors flagged OWNED_BY_DML and initialize the model. Only "
-            "those tensors are read; the rest are bound per dispatch.",
-            py::arg("model"),
-            py::arg("inputs"))
-        .def("dispatch", [](
-            pydml::Device& self,
-            pydml::CompiledModel& model,
-            std::vector<pydml::Binding*> inputs,
-            std::vector<dml::Expression*> outputs) {
-                return self.Dispatch(model, inputs, outputs);
-            },
-            "Run an initialized model. Uploads only the tensors that are not owned "
-            "by DirectML.",
-            py::arg("model"),
-            py::arg("inputs"),
-            py::arg("outputs"))
         .def("__repr__",
             [](pydml::Device const& device) {
                 return "dml.Device on " + std::string(device.UseGpu() ? "GPU" : "CPU");
             });
 
-    py::class_<dml::Graph>(module, "GraphBuilder")
-        .def(py::init([](pydml::Device const& device) {
-            return std::unique_ptr<dml::Graph>(new dml::Graph(device.GetDevice()));
+    // The private surface of a compiled operator. The public initialize(),
+    // dispatch() and __call__ live in the wrapper layer, which validates the
+    // dict of inputs and converts the arrays one at a time as _initialize and
+    // _dispatch pull on the staged iterable. py::dynamic_attr lets the wrapper
+    // cache its slot table on the instance.
+    py::class_<pydml::CompiledOperator>(module, "CompiledOperator", py::dynamic_attr())
+        .def_property_readonly("temporary_size", [](pydml::CompiledOperator& self) {
+            return self.op->GetBindingProperties().TemporaryResourceSize;
+            },
+            "Bytes of scratch memory one dispatch of this graph needs. Every "
+            "intermediate tensor lives here, so this is the number that grows with "
+            "the size of the input rather than with the size of the weights.")
+        .def_property_readonly("persistent_size", [](pydml::CompiledOperator& self) {
+            return self.op->GetBindingProperties().PersistentResourceSize;
+            },
+            "Bytes this graph keeps between dispatches: the OWNED_BY_DML tensors, "
+            "in whatever layout the operators wanted them in.")
+        .def_property_readonly("descriptor_count", [](pydml::CompiledOperator& self) {
+            return self.op->GetBindingProperties().RequiredDescriptorCount;
+            },
+            "Descriptors one dispatch of this graph binds.")
+        .def_property_readonly("initialized", [](pydml::CompiledOperator& self) {
+            return self.initialized;
+            },
+            "Whether the OWNED_BY_DML inputs have been folded into the operator's "
+            "persistent resource yet.")
+        .def_property_readonly("_input_slots", [](pydml::CompiledOperator& self) {
+            py::list slots;
+            for (auto const& slot : self.inputs)
+            {
+                slots.append(py::make_tuple(slot.key, slot.owned, slot.desc));
+            }
+            return slots;
+            },
+            "One (node id, owned, TensorDesc) tuple per graph input, in index order.")
+        .def("_initialize", [](pydml::CompiledOperator& self, py::iterable staged) {
+            self.device->Initialize(self, staged);
+            },
+            py::arg("staged"))
+        .def("_dispatch", [](pydml::CompiledOperator& self, py::iterable staged) {
+            return self.device->Dispatch(self, staged);
+            },
+            py::arg("staged"));
+
+    py::class_<pydml::Graph>(module, "GraphBuilder")
+        .def(py::init([](std::shared_ptr<pydml::Device> device) {
+            return new pydml::Graph(std::move(device), dml::TensorPolicy::Default());
             }),
             py::arg("device"))
-        .def("build", [](dml::Graph& self, DML_EXECUTION_FLAGS flags, std::vector<dml::Expression> outputs) {
-            return new pydml::CompiledModel(self, flags, outputs);
+        .def("build", [](pydml::Graph& self, DML_EXECUTION_FLAGS flags, std::vector<dml::Expression> outputs) {
+            return new pydml::CompiledOperator(self, flags, outputs);
             },
             "Compile the expressions to a compiled operator.",
             py::arg("flags"),
@@ -392,7 +359,11 @@ PYBIND11_MODULE(_core, module)
 
     // Functions
     //
-    module.def("input_tensor", &dml::InputTensor, "Create an input tensor as an expression.",
+    module.def("input_tensor", [](pydml::Graph& graph, uint32_t inputIndex, dml::TensorDesc desc) {
+            return graph.Input(inputIndex, std::move(desc));
+        },
+        "Create an input tensor as an expression. Its index is recorded by the "
+        "graph, and must arrive in order.",
         py::arg("scope"),
         py::arg("input_index"),
         py::arg("tensor_desc"));

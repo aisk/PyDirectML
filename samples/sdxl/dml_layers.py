@@ -39,7 +39,7 @@ NUMPY_DTYPES = {
 
 def sizes(expression):
     """The shape of an expression's output, as a list."""
-    return list(expression.get_output_desc().sizes)
+    return list(expression.desc.sizes)
 
 
 def data_type(expression):
@@ -48,37 +48,32 @@ def data_type(expression):
     Every reshape below reads this off the expression rather than assuming
     float32, so the same layer code builds a half-precision graph.
     """
-    return expression.get_output_desc().data_type
+    return expression.desc.data_type
 
 
 class Model:
-    """A graph under construction, plus the arrays bound to its inputs.
+    """A graph under construction, plus the arrays bound to its weights.
 
     Weights are registered with :meth:`constant` and carry their data with them.
     Anything fed per run -- the latent, the image -- is registered with
-    :meth:`placeholder` and supplied to :meth:`run`.
+    :meth:`placeholder` and supplied to :meth:`run`. This is the part that
+    belongs to the model domain: naming which array feeds which input. The
+    index bookkeeping, dtype conversion and validation all live in the library.
     """
 
     def __init__(self, device, tensor_type=FLOAT32):
         self.tensor_type = tensor_type
         self.data_type = NUMPY_DTYPES[tensor_type]
-        self.device = device
         self.graph = dml.GraphBuilder(device)
-        self._bindings = []
-        self._expressions = []
-        # index -> (shape, dtype) for the inputs supplied per run.
-        self._placeholders = {}
-        self._outputs = []
+        self.weights = {}        # Expression -> ndarray, handed over at compile
+        self._placeholders = []  # the run() arguments, in order
+        self.input_count = 0
         self._operator = None
 
-    def _add_input(self, array, flags, data_type):
-        desc = dml.TensorDesc(data_type, flags, list(array.shape))
-        expression = dml.input_tensor(self.graph, len(self._bindings), desc)
-        self._expressions.append(expression)
-        # Bound here rather than at compile time so the caller can drop its own
-        # reference to the array immediately. Holding every weight until the
-        # whole graph is built costs a second copy of the model.
-        self._bindings.append(dml.Binding(expression, array))
+    def _add_input(self, flags, data_type, shape):
+        desc = dml.TensorDesc(data_type, flags, list(shape))
+        expression = dml.input_tensor(self.graph, self.input_count, desc)
+        self.input_count += 1
         return expression
 
     def constant(self, array, shape=None):
@@ -91,33 +86,28 @@ class Model:
         array = np.ascontiguousarray(array, self.data_type)
         if shape is not None:
             array = array.reshape(shape)
-        return self._add_input(array, dml.TensorFlags.OWNED_BY_DML, self.tensor_type)
+        expression = self._add_input(dml.TensorFlags.OWNED_BY_DML, self.tensor_type, array.shape)
+        self.weights[expression] = array
+        return expression
 
     def placeholder(self, shape, data_type=None):
         """Register an input whose data is supplied to :meth:`run`.
 
         Token indices are the reason this takes a data type: ``gather`` wants an
-        integer tensor, and a Binding now converts to whatever the tensor
-        declares rather than forcing float32.
+        integer tensor.
         """
         data_type = self.tensor_type if data_type is None else data_type
-        expression = self._add_input(
-            np.zeros(shape, NUMPY_DTYPES[data_type]), dml.TensorFlags.NONE, data_type)
-        self._placeholders[len(self._bindings) - 1] = (list(shape), NUMPY_DTYPES[data_type])
+        expression = self._add_input(dml.TensorFlags.NONE, data_type, shape)
+        self._placeholders.append(expression)
         return expression
 
     def compile(self, outputs):
-        self._outputs = list(outputs)
-        self._operator = self.graph.build(dml.ExecutionFlags.NONE, self._outputs)
-        # Uploads every OWNED_BY_DML tensor and hands it to DirectML. After this
-        # a dispatch only carries the placeholders.
-        self.device.initialize(self._operator, self._bindings)
-
-        # DirectML holds the weights now, so each binding's copy can go. That is
+        self._operator = self.graph.build(dml.ExecutionFlags.NONE, list(outputs))
+        # Uploads every weight and hands it to DirectML. The library keeps no
+        # copy, so dropping ours here leaves exactly one, on the GPU -- that is
         # 5.1 GiB for the UNet at half precision.
-        for index, binding in enumerate(self._bindings):
-            if index not in self._placeholders:
-                binding.release_data()
+        self._operator.initialize(self.weights)
+        self.weights.clear()
         return self
 
     def run(self, *values):
@@ -126,19 +116,7 @@ class Model:
             raise RuntimeError("compile() the model before running it")
         if len(values) != len(self._placeholders):
             raise ValueError(f"expected {len(self._placeholders)} inputs, got {len(values)}")
-
-        for (index, (shape, dtype)), value in zip(sorted(self._placeholders.items()), values):
-            value = np.ascontiguousarray(value, dtype)
-            if list(value.shape) != shape:
-                raise ValueError(f"input {index} has shape {list(value.shape)}, expected {shape}")
-            self._bindings[index] = dml.Binding(self._expressions[index], value)
-
-        results = self.device.dispatch(self._operator, self._bindings, self._outputs)
-        return [np.asarray(r).reshape(sizes(o)) for r, o in zip(results, self._outputs)]
-
-    @property
-    def input_count(self):
-        return len(self._bindings)
+        return self._operator(dict(zip(self._placeholders, values)))
 
     @property
     def temporary_size(self):

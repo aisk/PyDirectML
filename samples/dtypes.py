@@ -1,9 +1,10 @@
-"""Run the same graph at float32 and at float16, and show what Binding refuses.
+"""Run the same graph at float32 and at float16, and show what dispatch refuses.
 
-A tensor's ``TensorDataType`` decides the dtype on both ends: ``Binding`` converts
-what you hand it to that type, and results come back as that type. Half precision
-halves the memory a set of weights takes and the bytes moved to reach them, which
-is what makes it interesting for anything model-sized.
+A tensor's ``TensorDataType`` decides the dtype on both ends: what you hand to
+``initialize()`` or ``dispatch()`` is converted to that type on upload, and
+results come back as that type. Half precision halves the memory a set of
+weights takes and the bytes moved to reach them, which is what makes it
+interesting for anything model-sized.
 
 Conversions that stay within a dtype kind, or that NumPy calls safe, happen
 silently. Anything else has to be spelled out, because reinterpreting an integer
@@ -23,10 +24,10 @@ def gemm(device, data_type, a, b):
     product = dml.gemm(lhs, rhs)
 
     op = graph.build(dml.ExecutionFlags.NONE, [product])
-    output, = device.compute(op, [dml.Binding(lhs, a), dml.Binding(rhs, b)], [product])
+    output, = op({lhs: a, rhs: b})
 
-    # No dtype is named here: the buffer NumPy reads carries the tensor's own.
-    return np.asarray(output).reshape(a.shape[0], b.shape[1])
+    # No dtype is named here: the result carries the tensor's own.
+    return output.reshape(a.shape[0], b.shape[1])
 
 
 def main():
@@ -42,9 +43,10 @@ def main():
         print(f"  {str(data_type):<32} -> {product.dtype}, "
               f"{product.nbytes} bytes, max error {error:.2e}")
 
-    print("\nWhat Binding accepts")
+    print("\nWhat dispatch accepts")
     graph = dml.GraphBuilder(device)
     tensor = dml.input_tensor(graph, 0, dml.TensorDesc(dml.TensorDataType.FLOAT32, [1, 1, 2, 2]))
+    op = graph.build(dml.ExecutionFlags.NONE, [dml.activation_identity(tensor)])
 
     cases = [
         ("float64 array", np.zeros((2, 2), np.float64)),
@@ -55,7 +57,7 @@ def main():
     ]
     for label, array in cases:
         try:
-            dml.Binding(tensor, array)
+            op({tensor: array})
             print(f"  {label:<32} accepted")
         except ValueError as error:
             print(f"  {label:<32} {error}")

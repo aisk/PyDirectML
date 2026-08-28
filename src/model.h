@@ -8,22 +8,58 @@
 
 namespace pydml
 {
-    struct CompiledModel
+    class Device;
+
+    // One input of a graph: which expression it is, what tensor it wants, and
+    // whether DirectML owns its data. `key` is the expression's NodeOutput
+    // pointer, kept only as an identity to match dict keys against -- it is
+    // never dereferenced, so it stays valid as a key after the graph is gone.
+    struct InputSlot
     {
-        CompiledModel(
-            dml::Graph& graph, 
+        uintptr_t key;
+        dml::TensorDesc desc;
+        bool owned;
+    };
+
+    // A dml::Graph plus the record of its inputs. The record is what lets a
+    // dict keyed by Expression replace bindings matched by position: every
+    // input's index is assigned here and snapshotted into the CompiledOperator,
+    // so no caller ever writes an index by hand.
+    struct Graph
+    {
+        Graph(std::shared_ptr<Device> device, dml::TensorPolicy tensorPolicy);
+
+        dml::Expression Input(uint32_t index, dml::TensorDesc desc);
+
+        std::shared_ptr<Device> device;
+        dml::Graph graph;
+        std::vector<InputSlot> slots;
+    };
+
+    struct CompiledOperator
+    {
+        CompiledOperator(
+            Graph& graph,
             DML_EXECUTION_FLAGS flags,
-            std::vector<dml::Expression>& outputs
-            ) : 
-            op(graph.Compile(flags, outputs))
-        {}
+            std::vector<dml::Expression> const& outputs
+            );
 
         Microsoft::WRL::ComPtr<IDMLCompiledOperator> op;
 
+        // The device that compiled this operator, which owns the execution
+        // machinery. Holding it here is what makes the operator self-contained:
+        // the natural way to write a model is to compile and then drop the
+        // graph, and initialize/dispatch must not require it to be alive.
+        std::shared_ptr<Device> device;
+
+        // Snapshots taken at compile time, for the same reason.
+        std::vector<InputSlot> inputs;
+        std::vector<dml::TensorDesc> outputDescs;
+
         // The allocator that made persistentResource. gpgmm hands the memory back
         // to it on release, and Python is free to destroy the Device before the
-        // Model, so the allocation keeps its allocator alive. Declared first so it
-        // is destroyed last.
+        // operator, so the allocation keeps its allocator alive. Declared before
+        // the allocation so it is destroyed last.
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocator> allocator;
 
         // Written by Device::Initialize. DirectML folds the DML_TENSOR_FLAG_OWNED_BY_DML
@@ -34,118 +70,5 @@ namespace pydml
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> persistentResource;
         uint64_t persistentResourceSize = 0;
         bool initialized = false;
-    };
-
-    struct TensorData
-    {
-        TensorData(py::buffer_info const& info) :
-            itemSize(info.itemsize),
-            format(info.format),
-            dimensions(info.ndim),
-            shape(info.shape),
-            strides(info.strides)
-        {
-            auto sizeInBytes = Size();
-            buffer.resize(sizeInBytes);
-            memcpy(buffer.data(), info.ptr, sizeInBytes);
-
-            // Numpy strides use bytes.
-            std::for_each(strides.begin(), strides.end(), [=](auto& i) {i *= itemSize; });
-        }
-
-        TensorData(dml::TensorDesc* desc) :
-            itemSize(GetDataType(desc->dataType).itemSize),
-            format(GetDataType(desc->dataType).format),
-            dimensions(desc->sizes.size())
-        {
-            for (auto size : desc->sizes)
-            {
-                shape.push_back(static_cast<ssize_t>(size));
-            }
-
-            if (desc->strides)
-            {
-                for (auto stride : *desc->strides)
-                {
-                    strides.push_back(static_cast<ssize_t>(stride));
-                }
-            }
-            else
-            {
-                // Use default descending packed strides.
-                strides.resize(shape.size());
-                ssize_t stride = 1;
-                for (size_t i = strides.size(); i-- > 0; )
-                {
-                    strides[i] = stride;
-                    stride *= shape[i];
-                }
-            }
-            // Numpy strides use bytes.
-            std::for_each(strides.begin(), strides.end(), [=](auto& i) {i *= itemSize; });
-
-            buffer.resize(static_cast<size_t>(desc->totalTensorSizeInBytes));
-        }
-
-        TensorData() {}
-
-        // Drop the CPU copy. For an OWNED_BY_DML input this is safe once the
-        // model has been initialized: DirectML has folded the data into the
-        // model's persistent resource and never reads this buffer again. At the
-        // scale of a diffusion UNet this copy is gigabytes.
-        void Release()
-        {
-            buffer.clear();
-            buffer.shrink_to_fit();
-        }
-
-        void* Get() const { return static_cast<void*>(const_cast<byte*>(buffer.data())); }
-
-        size_t Size() const
-        {
-            size_t size = 1;
-
-            for (auto length : shape)
-            {
-                size *= length;
-            }
-
-            return size * itemSize;
-        }
-
-        std::vector<byte> buffer;
-        size_t itemSize;
-        std::string format;
-        size_t dimensions;
-        std::vector<ssize_t> shape;
-        std::vector<ssize_t> strides;
-    };
-
-    struct Binding
-    {
-        explicit Binding(dml::Expression& expression, py::buffer_info const& info)
-            :   desc(expression.GetOutputDesc()),
-                data(info)
-        {
-            auto required = static_cast<size_t>(desc.AsPtr<DML_BUFFER_TENSOR_DESC>()->TotalTensorSizeInBytes);
-
-            if (data.buffer.size() > required)
-            {
-                throw std::invalid_argument(
-                    "array of " + std::to_string(data.buffer.size()) +
-                    " bytes does not fit a tensor of " + std::to_string(required) + " bytes");
-            }
-
-            // DirectML rounds a tensor's size up to a 4-byte boundary, so a packed
-            // array can come up a few bytes short. Device::Dispatch copies
-            // TotalTensorSizeInBytes out of this buffer, so pad it rather than let
-            // that copy read past the end.
-            data.buffer.resize(required);
-        }
-
-        Binding() = default;
-
-        dml::TensorDesc desc;
-        TensorData data;
     };
 }

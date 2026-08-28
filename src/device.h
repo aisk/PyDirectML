@@ -16,27 +16,22 @@ namespace pydml
         explicit Device(bool useGpu = true, bool useDebugLayer = false, DXGI_GPU_PREFERENCE gpuPreference = DXGI_GPU_PREFERENCE_UNSPECIFIED);
 
         // Bind the DML_TENSOR_FLAG_OWNED_BY_DML inputs and run the operator
-        // initializer, leaving the result in the model's persistent resource.
+        // initializer, leaving the result in the operator's persistent resource.
         // Once done, those inputs live on the GPU and dispatching does not touch
-        // them again.
+        // them again. `staged` yields (input index, C-contiguous array of the
+        // tensor's own dtype) pairs; the Python wrapper validates and converts,
+        // and yielding lazily means only one converted copy exists at a time.
         void Initialize(
-            pydml::CompiledModel& model,
-            std::vector<pydml::Binding*>& inputs
+            pydml::CompiledOperator& op,
+            py::iterable staged
             );
 
         // Upload the inputs that are not owned by DirectML, run the operator, and
-        // read the outputs back. Requires an initialized model.
-        std::vector<pydml::TensorData*> Dispatch(
-            pydml::CompiledModel& model,
-            std::vector<pydml::Binding*>& inputs,
-            std::vector<dml::Expression*>& outputs
-            );
-
-        // Initialize on first use, then dispatch.
-        std::vector<pydml::TensorData*> Compute(
-            pydml::CompiledModel& model,
-            std::vector<pydml::Binding*>& inputs,
-            std::vector<dml::Expression*>& outputs
+        // read the outputs back as numpy arrays shaped by the output descs.
+        // Requires an initialized operator.
+        py::list Dispatch(
+            pydml::CompiledOperator& op,
+            py::iterable staged
             );
 
         inline bool UseGpu() const
@@ -52,10 +47,22 @@ namespace pydml
     protected:
         void RecordOutputReadBack(uint64_t outputsResourceSize);
 
-        std::vector<pydml::TensorData*> DownloadFromReadBackHeap(
-            uint64_t outputsResourceSize, 
-            std::vector<dml::Expression*>& outputs,
+        py::list DownloadFromReadBackHeap(
+            uint64_t outputsResourceSize,
+            std::vector<dml::TensorDesc> const& outputDescs,
             std::vector<DmlBufferBinding>& outputBindings
+            );
+
+        // Copy `staged` (index, array) pairs into the upload heap at the offsets
+        // in `bindings`, zero-padding each tensor's tail, and record the copy
+        // into `inputsResource`.
+        void UploadStagedInputs(
+            py::iterable staged,
+            std::vector<pydml::InputSlot> const& slots,
+            std::vector<DmlBufferBinding> const& bindings,
+            gpgmm::d3d12::ResourceAllocation* inputsResource,
+            uint64_t inputsResourceSize,
+            bool owned
             );
 
         void EnsureUploadHeapSize(uint64_t requestedSizeInBytes);

@@ -5,6 +5,8 @@
 
 import directml as dml
 import numpy as np
+
+import tensor_data
 from PIL import Image, ImageOps
 import sys
 import os
@@ -36,14 +38,22 @@ mean = np.array([[[0.485]],[[ 0.456]],[[0.406]]])
 standard_deviation = np.array([[[0.229]],[[0.224]],[[0.225]]])
 processed_image = (rescaled_image - mean) / standard_deviation
 
-input_bindings = []
+weights = {}      # tensors DirectML owns, read once at initialize
+feeds = {}        # tensors bound per dispatch
+input_count = 1   # the image is input 0
 
-def append_input_tensor(builder: dml.GraphBuilder, input_bindings: list, input_tensor: dml.TensorDesc, file_name: str):
-    tensor = dml.input_tensor(builder, len(input_bindings), input_tensor)
+def append_input_tensor(builder: dml.GraphBuilder, input_tensor: dml.TensorDesc, file_name: str):
+    global input_count
+    tensor = dml.input_tensor(builder, input_count, input_tensor)
+    input_count += 1
     if file_name == "":
-        input_bindings.append(dml.Binding(tensor, np.zeros(tensor.get_output_desc().sizes)))
+        array = np.zeros(tensor.shape)
     else:
-        input_bindings.append(dml.Binding(tensor, np.load(tensor_data_path + "/" + file_name)))
+        array = tensor_data.load(tensor_data_path + "/" + file_name)
+    if input_tensor.flags == dml.TensorFlags.OWNED_BY_DML:
+        weights[tensor] = array
+    else:
+        feeds[tensor] = array
     return tensor
 
 # Create a GPU device, and build a model graph.
@@ -54,47 +64,46 @@ data_type = dml.TensorDataType.FLOAT32
 input = dml.input_tensor(builder, 0, dml.TensorDesc(data_type, [1, 3, 224, 224]))
 flags = dml.TensorFlags.OWNED_BY_DML
 
-input_bindings.append(dml.Binding(input, processed_image))
 
 # squeezenet0_conv0_fwd
-squeezenet0_conv0_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,3,3,3]), "squeezenet0_conv0_weight.npy")
-squeezenet0_conv0_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv0_bias.npy")
+squeezenet0_conv0_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,3,3,3]), "squeezenet0_conv0_weight.npy")
+squeezenet0_conv0_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv0_bias.npy")
 squeezenet0_conv0_fwd = dml.convolution(input, squeezenet0_conv0_weight, squeezenet0_conv0_bias, strides = [2,2], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_pool0_fwd
 squeezenet0_pool0_fwd = dml.max_pooling(squeezenet0_conv0_fwd, window_sizes = [3,3], strides = [2,2])
 
 # squeezenet0_conv1_fwd
-squeezenet0_conv1_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [16,64,1,1]), "squeezenet0_conv1_weight.npy")
-squeezenet0_conv1_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,16,1,1]), "squeezenet0_conv1_bias.npy")
+squeezenet0_conv1_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [16,64,1,1]), "squeezenet0_conv1_weight.npy")
+squeezenet0_conv1_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,16,1,1]), "squeezenet0_conv1_bias.npy")
 squeezenet0_conv1_fwd = dml.convolution(squeezenet0_pool0_fwd.values, squeezenet0_conv1_weight, squeezenet0_conv1_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv2_fwd
-squeezenet0_conv2_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,16,1,1]), "squeezenet0_conv2_weight.npy")
-squeezenet0_conv2_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv2_bias.npy")
+squeezenet0_conv2_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,16,1,1]), "squeezenet0_conv2_weight.npy")
+squeezenet0_conv2_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv2_bias.npy")
 squeezenet0_conv2_fwd = dml.convolution(squeezenet0_conv1_fwd, squeezenet0_conv2_weight, squeezenet0_conv2_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv3_fwd
-squeezenet0_conv3_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,16,3,3]), "squeezenet0_conv3_weight.npy")
-squeezenet0_conv3_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv3_bias.npy")
+squeezenet0_conv3_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,16,3,3]), "squeezenet0_conv3_weight.npy")
+squeezenet0_conv3_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv3_bias.npy")
 squeezenet0_conv3_fwd = dml.convolution(squeezenet0_conv1_fwd, squeezenet0_conv3_weight, squeezenet0_conv3_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat0
 squeezenet0_concat0 = dml.join([squeezenet0_conv2_fwd, squeezenet0_conv3_fwd], 1)
 
 # squeezenet0_conv4_fwd
-squeezenet0_conv4_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [16,128,1,1]), "squeezenet0_conv4_weight.npy")
-squeezenet0_conv4_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,16,1,1]), "squeezenet0_conv4_bias.npy")
+squeezenet0_conv4_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [16,128,1,1]), "squeezenet0_conv4_weight.npy")
+squeezenet0_conv4_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,16,1,1]), "squeezenet0_conv4_bias.npy")
 squeezenet0_conv4_fwd = dml.convolution(squeezenet0_concat0, squeezenet0_conv4_weight, squeezenet0_conv4_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv5_fwd
-squeezenet0_conv5_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,16,1,1]), "squeezenet0_conv5_weight.npy")
-squeezenet0_conv5_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv5_bias.npy")
+squeezenet0_conv5_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,16,1,1]), "squeezenet0_conv5_weight.npy")
+squeezenet0_conv5_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv5_bias.npy")
 squeezenet0_conv5_fwd = dml.convolution(squeezenet0_conv4_fwd, squeezenet0_conv5_weight, squeezenet0_conv5_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv6_fwd
-squeezenet0_conv6_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,16,3,3]), "squeezenet0_conv6_weight.npy")
-squeezenet0_conv6_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv6_bias.npy")
+squeezenet0_conv6_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,16,3,3]), "squeezenet0_conv6_weight.npy")
+squeezenet0_conv6_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv6_bias.npy")
 squeezenet0_conv6_fwd = dml.convolution(squeezenet0_conv4_fwd, squeezenet0_conv6_weight, squeezenet0_conv6_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat1
@@ -104,36 +113,36 @@ squeezenet0_concat1 = dml.join([squeezenet0_conv5_fwd, squeezenet0_conv6_fwd], 1
 squeezenet0_pool1_fwd = dml.max_pooling(squeezenet0_concat1, window_sizes = [3,3], strides = [2,2])
 
 # squeezenet0_conv7_fwd
-squeezenet0_conv7_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [32,128,1,1]), "squeezenet0_conv7_weight.npy")
-squeezenet0_conv7_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,32,1,1]), "squeezenet0_conv7_bias.npy")
+squeezenet0_conv7_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [32,128,1,1]), "squeezenet0_conv7_weight.npy")
+squeezenet0_conv7_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,32,1,1]), "squeezenet0_conv7_bias.npy")
 squeezenet0_conv7_fwd = dml.convolution(squeezenet0_pool1_fwd.values, squeezenet0_conv7_weight, squeezenet0_conv7_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv8_fwd
-squeezenet0_conv8_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [128,32,1,1]), "squeezenet0_conv8_weight.npy")
-squeezenet0_conv8_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv8_bias.npy")
+squeezenet0_conv8_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [128,32,1,1]), "squeezenet0_conv8_weight.npy")
+squeezenet0_conv8_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv8_bias.npy")
 squeezenet0_conv8_fwd = dml.convolution(squeezenet0_conv7_fwd, squeezenet0_conv8_weight, squeezenet0_conv8_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv9_fwd
-squeezenet0_conv9_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [128,32,3,3]), "squeezenet0_conv9_weight.npy")
-squeezenet0_conv9_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv9_bias.npy")
+squeezenet0_conv9_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [128,32,3,3]), "squeezenet0_conv9_weight.npy")
+squeezenet0_conv9_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv9_bias.npy")
 squeezenet0_conv9_fwd = dml.convolution(squeezenet0_conv7_fwd, squeezenet0_conv9_weight, squeezenet0_conv9_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat2
 squeezenet0_concat2 = dml.join([squeezenet0_conv8_fwd, squeezenet0_conv9_fwd], 1)
 
 # squeezenet0_conv10_fwd
-squeezenet0_conv10_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [32,256,1,1]), "squeezenet0_conv10_weight.npy")
-squeezenet0_conv10_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,32,1,1]), "squeezenet0_conv10_bias.npy")
+squeezenet0_conv10_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [32,256,1,1]), "squeezenet0_conv10_weight.npy")
+squeezenet0_conv10_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,32,1,1]), "squeezenet0_conv10_bias.npy")
 squeezenet0_conv10_fwd = dml.convolution(squeezenet0_concat2, squeezenet0_conv10_weight, squeezenet0_conv10_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv11_fwd
-squeezenet0_conv11_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [128,32,1,1]), "squeezenet0_conv11_weight.npy")
-squeezenet0_conv11_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv11_bias.npy")
+squeezenet0_conv11_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [128,32,1,1]), "squeezenet0_conv11_weight.npy")
+squeezenet0_conv11_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv11_bias.npy")
 squeezenet0_conv11_fwd = dml.convolution(squeezenet0_conv10_fwd, squeezenet0_conv11_weight, squeezenet0_conv11_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv12_fwd
-squeezenet0_conv12_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [128,32,3,3]), "squeezenet0_conv12_weight.npy")
-squeezenet0_conv12_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv12_bias.npy")
+squeezenet0_conv12_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [128,32,3,3]), "squeezenet0_conv12_weight.npy")
+squeezenet0_conv12_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,128,1,1]), "squeezenet0_conv12_bias.npy")
 squeezenet0_conv12_fwd = dml.convolution(squeezenet0_conv10_fwd, squeezenet0_conv12_weight, squeezenet0_conv12_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat3
@@ -143,72 +152,72 @@ squeezenet0_concat3 = dml.join([squeezenet0_conv11_fwd, squeezenet0_conv12_fwd],
 squeezenet0_pool2_fwd = dml.max_pooling(squeezenet0_concat3, window_sizes = [3,3], strides = [2,2])
 
 # squeezenet0_conv13_fwd
-squeezenet0_conv13_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [48,256,1,1]), "squeezenet0_conv13_weight.npy")
-squeezenet0_conv13_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,48,1,1]), "squeezenet0_conv13_bias.npy")
+squeezenet0_conv13_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [48,256,1,1]), "squeezenet0_conv13_weight.npy")
+squeezenet0_conv13_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,48,1,1]), "squeezenet0_conv13_bias.npy")
 squeezenet0_conv13_fwd = dml.convolution(squeezenet0_pool2_fwd.values, squeezenet0_conv13_weight, squeezenet0_conv13_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv14_fwd
-squeezenet0_conv14_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [192,48,1,1]), "squeezenet0_conv14_weight.npy")
-squeezenet0_conv14_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv14_bias.npy")
+squeezenet0_conv14_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [192,48,1,1]), "squeezenet0_conv14_weight.npy")
+squeezenet0_conv14_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv14_bias.npy")
 squeezenet0_conv14_fwd = dml.convolution(squeezenet0_conv13_fwd, squeezenet0_conv14_weight, squeezenet0_conv14_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv15_fwd
-squeezenet0_conv15_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [192,48,3,3]), "squeezenet0_conv15_weight.npy")
-squeezenet0_conv15_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv15_bias.npy")
+squeezenet0_conv15_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [192,48,3,3]), "squeezenet0_conv15_weight.npy")
+squeezenet0_conv15_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv15_bias.npy")
 squeezenet0_conv15_fwd = dml.convolution(squeezenet0_conv13_fwd, squeezenet0_conv15_weight, squeezenet0_conv15_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat4
 squeezenet0_concat4 = dml.join([squeezenet0_conv14_fwd, squeezenet0_conv15_fwd], 1)
 
 # squeezenet0_conv16_fwd
-squeezenet0_conv16_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [48,384,1,1]), "squeezenet0_conv16_weight.npy")
-squeezenet0_conv16_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,48,1,1]), "squeezenet0_conv16_bias.npy")
+squeezenet0_conv16_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [48,384,1,1]), "squeezenet0_conv16_weight.npy")
+squeezenet0_conv16_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,48,1,1]), "squeezenet0_conv16_bias.npy")
 squeezenet0_conv16_fwd = dml.convolution(squeezenet0_concat4, squeezenet0_conv16_weight, squeezenet0_conv16_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv17_fwd
-squeezenet0_conv17_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [192,48,1,1]), "squeezenet0_conv17_weight.npy")
-squeezenet0_conv17_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv17_bias.npy")
+squeezenet0_conv17_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [192,48,1,1]), "squeezenet0_conv17_weight.npy")
+squeezenet0_conv17_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv17_bias.npy")
 squeezenet0_conv17_fwd = dml.convolution(squeezenet0_conv16_fwd, squeezenet0_conv17_weight, squeezenet0_conv17_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv18_fwd
-squeezenet0_conv18_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [192,48,3,3]), "squeezenet0_conv18_weight.npy")
-squeezenet0_conv18_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv18_bias.npy")
+squeezenet0_conv18_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [192,48,3,3]), "squeezenet0_conv18_weight.npy")
+squeezenet0_conv18_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,192,1,1]), "squeezenet0_conv18_bias.npy")
 squeezenet0_conv18_fwd = dml.convolution(squeezenet0_conv16_fwd, squeezenet0_conv18_weight, squeezenet0_conv18_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat5
 squeezenet0_concat5 = dml.join([squeezenet0_conv17_fwd, squeezenet0_conv18_fwd], 1)
 
 # squeezenet0_conv19_fwd
-squeezenet0_conv19_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,384,1,1]), "squeezenet0_conv19_weight.npy")
-squeezenet0_conv19_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv19_bias.npy")
+squeezenet0_conv19_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,384,1,1]), "squeezenet0_conv19_weight.npy")
+squeezenet0_conv19_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv19_bias.npy")
 squeezenet0_conv19_fwd = dml.convolution(squeezenet0_concat5, squeezenet0_conv19_weight, squeezenet0_conv19_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv20_fwd
-squeezenet0_conv20_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [256,64,1,1]), "squeezenet0_conv20_weight.npy")
-squeezenet0_conv20_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv20_bias.npy")
+squeezenet0_conv20_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [256,64,1,1]), "squeezenet0_conv20_weight.npy")
+squeezenet0_conv20_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv20_bias.npy")
 squeezenet0_conv20_fwd = dml.convolution(squeezenet0_conv19_fwd, squeezenet0_conv20_weight, squeezenet0_conv20_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv21_fwd
-squeezenet0_conv21_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [256,64,3,3]), "squeezenet0_conv21_weight.npy")
-squeezenet0_conv21_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv21_bias.npy")
+squeezenet0_conv21_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [256,64,3,3]), "squeezenet0_conv21_weight.npy")
+squeezenet0_conv21_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv21_bias.npy")
 squeezenet0_conv21_fwd = dml.convolution(squeezenet0_conv19_fwd, squeezenet0_conv21_weight, squeezenet0_conv21_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat6
 squeezenet0_concat6 = dml.join([squeezenet0_conv20_fwd, squeezenet0_conv21_fwd], 1)
 
 # squeezenet0_conv22_fwd
-squeezenet0_conv22_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [64,512,1,1]), "squeezenet0_conv22_weight.npy")
-squeezenet0_conv22_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv22_bias.npy")
+squeezenet0_conv22_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [64,512,1,1]), "squeezenet0_conv22_weight.npy")
+squeezenet0_conv22_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,64,1,1]), "squeezenet0_conv22_bias.npy")
 squeezenet0_conv22_fwd = dml.convolution(squeezenet0_concat6, squeezenet0_conv22_weight, squeezenet0_conv22_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv23_fwd
-squeezenet0_conv23_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [256,64,1,1]), "squeezenet0_conv23_weight.npy")
-squeezenet0_conv23_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv23_bias.npy")
+squeezenet0_conv23_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [256,64,1,1]), "squeezenet0_conv23_weight.npy")
+squeezenet0_conv23_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv23_bias.npy")
 squeezenet0_conv23_fwd = dml.convolution(squeezenet0_conv22_fwd, squeezenet0_conv23_weight, squeezenet0_conv23_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_conv24_fwd
-squeezenet0_conv24_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [256,64,3,3]), "squeezenet0_conv24_weight.npy")
-squeezenet0_conv24_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv24_bias.npy")
+squeezenet0_conv24_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [256,64,3,3]), "squeezenet0_conv24_weight.npy")
+squeezenet0_conv24_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,256,1,1]), "squeezenet0_conv24_bias.npy")
 squeezenet0_conv24_fwd = dml.convolution(squeezenet0_conv22_fwd, squeezenet0_conv24_weight, squeezenet0_conv24_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_concat7
@@ -218,8 +227,8 @@ squeezenet0_concat7 = dml.join([squeezenet0_conv23_fwd, squeezenet0_conv24_fwd],
 squeezenet0_dropout0_fwd = dml.activation_identity(squeezenet0_concat7)
 
 # squeezenet0_conv25_fwd
-squeezenet0_conv25_weight = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1000,512,1,1]), "squeezenet0_conv25_weight.npy")
-squeezenet0_conv25_bias = append_input_tensor(builder, input_bindings, dml.TensorDesc(data_type, flags, [1,1000,1,1]), "squeezenet0_conv25_bias.npy")
+squeezenet0_conv25_weight = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1000,512,1,1]), "squeezenet0_conv25_weight.npy")
+squeezenet0_conv25_bias = append_input_tensor(builder, dml.TensorDesc(data_type, flags, [1,1000,1,1]), "squeezenet0_conv25_bias.npy")
 squeezenet0_conv25_fwd = dml.convolution(squeezenet0_dropout0_fwd, squeezenet0_conv25_weight, squeezenet0_conv25_bias, fused_activation = dml.FusedActivation(dml.OperatorType.ACTIVATION_RELU))
 
 # squeezenet0_pool3_fwd
@@ -234,9 +243,10 @@ soft_max = dml.activation_softmax(squeezenet0_flatten0_reshape0)
 # Compile the expression graph into a compiled operator
 op = builder.build(dml.ExecutionFlags.NONE, [soft_max])
 
+op.initialize(weights)
+
 # Compute the result
-output_data = device.compute(op, input_bindings, [soft_max])
-output_tensor = np.array(output_data[0], np.float32)
+output_tensor, = op({input: processed_image, **feeds})
 
 # Opens text file of categories to collect the correct image category
 label_file = open("imagenet_categories.txt","r")

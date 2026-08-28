@@ -31,10 +31,9 @@ def matmul(a, b):
     product = dml.gemm(lhs, rhs)
 
     op = graph.build(dml.ExecutionFlags.NONE, [product])
-    bindings = [dml.Binding(lhs, a), dml.Binding(rhs, b)]
-    output, = device.compute(op, bindings, [product])
+    output, = op({lhs: a, rhs: b})
 
-    return np.array(output, np.float32).reshape(a.shape[0], b.shape[1])
+    return output.reshape(a.shape[0], b.shape[1])
 
 
 def main():
