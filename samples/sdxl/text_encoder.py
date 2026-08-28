@@ -49,18 +49,18 @@ def causal_mask(tokens=MAX_TOKENS):
 
 def _encoder_layer(model, x, params, prefix, heads, activation, mask):
     """One pre-norm transformer block: attention, then MLP, both residual."""
-    x = dml.add(x, multi_head_attention(
+    x = x + multi_head_attention(
         model,
         layer_norm(model, x, params[f"{prefix}.layer_norm1.weight"],
                    params[f"{prefix}.layer_norm1.bias"], LAYER_NORM_EPSILON),
-        params, f"{prefix}.self_attn", heads, mask))
+        params, f"{prefix}.self_attn", heads, mask)
 
     h = layer_norm(model, x, params[f"{prefix}.layer_norm2.weight"],
                    params[f"{prefix}.layer_norm2.bias"], LAYER_NORM_EPSILON)
     h = activation(linear(model, h, params[f"{prefix}.mlp.fc1.weight"],
                           params[f"{prefix}.mlp.fc1.bias"]))
     h = linear(model, h, params[f"{prefix}.mlp.fc2.weight"], params[f"{prefix}.mlp.fc2.bias"])
-    return dml.add(x, h)
+    return x + h
 
 
 def build_text_encoder(model, params, config):
@@ -78,8 +78,8 @@ def build_text_encoder(model, params, config):
     tokens = model.placeholder([1, 1, 1, MAX_TOKENS], np.uint32)
     x = dml.gather(model.constant(table, shape=[1, 1, table.shape[0], width]),
                    tokens, axis=2, index_dimensions=1)
-    x = dml.add(x, model.constant(params["text_model.embeddings.position_embedding.weight"],
-                                  shape=[1, 1, MAX_TOKENS, width]))
+    x = x + model.constant(params["text_model.embeddings.position_embedding.weight"],
+                           shape=[1, 1, MAX_TOKENS, width])
 
     mask = model.constant(causal_mask())
 

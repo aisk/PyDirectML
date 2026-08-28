@@ -257,16 +257,23 @@ PYBIND11_MODULE(_core, module)
         .def("__ne__", [](dml::Expression const& self, dml::Expression const& other) {
             return self.Impl() != other.Impl();
             }, py::is_operator())
+        // The arithmetic operators are DirectMLX's: +, -, *, / build the
+        // elementwise node, and a float operand rides on the scale-bias of an
+        // identity. Two are corrected here rather than taken as-is, and the
+        // in-place forms are dropped: += would mutate the C++ node behind
+        // every Python reference at once, changing the hash and dict-binding
+        // identity of each alias. Without __iadd__, Python rewrites x += y as
+        // x = x + y, which rebinds one name and leaves the aliases alone.
         .def(py::self + py::self)
         .def(py::self - py::self)
         .def(py::self * py::self)
         .def(py::self / py::self)
-        .def(py::self % py::self)
-        .def(py::self += py::self)
-        .def(py::self -= py::self)
-        .def(py::self *= py::self)
-        .def(py::self /= py::self)
-        .def(py::self %= py::self)
+        // Python's % is floored: -7 % 5 == 3. DirectMLX's operator% picks
+        // ModulusTruncate, which is C's fmod, so bind the floored operator
+        // DirectML also has.
+        .def("__mod__", [](dml::Expression const& a, dml::Expression const& b) {
+            return dml::ModulusFloor(a, b);
+            }, py::is_operator())
         .def(py::self + float())
         .def(py::self - float())
         .def(py::self * float())
@@ -274,11 +281,12 @@ PYBIND11_MODULE(_core, module)
         .def(float() + py::self)
         .def(float() - py::self)
         .def(float() * py::self)
-        .def(float() / py::self)
-        .def(py::self += float())
-        .def(py::self -= float())
-        .def(py::self *= float())
-        .def(py::self /= float())
+        // DirectMLX writes a / x as Recip(x, scale=a), but an elementwise
+        // scale-bias applies to the operator's input, so that computes
+        // 1/(a*x). Scale the reciprocal instead.
+        .def("__rtruediv__", [](dml::Expression const& self, float a) {
+            return dml::Identity(dml::Recip(self), DML_SCALE_BIAS{ a, 0.0f });
+            }, py::is_operator())
         .def(-py::self);
 
     py::class_<dml::FusedActivation>(module, "FusedActivation")

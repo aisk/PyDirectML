@@ -103,6 +103,60 @@ class TestBindingErrors:
             op({x: np.zeros((2, 3), np.float32)})
 
 
+class TestOperators:
+    """Arithmetic on Expression comes from DirectMLX's C++ overloads, with the
+    deviations the README documents: % is floored like Python's, a float
+    numerator scales the reciprocal, and there are no in-place forms."""
+
+    def compute(self, device, build, *arrays):
+        graph = dml.Graph(device)
+        inputs = [graph.input(a.shape, a.dtype) for a in arrays]
+        op = graph.compile([build(*inputs)])
+        return op(dict(zip(inputs, arrays)))[0]
+
+    def test_expression_operands(self, device):
+        a = np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2)
+        b = np.full((1, 1, 2, 2), 2.0, np.float32)
+        result = self.compute(device, lambda x, y: x * y - x / y, a, b)
+        assert np.allclose(result, a * b - a / b)
+
+    def test_float_operands_ride_the_scale_bias(self, device):
+        a = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+        result = self.compute(device, lambda x: 1.0 - x * 0.5, a)
+        assert np.allclose(result, 1.0 - a * 0.5)
+
+    def test_negation(self, device):
+        a = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+        assert np.allclose(self.compute(device, lambda x: -x, a), -a)
+
+    def test_float_numerator_scales_the_reciprocal(self, device):
+        # DirectMLX's own operator/ hands the scale to Recip, and an
+        # elementwise scale-bias applies to the input: 1/(2x), not 2/x.
+        a = np.array([1, 2, 4, 8], np.float32).reshape(1, 1, 2, 2)
+        result = self.compute(device, lambda x: 2.0 / x, a)
+        assert np.allclose(result, 2.0 / a)
+
+    def test_modulus_is_floored_like_pythons(self, device):
+        a = np.array([-7, -1, 1, 7], np.int32).reshape(1, 1, 2, 2)
+        b = np.full((1, 1, 2, 2), 5, np.int32)
+        result = self.compute(device, lambda x, y: x % y, a, b)
+        assert np.array_equal(result, a % b)
+
+    def test_augmented_assignment_rebinds_the_name(self, device):
+        # Deliberately no __iadd__: it would mutate the node behind every
+        # reference to it, changing the identity that dict binding matches
+        # on. The x = x + y fallback rebinds one name and leaves the input
+        # reachable through its alias.
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        alias = x
+        x += 1.0
+        assert x is not alias
+        op = graph.compile([x])
+        result, = op({alias: np.zeros((2, 2), np.float32)})
+        assert np.all(result == 1.0)
+
+
 class TestByteSizes:
     def test_short_packed_array_is_padded(self, device):
         # Three float16s are 6 bytes; DirectML rounds the tensor up to 8. The

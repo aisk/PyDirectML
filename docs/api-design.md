@@ -189,6 +189,19 @@ namedtuple 用 `typing.NamedTuple` 定义在 Python 包装层，`_core` 返回�
 
 `__version__` 保留：正经打包之后它几乎是白送的（从包元数据读），不再经 CXXFLAGS 走一遍。
 
+### 4.9 `Expression` 的算术运算符
+
+`+ - * / %` 和一元 `-` 来自 DirectMLX 的 C++ 重载：两个 Expression 之间是逐元素算子节点；float 标量骑在 identity 的 scale-bias 上（`x * 0.5` 是一个 `ELEMENT_WISE_IDENTITY`，不产生常量张量，也不占输入槽位）。有三处不照单全收：
+
+- **`float / x` 修正**。DirectMLX 写成 `Recip(x, {scale=a})`，但逐元素算子的 scale-bias 作用在**输入**上，算出来是 `1/(ax)` 而非 `a/x`。绑定改为先 `Recip` 再用 identity 乘回 `a`。
+- **`%` 取 floored 语义**。Python 的 `-7 % 5 == 3`；DirectMLX 的 `operator%` 选了 `ModulusTruncate`（即 C 的 fmod），绑定换成 `ModulusFloor`，与 Python/numpy 的 `%` 一致。
+- **不提供 in-place 形式**。`py::self += py::self` 会原地改写 C++ 节点——引用同一 Python 对象的所有别名一起变，hash 和 §4.1 的 dict 绑定身份随之失效。不定义 `__iadd__`，Python 自动退化为 `x = x + y`，只重绑一个名字，别名手里的输入原封不动。
+
+两条红线：
+
+- **比较运算符永远不构图**。`__eq__`/`__hash__` 按节点身份实现（§4.3，dict 绑定靠它），numpy 风格的逐元素 `==` 与之不可共存；`<`、`>` 等一并不做，避免「一半按身份一半构图」的割裂。
+- **不做隐式广播**。两个 Expression 的 shape 必须一致，广播由调用方用 `reinterpret` 的零步长视图显式表达（sdxl 样例的 `broadcast()` 即是）。shape 不匹配在 compile 时以 `E_INVALIDARG` 报出。
+
 ## 5. 效果对照
 
 以 mnist.py 的前半段为例。改造前：

@@ -131,7 +131,7 @@ def resnet_block(model, x, temb, params, prefix):
 
     projected = linear(model, silu(temb), params[f"{prefix}.time_emb_proj.weight"],
                        params[f"{prefix}.time_emb_proj.bias"])
-    h = dml.add(h, broadcast(to_channels(projected), h.shape))
+    h = h + broadcast(to_channels(projected), h.shape)
 
     h = conv2d(model, silu(group_norm(model, h, params[f"{prefix}.norm2.weight"],
                                       params[f"{prefix}.norm2.bias"],
@@ -141,24 +141,24 @@ def resnet_block(model, x, temb, params, prefix):
     if f"{prefix}.conv_shortcut.weight" in params:
         x = conv2d(model, x, params[f"{prefix}.conv_shortcut.weight"],
                    params[f"{prefix}.conv_shortcut.bias"], padding=0)
-    return dml.add(x, h)
+    return x + h
 
 
 def transformer_block(model, x, context, params, prefix, heads):
     """Attend over the image, cross-attend to the text, then a gated feed-forward."""
-    x = dml.add(x, diffusers_attention(
+    x = x + diffusers_attention(
         model, layer_norm(model, x, params[f"{prefix}.norm1.weight"],
                           params[f"{prefix}.norm1.bias"]),
-        params, f"{prefix}.attn1", heads))
+        params, f"{prefix}.attn1", heads)
 
-    x = dml.add(x, diffusers_attention(
+    x = x + diffusers_attention(
         model, layer_norm(model, x, params[f"{prefix}.norm2.weight"],
                           params[f"{prefix}.norm2.bias"]),
-        params, f"{prefix}.attn2", heads, context))
+        params, f"{prefix}.attn2", heads, context)
 
-    return dml.add(x, geglu(model, layer_norm(model, x, params[f"{prefix}.norm3.weight"],
-                                              params[f"{prefix}.norm3.bias"]),
-                            params, f"{prefix}.ff"))
+    return x + geglu(model, layer_norm(model, x, params[f"{prefix}.norm3.weight"],
+                                       params[f"{prefix}.norm3.bias"]),
+                     params, f"{prefix}.ff")
 
 
 def transformer_2d(model, x, context, params, prefix, heads, layers):
@@ -178,7 +178,7 @@ def transformer_2d(model, x, context, params, prefix, heads, layers):
 
     tokens = linear(model, tokens, params[f"{prefix}.proj_out.weight"],
                     params[f"{prefix}.proj_out.bias"])
-    return dml.add(to_image(tokens, height, width), residual)
+    return to_image(tokens, height, width) + residual
 
 
 def down_block(model, x, temb, context, params, prefix, heads, layers, downsample):
@@ -232,8 +232,8 @@ def build_down(model, params, latent_shape, tokens):
         [batch, 1, 1, TIME_EMBED_DIM + 6 * ADDITION_TIME_EMBED_DIM])
     context = model.placeholder([batch, 1, tokens, CROSS_ATTENTION_DIM])
 
-    temb = dml.add(_embedding_mlp(model, time_input, params, "time_embedding"),
-                   _embedding_mlp(model, add_input, params, "add_embedding"))
+    temb = (_embedding_mlp(model, time_input, params, "time_embedding")
+            + _embedding_mlp(model, add_input, params, "add_embedding"))
 
     x = conv2d(model, sample, params["conv_in.weight"], params["conv_in.bias"])
     skips = [x]

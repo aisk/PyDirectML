@@ -142,7 +142,7 @@ def to_image(expression, height, width):
 
 def silu(expression):
     """x * sigmoid(x), the activation the VAE calls "swish"."""
-    return dml.multiply(expression, dml.activation_sigmoid(expression))
+    return expression * dml.activation_sigmoid(expression)
 
 
 def conv2d(model, x, weight, bias, stride=1, padding=1, end_padding=None):
@@ -191,7 +191,7 @@ def group_norm(model, x, weight, bias, groups=32, epsilon=1e-6):
 
     scale = broadcast(model.constant(weight, shape=[1, c, 1, 1]), shape)
     shift = broadcast(model.constant(bias, shape=[1, c, 1, 1]), shape)
-    return dml.add(dml.multiply(normalized, scale), shift)
+    return normalized * scale + shift
 
 
 def resnet_block(model, x, params, prefix, epsilon=1e-6):
@@ -207,7 +207,7 @@ def resnet_block(model, x, params, prefix, epsilon=1e-6):
     if f"{prefix}.conv_shortcut.weight" in params:
         x = conv2d(model, x, params[f"{prefix}.conv_shortcut.weight"],
                    params[f"{prefix}.conv_shortcut.bias"], padding=0)
-    return dml.add(x, h)
+    return x + h
 
 
 def attention_block(model, x, params, prefix, epsilon=1e-6):
@@ -232,7 +232,7 @@ def attention_block(model, x, params, prefix, epsilon=1e-6):
 
     projected = linear(model, attended, params[f"{prefix}.to_out.0.weight"],
                        params[f"{prefix}.to_out.0.bias"])
-    return dml.add(to_image(projected, height, width), x)
+    return to_image(projected, height, width) + x
 
 
 def upsample_nearest(x, scale=2):
@@ -275,12 +275,12 @@ def layer_norm(model, x, weight, bias, epsilon=1e-5):
 
     scale = broadcast(model.constant(weight, shape=leading + [shape[-1]]), shape)
     shift = broadcast(model.constant(bias, shape=leading + [shape[-1]]), shape)
-    return dml.add(dml.multiply(normalized, scale), shift)
+    return normalized * scale + shift
 
 
 def quick_gelu(x):
     """x * sigmoid(1.702x), the approximation CLIP ViT-L was trained with."""
-    return dml.multiply(x, dml.activation_sigmoid(dml.activation_linear(x, alpha=1.702, beta=0.0)))
+    return x * dml.activation_sigmoid(1.702 * x)
 
 
 def split_heads(x, heads):
@@ -329,7 +329,7 @@ def attend(query, key, value, heads, mask=None):
 
     scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
                       alpha=1.0 / math.sqrt(dim))
-    scores = dml.add(scores, broadcast(mask, scores.shape))
+    scores = scores + broadcast(mask, scores.shape)
 
     return merge_heads(dml.gemm(dml.activation_softmax(scores, axes=[3]), value))
 
@@ -378,5 +378,5 @@ def geglu(model, x, params, prefix):
                          input_window_sizes=[n, 1, tokens, inner],
                          input_window_strides=[1, 1, 1, 1])
 
-    gated = dml.multiply(half(0), dml.activation_gelu(half(inner)))
+    gated = half(0) * dml.activation_gelu(half(inner))
     return linear(model, gated, params[f"{prefix}.net.2.weight"], params[f"{prefix}.net.2.bias"])

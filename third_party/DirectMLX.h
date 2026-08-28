@@ -346,7 +346,7 @@ namespace dml
     #if DMLX_USE_WIL
         #define DMLX_THROW_IF_FAILED(_hr) THROW_IF_FAILED(_hr)
         #define DMLX_THROW(_hr) THROW_HR(_hr)
-    #else
+    #elif !defined(DMLX_THROW_IF_FAILED)
         #define DMLX_THROW_IF_FAILED(_hr) if (FAILED(_hr)) { throw std::runtime_error(#_hr); }
         #define DMLX_THROW(_hr) throw std::runtime_error(#_hr); 
     #endif

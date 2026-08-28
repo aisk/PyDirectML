@@ -10,7 +10,8 @@
 
 // The HRESULTs worth spelling out. Device removal is the one this hits in
 // practice, and its reason code says whether the GPU hung, was reset out from
-// under us, or the driver failed something on its own.
+// under us, or the driver failed something on its own. E_INVALIDARG is what a
+// graph DirectML refuses to compile comes back as -- a shape mismatch, say.
 inline const char* HresultName(HRESULT hr)
 {
     switch (hr)
@@ -20,6 +21,7 @@ inline const char* HresultName(HRESULT hr)
     case DXGI_ERROR_DEVICE_RESET:          return "DXGI_ERROR_DEVICE_RESET";
     case DXGI_ERROR_DRIVER_INTERNAL_ERROR: return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
     case DXGI_ERROR_INVALID_CALL:          return "DXGI_ERROR_INVALID_CALL";
+    case E_INVALIDARG:                     return "E_INVALIDARG";
     case E_OUTOFMEMORY:                    return "E_OUTOFMEMORY";
     default:                               return nullptr;
     }

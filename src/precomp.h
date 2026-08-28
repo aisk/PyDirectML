@@ -40,6 +40,18 @@ namespace py = pybind11;
 
 #define DML_TARGET_VERSION_USE_LATEST 1
 #include <DirectML.h>
+// DirectMLX's own failure macro throws the failing expression's text with no
+// HRESULT in it, so a graph DirectML rejects surfaced as a bare
+// "m_device->CreateOperator(...)". Route it through DescribeHresult (defined
+// in util.h, declared here because the macro expands before that include) so
+// the error carries E_INVALIDARG or whatever the code was, like every other
+// throw in the bindings.
+std::string DescribeHresult(HRESULT hr);
+#define DMLX_THROW_IF_FAILED(_hr) \
+    do { HRESULT _dmlx_hr = (_hr); if (FAILED(_dmlx_hr)) { \
+        throw std::runtime_error(std::string(#_hr) + " failed: " + DescribeHresult(_dmlx_hr)); \
+    } } while (0)
+#define DMLX_THROW(_hr) throw std::runtime_error(DescribeHresult(_hr))
 // DirectMLX guards several locals with assert() only, so they read as unused
 // once NDEBUG compiles the asserts out.
 #pragma warning(push)
