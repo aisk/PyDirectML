@@ -11,7 +11,7 @@ Euler sampler that ties them together.
 ## Running it
 
 ```powershell
-pip install .[dev] --no-build-isolation   # from the repository root
+pip install .[samples]                   # from the repository root
 cd samples\sdxl
 
 python generate.py "a prompt"             # a prompt to an image
