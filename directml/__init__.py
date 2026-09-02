@@ -1,17 +1,14 @@
 """Python binding for DirectML.
 
-The package splits in two along the line drawn in docs/api-design.md: ``_core``
-is the compiled extension and owns resources, execution and the data hot path;
-this wrapper layer owns signature shaping, defaults, validation and error
-messages. The boundary of the library is ``import directml``, not the ``.pyd``.
-
-Every class here is the ``_core`` class itself, with the wrapper's methods and
-properties attached at import time. Instances are created on the C++ side --
-an Expression by an operator, a Buffer by dispatch -- so subclassing would
-give the wrapper's conveniences to the objects users construct and not to the
-ones the library hands back. Attaching gives them to both.
+``_core`` is the compiled extension and owns resources, execution and the data
+hot path; this wrapper layer owns signature shaping, defaults, validation and
+error messages. Every class here is the ``_core`` class itself, with the
+wrapper's methods and properties attached at import time: instances are created
+on the C++ side, so a Python subclass would only cover the objects users
+construct and not the ones the library hands back.
 """
 
+import functools
 import importlib.metadata
 import math
 import typing
@@ -19,18 +16,16 @@ import typing
 import numpy as np
 
 from . import _core
-from ._core import *  # noqa: F401,F403 -- the classes, enums and operators
+from ._core import *  # noqa: F401,F403
 
 try:
     __version__ = importlib.metadata.version("directml")
 except importlib.metadata.PackageNotFoundError:
-    # Running from a source tree that was never pip-installed.
     __version__ = "0.0.0"
 
 
-# How a DML_TENSOR_DATA_TYPE is spelled in numpy. Every sample used to carry a
-# private copy of this table; it lives here now, and every API that takes a
-# data type accepts either spelling.
+# How a DML_TENSOR_DATA_TYPE is spelled in numpy; every API that takes a data
+# type accepts either spelling.
 _NUMPY_DTYPES = {
     TensorDataType.FLOAT32: np.dtype(np.float32),
     TensorDataType.FLOAT16: np.dtype(np.float16),
@@ -97,7 +92,6 @@ _core.TensorDesc.__init__ = _tensor_desc_init
 
 
 # --- Expression and Buffer conveniences -------------------------------------
-# Both are read through a TensorDesc, so both get the same view of it.
 
 
 def _desc_shape(self):
@@ -143,19 +137,16 @@ _core_buffer_init = _core.Buffer.__init__
 def _buffer_init(self, device, array, dtype=None):
     """Upload an array to the GPU.
 
-    A Buffer is a tensor that lives in the device's memory. dispatch() accepts
-    one wherever it accepts an array, and binds it in place with no upload;
+    A Buffer is a tensor in the device's memory. A binding dict accepts one
+    wherever it accepts an array, and binds it in place with no upload;
     ``dispatch(readback=False)`` returns one per output instead of copying the
-    outputs back. That is how a tensor moves between two graphs without
-    crossing PCIe twice.
+    outputs back; ``numpy()`` copies it back explicitly.
 
     Args:
         device: The Device whose memory to use.
         array: The data; anything np.asarray accepts.
         dtype: The buffer's element type. Defaults to the array's own dtype.
-            The array is converted under the same rules as dispatch(): within
-            a dtype kind or NumPy-safe silently, anything else must be an
-            explicit astype().
+            The array is converted under the same rules as dispatch().
 
     Raises:
         ValueError: The array's dtype would convert unsafely.
@@ -175,14 +166,11 @@ _core.Buffer.__init__ = _buffer_init
 
 
 def _check_cast(array, target, what):
-    """Refuse a conversion that would silently lose meaning.
+    """Refuse a conversion that crosses dtype kinds unless NumPy calls it safe.
 
-    Narrowing within a kind is fine -- float64 to float32 is what np.zeros()
-    lands on, float32 to float16 is how half-precision weights get loaded --
-    and so is any cast NumPy calls safe. Crossing kinds any other way, int32
-    into a float32 tensor above all, is the silent-wrong-answer case, and has
-    to be spelled out with an explicit astype. NumPy's own 'same_kind' rule is
-    no help here: it permits int32 to float32.
+    Narrowing within a kind (float64 to float32, float32 to float16) is
+    allowed. NumPy's own 'same_kind' rule would also allow int32 to float32,
+    which is the silent-wrong-answer case this exists to catch.
     """
     if (array.dtype != target and array.dtype.kind != target.kind
             and not np.can_cast(array.dtype, target, "safe")):
@@ -191,16 +179,9 @@ def _check_cast(array, target, what):
             f"convert it explicitly with astype()")
 
 
-def _check_fit(array, dtype, sizes, total_bytes, strided, what):
-    """Refuse an array or Buffer that does not fill its tensor."""
-    if strided:
-        # A strided view repeats or reorders elements, so the data covers the
-        # underlying buffer rather than the logical shape.
-        nbytes = array.nbytes if isinstance(array, _core.Buffer) else array.size * dtype.itemsize
-        if nbytes < total_bytes:
-            raise ValueError(
-                f"{nbytes} bytes do not fill {what}, whose buffer holds {total_bytes} bytes")
-    elif array.size != math.prod(sizes):
+def _check_count(array, sizes, what):
+    """Refuse an array or Buffer whose element count differs from ``sizes``."""
+    if array.size != math.prod(sizes):
         kind = "Buffer" if isinstance(array, _core.Buffer) else "array"
         raise ValueError(f"{kind} of {array.size} elements does not fill {what}")
 
@@ -223,16 +204,28 @@ class _Slot:
         name = f" {self.name!r}" if self.name is not None else ""
         return f"input {self.index}{name} ({self.dtype.name} {list(self.sizes)})"
 
+    def check_fit(self, value):
+        """Refuse data that does not fill this input's tensor."""
+        if not self.strided:
+            _check_count(value, self.sizes, self.describe())
+            return
+        # A strided view repeats or reorders elements, so the data covers the
+        # underlying buffer rather than the logical shape.
+        nbytes = value.nbytes if isinstance(value, _core.Buffer) else value.size * self.dtype.itemsize
+        if nbytes < self.total_bytes:
+            raise ValueError(
+                f"{nbytes} bytes do not fill {self.describe()}, whose buffer holds "
+                f"{self.total_bytes} bytes")
+
 
 class _Slots:
     """A compiled operator's inputs, by index, node identity and name."""
 
     def __init__(self, op):
-        names = getattr(op, "_names", {})
         slots = op._input_slots
         self.keys = [key for key, _, _ in slots]
         self.by_index = [
-            _Slot(index, owned, desc, names.get(key))
+            _Slot(index, owned, desc, op._names.get(key))
             for index, (key, owned, desc) in enumerate(slots)
         ]
         self.by_node = dict(zip(self.keys, self.by_index))
@@ -264,15 +257,12 @@ def _slot_table(op):
 
 
 def _validate(op, inputs, owned, verb, defaults=None):
-    """Match the dict against the graph's inputs.
+    """Match a binding dict against the graph's inputs.
 
-    Returns ``(buffers, staged)``: the inputs supplied as Buffers, bound in
-    place, and the arrays to convert and upload, both by input index.
-    Everything that can go wrong is raised from here, before any upload
-    starts: a key that is not an input, one bound in the wrong phase or twice,
-    a dtype that would silently lose meaning, data of the wrong size, and
-    inputs that are missing outright. ``defaults`` supplies the constants the
-    graph recorded, for any owned input the dict leaves out.
+    Returns ``(buffers, staged)``: the inputs supplied as Buffers and the
+    arrays still to convert and upload, both by input index. Every error is
+    raised from here, before any upload starts. ``defaults`` supplies the
+    constants the graph recorded for any owned input the dict leaves out.
     """
     table = _slot_table(op)
     buffers = {}
@@ -289,20 +279,17 @@ def _validate(op, inputs, owned, verb, defaults=None):
             raise ValueError(f"{slot.describe()} is bound twice")
 
         if isinstance(value, _core.Buffer):
-            # A Buffer is already typed; there is nothing to convert it with.
             if value.dtype != slot.dtype:
                 raise ValueError(
                     f"cannot bind a {value.dtype} Buffer to {slot.describe()}; "
                     f"Buffers are not converted")
-            _check_fit(value, slot.dtype, slot.sizes, slot.total_bytes, slot.strided,
-                       slot.describe())
+            slot.check_fit(value)
             buffers[slot.index] = value
             return
 
         array = np.asarray(value)
         _check_cast(array, slot.dtype, slot.describe())
-        _check_fit(array, slot.dtype, slot.sizes, slot.total_bytes, slot.strided,
-                   slot.describe())
+        slot.check_fit(array)
         staged[slot.index] = array
 
     for key, value in inputs.items():
@@ -329,9 +316,8 @@ def _validate(op, inputs, owned, verb, defaults=None):
 def _converted(op, staged):
     """Yield (index, contiguous array of the tensor's dtype) pairs.
 
-    Conversion happens one tensor at a time, as the upload loop in _core pulls
-    on this generator: converting the whole dict first would hold a second copy
-    of every weight at once, which for model-sized graphs is gigabytes.
+    Conversion happens one tensor at a time as the upload loop in _core pulls
+    on this generator, so only one converted copy is alive at once.
     """
     slots = _slot_table(op).by_index
     for index, array in staged.items():
@@ -346,30 +332,25 @@ def _operator_initialize(self, weights=None):
 
     The data is read once, here, and lives on the GPU from then on; the
     library keeps no copy. To change an owned input's data afterwards, call
-    initialize() again -- the previous contents are replaced wholesale, and
-    every owned input must be supplied again, constants included.
+    initialize() again with every owned input, constants included.
 
     Args:
         weights: A dict mapping owned inputs to their data, keyed by
             Expression or by the name given at ``graph.input()``. A value is
             an array, converted to the tensor's dtype under the same rules as
             dispatch(), or a Buffer, bound as it is. Inputs declared with
-            ``graph.constant()`` may be left out the first time: the graph
-            recorded their data, and compile() handed it over.
+            ``graph.constant()`` may be left out the first time.
 
     Raises:
         ValueError: A key is not an input of this graph, is not owned, or is
             bound twice; an owned input is missing; an array's dtype would
-            convert unsafely (cross-kind and not NumPy-safe); a Buffer's
-            dtype differs from the tensor's; or the data does not fit.
+            convert unsafely; a Buffer's dtype differs from the tensor's; or
+            the data does not fit.
     """
-    constants = getattr(self, "_constants", None)
     buffers, staged = _validate(self, weights or {}, owned=True, verb="initialize",
-                                defaults=constants)
+                                defaults=self._constants)
     self._initialize(buffers, _converted(self, staged))
-    # The library keeps no copy: once the constants are on the GPU, the
-    # references the graph recorded are dropped.
-    self._constants = None
+    self._constants = {}
 
 
 def _operator_dispatch(self, inputs=None, *, readback=True):
@@ -385,8 +366,7 @@ def _operator_dispatch(self, inputs=None, *, readback=True):
             upload; its dtype must match the tensor's.
         readback: True copies each output back to the host as a numpy array
             of the output's shape and dtype. False leaves each output on the
-            GPU and returns a Buffer for it, which is what to pass to the next
-            graph.
+            GPU and returns a Buffer for it.
 
     Returns:
         One array or Buffer per output of compile(), in that order.
@@ -414,23 +394,37 @@ _core.CompiledOperator.__call__ = _operator_dispatch
 # --- Graph: input, constant and compile ---------------------------------------
 
 
+_core_graph_init = _core.Graph.__init__
+
+
+def _graph_init(self, device, *, tensor_policy=None):
+    """A graph under construction.
+
+    Args:
+        device: The Device that will compile and run it.
+        tensor_policy: A TensorPolicy deciding the layout of the tensors the
+            graph creates internally; InterleavedChannel is only reachable
+            through it.
+    """
+    _core_graph_init(self, device, tensor_policy=tensor_policy)
+    self._names = {}      # input node id -> the name given at input()/constant()
+    self._constants = {}  # input node id -> the array given at constant()
+
+
 def _graph_register(self, expression, name):
     """Record an input's name on the graph, refusing a duplicate."""
-    names = self.__dict__.setdefault("_names", {})
     if name is not None:
         if not isinstance(name, str):
             raise TypeError(f"an input's name must be a str, not {type(name).__name__}")
-        if name in names.values():
+        if name in self._names.values():
             raise ValueError(f"this graph already has an input named {name!r}")
-        names[expression._node_id] = name
+        self._names[expression._node_id] = name
     return expression
 
 
 def _graph_input(self, sizes=None, dtype=None, *, owned=False, strides=None, desc=None,
                  name=None):
     """Add an input tensor to the graph and return its Expression.
-
-    The graph assigns the input's index; no caller ever writes one.
 
     Args:
         sizes: The tensor's shape.
@@ -441,12 +435,10 @@ def _graph_input(self, sizes=None, dtype=None, *, owned=False, strides=None, des
             For a weight whose value is already in hand, ``constant()``
             declares an owned input and records the data in one call.
         strides: Element strides for a non-packed view; a stride of 0 repeats
-            an axis, which is how a broadcast input is declared.
+            an axis.
         desc: A complete TensorDesc, for the controls input() does not take
             (total_tensor_size_in_bytes, guaranteed_base_offset_alignment).
-            Every other tensor argument is illegal with it -- a desc already
-            answers them, and answering twice would raise the question of
-            which wins.
+            No other tensor argument may be combined with it.
         name: An optional name, unique within the graph, that initialize()
             and dispatch() accept as a dict key in place of the Expression.
 
@@ -474,12 +466,9 @@ def _graph_input(self, sizes=None, dtype=None, *, owned=False, strides=None, des
 def _graph_constant(self, array, dtype=None, *, sizes=None, name=None):
     """Add an owned input whose data is known now, and return its Expression.
 
-    This is ``input(..., owned=True)`` for the common case, the weight whose
-    array is in hand when the graph is built. The graph keeps a reference to
-    the array -- not a copy -- until compile(), which uploads it and lets it
-    go. A compile() whose every owned input is a constant initializes the
-    operator itself, so a graph built from constants alone is ready to
-    dispatch as soon as it is compiled.
+    The graph keeps a reference to the array (not a copy) until compile(),
+    which uploads it and lets it go. A compile() whose every owned input is a
+    constant initializes the operator itself.
 
     Args:
         array: The data: anything np.asarray accepts, or a Buffer.
@@ -507,25 +496,23 @@ def _graph_constant(self, array, dtype=None, *, sizes=None, name=None):
                              f"{target.name}; Buffers are not converted")
     else:
         _check_cast(array, target, what)
-    _check_fit(array, target, sizes, 0, False, what)
+    _check_count(array, sizes, what)
 
     desc = _core.TensorDesc(target, sizes, flags=TensorFlags.OWNED_BY_DML)
     expression = _graph_register(self, self._input(desc), name)
-    self.__dict__.setdefault("_constants", {})[expression._node_id] = array
+    self._constants[expression._node_id] = array
     return expression
 
 
 def _graph_compile(self, outputs, *, flags=ExecutionFlags.NONE):
     """Compile the graph into a CompiledOperator.
 
-    The outputs are fixed here, in this order, and are not named again at
-    dispatch. The operator is self-contained: it snapshots what it needs from
-    the graph, so the graph can be dropped as soon as this returns.
-
-    The constants the graph recorded go with it. If they are the graph's only
-    owned inputs -- or it has none -- the operator is initialized here and
-    the graph's references to the arrays are released; otherwise they wait
-    for initialize(), which supplies them alongside the other weights.
+    The outputs are fixed here, in this order. The operator snapshots what it
+    needs from the graph, so the graph can be dropped as soon as this returns.
+    The constants the graph recorded go with it: if they are the graph's only
+    owned inputs, or it has none, the operator is initialized here; otherwise
+    they wait for initialize(), which supplies them alongside the other
+    weights. Either way the graph no longer holds them.
 
     Args:
         outputs: The Expressions to compute, in the order dispatch() returns
@@ -537,8 +524,8 @@ def _graph_compile(self, outputs, *, flags=ExecutionFlags.NONE):
         that are not constants, for initialize().
     """
     op = self._compile(list(outputs), flags=flags)
-    op._names = dict(self.__dict__.get("_names", {}))
-    op._constants = self.__dict__.pop("_constants", {})
+    op._names = dict(self._names)
+    op._constants, self._constants = self._constants, {}
 
     table = _slot_table(op)
     if all(table.keys[slot.index] in op._constants for slot in table.owned()):
@@ -546,12 +533,13 @@ def _graph_compile(self, outputs, *, flags=ExecutionFlags.NONE):
     return op
 
 
+_core.Graph.__init__ = _graph_init
 _core.Graph.input = _graph_input
 _core.Graph.constant = _graph_constant
 _core.Graph.compile = _graph_compile
 
 
-# --- Elementwise shape checks --------------------------------------------------
+# --- Elementwise operators, checked where they are written ------------------
 # DirectML refuses a mismatched elementwise pair at compile, but only as a bare
 # E_INVALIDARG with no node named. The operands are right here, so say which.
 
@@ -565,12 +553,31 @@ def _check_elementwise(symbol, a, b):
         raise ValueError(f"{a!r} {symbol} {b!r}: element types differ")
 
 
-def _checked_operator(name, symbol):
+def _checked(symbol, function):
+    """``function`` with the shape and dtype check in front of it."""
+    @functools.wraps(function)
+    def checked(a, b, **kwargs):
+        _check_elementwise(symbol, a, b)
+        return function(a, b, **kwargs)
+    return checked
+
+
+add = _checked("+", _core.add)
+subtract = _checked("-", _core.subtract)
+multiply = _checked("*", _core.multiply)
+divide = _checked("/", _core.divide)
+
+
+def _patch_operator(name, function):
+    """Route ``Expression <op> Expression`` through the checked ``function``.
+
+    A float operand keeps DirectMLX's overload, which has nothing to check.
+    """
     original = getattr(_core.Expression, name)
 
     def method(self, other):
         if isinstance(other, _core.Expression):
-            _check_elementwise(symbol, self, other)
+            return function(self, other)
         return original(self, other)
 
     method.__name__ = name
@@ -579,34 +586,12 @@ def _checked_operator(name, symbol):
     setattr(_core.Expression, name, method)
 
 
-for _name, _symbol in [("__add__", "+"), ("__sub__", "-"), ("__mul__", "*"),
-                       ("__truediv__", "/"), ("__mod__", "%")]:
-    _checked_operator(_name, _symbol)
-del _name, _symbol
-
-
-def add(a, b, *, fused_activation=None):
-    """Elementwise ``a + b``, optionally with a fused activation on the result."""
-    _check_elementwise("+", a, b)
-    return _core.add(a, b, fused_activation=fused_activation)
-
-
-def subtract(a, b):
-    """Elementwise ``a - b``."""
-    _check_elementwise("-", a, b)
-    return _core.subtract(a, b)
-
-
-def multiply(a, b):
-    """Elementwise ``a * b``."""
-    _check_elementwise("*", a, b)
-    return _core.multiply(a, b)
-
-
-def divide(a, b):
-    """Elementwise ``a / b``."""
-    _check_elementwise("/", a, b)
-    return _core.divide(a, b)
+for _name, _function in [
+    ("__add__", add), ("__sub__", subtract), ("__mul__", multiply),
+    ("__truediv__", divide), ("__mod__", _checked("%", _core.Expression.__mod__)),
+]:
+    _patch_operator(_name, _function)
+del _name, _function
 
 
 # --- Operator wrappers -------------------------------------------------------
@@ -615,9 +600,8 @@ def divide(a, b):
 def reinterpret(input, sizes, strides=None, dtype=None):
     """View the same bytes through different sizes, strides or dtype.
 
-    ``dtype=None`` keeps the input's type, which is what almost every
-    reinterpret wants. The element count implied by the arguments must match
-    the input's.
+    ``dtype=None`` keeps the input's type. The element count implied by the
+    arguments must match the input's.
     """
     return _core.reinterpret(input, list(sizes), strides,
                              None if dtype is None else _to_data_type(dtype))
@@ -626,14 +610,12 @@ def reinterpret(input, sizes, strides=None, dtype=None):
 def broadcast(input, shape):
     """View ``input`` as ``shape``, repeating every axis whose extent is 1.
 
-    NumPy's rule, made explicit: axes align from the right, a missing leading
-    axis or one of extent 1 repeats to the target's extent, and any other
-    difference is an error. The repeat is a stride of 0 -- DirectML reads a
-    tensor through whatever strides its descriptor carries -- so nothing is
-    copied and no operator is added; the result is a view of the same node.
-
-    Nothing broadcasts implicitly: an elementwise operator wants both operands
-    the same shape, and this is how to say which one stretches.
+    NumPy's rule: axes align from the right, a missing leading axis or one of
+    extent 1 repeats to the target's extent, and any other difference is an
+    error. The repeat is a stride of 0, so nothing is copied and no operator
+    is added; the result is a view of the same node. Nothing broadcasts
+    implicitly: an elementwise operator wants both operands the same shape,
+    and this is how to say which one stretches.
 
     Args:
         input: The Expression to view.
@@ -726,9 +708,7 @@ def gru(input, weight, recurrence, bias=None, hidden_init=None,
 
 
 # --- FusedActivation factories -----------------------------------------------
-# One per activation DirectMLX can fuse, so an activation's parameters get
-# names instead of riding as bare positional floats -- and an operator that
-# cannot be fused never gets constructed as one. Copied 1:1 from DirectMLX.h's
+# One per activation DirectMLX can fuse, copied 1:1 from DirectMLX.h's
 # FusedActivation statics, defaults included.
 
 
