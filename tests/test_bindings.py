@@ -6,6 +6,8 @@ padding at upload, and the initialize/dispatch split. The graphs are tiny; a
 dispatch on any device suffices.
 """
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -25,8 +27,8 @@ def identity_op(device, sizes, dtype=np.float32):
 
 
 class TestCastTable:
-    """The table from docs/api-design.md section 4.1, row by row: within a kind
-    or NumPy-safe converts silently, everything else must be an explicit astype."""
+    """The cast table in docs/api-design.md, row by row: within a kind or
+    NumPy-safe converts silently, everything else must be an explicit astype."""
 
     def dispatch(self, device, array, dtype=dml.TensorDataType.FLOAT32):
         x, op = identity_op(device, [1, 1, 2, 2], dtype)
@@ -130,8 +132,7 @@ class TestOperators:
         assert np.allclose(self.compute(device, lambda x: -x, a), -a)
 
     def test_float_numerator_scales_the_reciprocal(self, device):
-        # DirectMLX's own operator/ hands the scale to Recip, and an
-        # elementwise scale-bias applies to the input: 1/(2x), not 2/x.
+        # DirectMLX's own overload computes 1/(2x) here.
         a = np.array([1, 2, 4, 8], np.float32).reshape(1, 1, 2, 2)
         result = self.compute(device, lambda x: 2.0 / x, a)
         assert np.allclose(result, 2.0 / a)
@@ -142,18 +143,17 @@ class TestOperators:
         result = self.compute(device, lambda x, y: x % y, a, b)
         assert np.array_equal(result, a % b)
 
-    def test_augmented_assignment_rebinds_the_name(self, device):
-        # Deliberately no __iadd__: it would mutate the node behind every
-        # reference to it, changing the identity that dict binding matches
-        # on. The x = x + y fallback rebinds one name and leaves the input
-        # reachable through its alias.
+    def test_no_in_place_operators(self, device):
+        # An in-place form would mutate the node behind every alias, changing
+        # the identity dict binding matches on; without one, x += y rebinds
+        # the name and leaves the alias pointing at the input.
+        for name in ("__iadd__", "__isub__", "__imul__", "__itruediv__", "__imod__"):
+            assert not hasattr(dml.Expression, name)
         graph = dml.Graph(device)
-        x = graph.input([1, 1, 2, 2])
-        alias = x
+        x = alias = graph.input([1, 1, 2, 2])
         x += 1.0
         assert x is not alias
-        op = graph.compile([x])
-        result, = op({alias: np.zeros((2, 2), np.float32)})
+        result, = graph.compile([x])({alias: np.zeros((2, 2), np.float32)})
         assert np.all(result == 1.0)
 
 
@@ -282,12 +282,16 @@ class TestConstants:
         result, = op({x: np.zeros((2, 2), np.float32)})
         assert np.all(result == 5.0)
 
-    def test_graph_drops_the_arrays_at_compile(self, device):
+    def test_nothing_holds_the_array_after_compile(self, device):
         graph = dml.Graph(device)
-        w = graph.constant(np.zeros((1, 1, 2, 2), np.float32))
-        assert graph._constants
-        graph.compile([dml.activation_identity(w)])
-        assert "_constants" not in graph.__dict__
+        array = np.zeros((1, 1, 2, 2), np.float32)
+        w = graph.constant(array)
+        held = sys.getrefcount(array)
+        op = graph.compile([dml.activation_identity(w)])
+        assert op.initialized
+        # Neither the graph nor the operator keeps a reference once the data
+        # is on the GPU.
+        assert sys.getrefcount(array) == held - 1
 
 
 class TestNames:
@@ -474,11 +478,6 @@ class TestElementwiseChecks:
         b = graph.input([1, 1, 2, 2], np.float16)
         with pytest.raises(ValueError, match="element types differ"):
             a * b
-
-    def test_float_operands_are_not_checked(self, device):
-        graph = dml.Graph(device)
-        a = graph.input([1, 1, 2, 2])
-        assert (a * 2.0).shape == (1, 1, 2, 2)
 
 
 class TestTensorDesc:
