@@ -71,4 +71,33 @@ namespace pydml
         uint64_t persistentResourceSize = 0;
         bool initialized = false;
     };
+
+    // A tensor that lives on the GPU: a DEFAULT-heap resource plus the desc
+    // that says how to read it. Dispatch hands one out per output when asked
+    // not to read back, and accepts one wherever it accepts an array, bound
+    // directly with no upload -- which is what lets the tensors that cross
+    // between two graphs stay where they are instead of crossing PCIe twice.
+    // The device is declared first so it outlives the allocation it made.
+    struct Buffer
+    {
+        Buffer(
+            std::shared_ptr<Device> device,
+            dml::TensorDesc desc,
+            Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> resource
+            ) :
+            device(std::move(device)),
+            desc(std::move(desc)),
+            resource(std::move(resource))
+        {
+        }
+
+        std::shared_ptr<Device> device;
+        dml::TensorDesc desc;
+        Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> resource;
+
+        uint64_t SizeInBytes() const
+        {
+            return desc.totalTensorSizeInBytes;
+        }
+    };
 }

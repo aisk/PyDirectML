@@ -13,9 +13,12 @@ PyDirectML is an open source Python binding library for DirectML written to faci
 - `DirectML.h` and `DirectML.lib` come from the Windows SDK. Upstream downloaded the `microsoft.ai.directml` NuGet package at build time and shipped its `DirectML.dll` inside the wheel, where nothing ever loaded it.
 - `average_pooling` takes `dilations` and `mean_variance_normalization` takes `normalize_mean`, in the position the DirectMLX signature gives them. The samples are updated to match.
 - `activation_soft_max` is spelled `activation_softmax` and takes an `axes` argument, binding `DML_ACTIVATION_SOFTMAX1`. The old binding normalized a flattened 2-D view and could not express softmax over the last axis of a 4-D tensor, which attention needs. `activation_gelu` is bound as well.
-- Inputs are bound as a **dict from `Expression` to array**: `op.initialize({weight: array})` for the tensors DirectML owns, `op({input: array})` for the rest. Upstream matched a list of `Binding`s to inputs by position, with no validation — a misordered list silently computed garbage. The dict also means the library keeps no CPU copy of any weight: data is uploaded from the caller's array at the moment of the call.
+- Inputs are bound as a **dict from `Expression` to array**: `op.initialize({weight: array})` for the tensors DirectML owns, `op({input: array})` for the rest. Upstream matched a list of `Binding`s to inputs by position, with no validation — a misordered list silently computed garbage. The dict also means the library keeps no CPU copy of any weight: data is uploaded from the caller's array at the moment of the call. An input given a `name=` can be bound by that name instead of by its `Expression`.
+- **`graph.constant(array)`** declares an owned input and records its data in one call, for the weight that is already in hand when the graph is built. `compile()` uploads the constants, initializes the operator if they are its only owned inputs, and lets the arrays go. That is the whole of what `samples/sdxl` used to do by hand around `initialize`.
+- **`dml.Buffer`** is a tensor that stays on the GPU. `op(inputs, readback=False)` returns one per output instead of copying the outputs back; a binding dict accepts one wherever it accepts an array, bound in place with no upload; `buffer.numpy()` reads it back. A single D3D12 buffer stops at 4 GiB, so a model with more weight than that has to be two graphs — the SDXL UNet is — and without a GPU-resident handle every tensor crossing between them crossed PCIe twice per step.
+- **`dml.broadcast(x, shape)`** views a tensor through a larger shape with NumPy's rule, as a zero-stride `reinterpret`; no data is copied and no operator is added. Nothing broadcasts implicitly, and an elementwise operator with mismatched operands is refused where it is written, naming both, rather than at compile as a bare `E_INVALIDARG`.
 - A tensor's declared data type is honored on both ends, and every API that takes one accepts numpy dtypes. What you hand to `initialize()` or `dispatch()` is converted to the tensor's type, refusing conversions that cross a dtype kind unsafely; results come back as numpy arrays of that type and shape. Upstream forced float32 in and read float32 out, which reads out of bounds for any narrower type. Half precision works: see `samples/dtypes.py`.
-- `initialize` and `dispatch` live on the `CompiledOperator`, whose persistent resource belongs to it rather than to the device, so a tensor flagged `owned=True` is uploaded once and then stays on the GPU. A graph without owned inputs initializes itself on first dispatch. Upstream re-ran initialization on every `compute`, re-uploading every weight each time.
+- `initialize` and `dispatch` live on the `CompiledOperator`, whose persistent resource belongs to it rather than to the device, so a tensor flagged `owned=True` is uploaded once and then stays on the GPU. A graph whose owned inputs are all `constant()`s, or that has none, is initialized by `compile()`. Upstream re-ran initialization on every `compute`, re-uploading every weight each time.
 - `multihead_attention` binds `DML_OPERATOR_MULTIHEAD_ATTENTION`, which DirectMLX has no helper for, so `src/attention.h` builds the graph node from the raw descriptor in the style of the helpers it sits beside. Attention written out as a `gemm`, a softmax and a `gemm` materializes the whole score matrix; the one operator does not, and in `samples/sdxl` it cut a 1024×1024 image from 107 seconds to 63 and nearly halved the UNet's scratch.
 - Arithmetic on `Expression` (`x + y`, `x * 0.5`, `1.0 - x`, `-x`) comes from DirectMLX's C++ overloads — a float operand rides on an identity operator's scale-bias — with three corrections. `float / x` scales the reciprocal: DirectMLX hands the scale to `Recip`, whose scale-bias applies to the *input*, so it computed `1/(ax)`. `%` binds `ModulusFloor` to match Python's floored semantics instead of `ModulusTruncate`. And the in-place forms are gone: `+=` mutated the node behind every alias of the Python object, silently changing the identity that `hash()` and dict binding match on; without `__iadd__`, `x += y` rebinds one name and leaves the aliases alone. Comparison operators stay identity-based — `__eq__` is what makes an `Expression` a dict key — and nothing broadcasts implicitly; mismatched shapes are refused at compile with `E_INVALIDARG`.
 - `CompiledOperator.temporary_size`, `persistent_size` and `descriptor_count` expose `IDMLCompiledOperator::GetBindingProperties`, which is how much scratch one dispatch of a graph needs, how much DirectML keeps between dispatches, and how many descriptors it binds. The first two are the whole memory budget of a compiled graph, and without them a card that runs out of it can only be investigated with a system-wide counter. `samples/sdxl/README.md` has what they turned up.
@@ -61,16 +64,21 @@ import directml as dml
 device = dml.Device()
 graph = dml.Graph(device)
 
-x = graph.input([1, 1, 28, 28])                          # float32 is the default
-w = graph.input([8, 1, 5, 5], owned=True)                # read once at initialize
+x = graph.input([1, 1, 28, 28], name="image")            # float32 is the default
+w = graph.constant(np.load("w.npy"))                     # a weight, uploaded at compile
+b = graph.constant(np.load("b.npy"), sizes=[1, 8, 1, 1])
 conv = dml.convolution(x, w, strides=[1, 1],
                        start_padding=[2, 2], end_padding=[2, 2])
+conv = conv + dml.broadcast(b, conv.shape)               # a [1, 8, 1, 1] bias, per channel
 probs = dml.activation_softmax(conv, axes=[1])
 
-op = graph.compile([probs])
-op.initialize({w: np.load("w.npy")})
-result, = op({x: image})                                 # a shaped, typed ndarray
+op = graph.compile([probs])                              # initialized: every weight is a constant
+result, = op({"image": image})                           # a shaped, typed ndarray
 ```
+
+An input declared with `owned=True` instead of `constant()` is bound at `op.initialize({w: array})` and lives on the GPU from then on. `op(inputs, readback=False)` leaves the outputs on the GPU as `dml.Buffer`s, which the next graph binds in place.
+
+DirectML's tensors are 4-D (up to 8-D for some operators), and the bindings expose that as it is: a matrix is fed to `gemm` as `[1, 1, M, K]`, and a `[C]` bias is viewed as `[1, C, 1, 1]` before it is broadcast. `samples/matmul.py` shows the reshape on the way in and out.
 
 The API and the reasoning behind it are documented in [docs/api-design.md](./docs/api-design.md).
 

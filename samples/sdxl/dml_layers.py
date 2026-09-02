@@ -10,10 +10,9 @@ three that need explaining:
   the scale and bias to be 1 along every normalized axis, and the channel axis is
   normalized here -- so it is a separate multiply and add.
 
-* **Broadcasting** is a stride trick. DirectML reads a tensor through whatever
-  strides its descriptor carries, and a stride of 0 makes an axis repeat. So a
-  ``[1, C, 1, 1]`` bias becomes a ``[1, C, H, W]`` view with strides
-  ``[C, 1, 0, 0]`` and no data is copied.
+* **Broadcasting** is explicit. Nothing stretches on its own; ``dml.broadcast``
+  views a ``[1, C, 1, 1]`` bias as ``[1, C, H, W]`` through a stride of 0 on
+  the repeated axes, and no data is copied.
 
 * **Transposing** is the same trick with non-zero strides: ``[1, C, H, W]`` read
   as ``[1, 1, H*W, C]`` with strides ``[.., .., 1, H*W]`` is the NCHW-to-tokens
@@ -28,38 +27,32 @@ import directml as dml
 
 
 class Model:
-    """A graph under construction, plus the arrays bound to its weights.
+    """A graph under construction and, once compiled, the operator it became.
 
     Weights are registered with :meth:`constant` and carry their data with
-    them. Anything fed per run -- the latent, the image -- is registered with
+    them; anything fed per run -- the latent, the image -- is registered with
     :meth:`placeholder` and supplied to :meth:`run`. This is the part that
     belongs to the model domain: naming which array feeds which input.
-    Everything else -- index bookkeeping, dtype conversion, validation --
-    lives in the library.
+    Everything else -- index bookkeeping, dtype conversion, validation, the
+    upload of the weights at compile -- is the library's.
     """
 
     def __init__(self, device, dtype=np.float32):
         self.dtype = np.dtype(dtype)
         self.graph = dml.Graph(device)
-        self.weights = {}        # Expression -> ndarray, handed over at compile
         self._placeholders = []  # the run() arguments, in order
         self.input_count = 0
         self._operator = None
 
     def constant(self, array, shape=None):
-        """Register a weight, reshaped to ``shape`` if given.
+        """Register a weight, viewed as ``shape`` if given.
 
-        ``owned=True`` hands the tensor to DirectML at initialization, which is
-        once per model, and it stays on the GPU from then on. Without it the
-        weight would be re-uploaded on every dispatch.
+        The graph holds the array until compile() uploads it, converting to
+        the model's dtype one weight at a time; from then on it lives on the
+        GPU, and nothing keeps a host copy.
         """
-        array = np.ascontiguousarray(array, self.dtype)
-        if shape is not None:
-            array = array.reshape(shape)
-        expression = self.graph.input(array.shape, self.dtype, owned=True)
         self.input_count += 1
-        self.weights[expression] = array
-        return expression
+        return self.graph.constant(array, self.dtype, sizes=shape)
 
     def placeholder(self, shape, dtype=None):
         """Register an input whose data is supplied to :meth:`run`.
@@ -73,21 +66,22 @@ class Model:
         return expression
 
     def compile(self, outputs):
+        # Every owned input is a constant, so this also initializes: the
+        # weights go up and the graph lets go of them.
         self._operator = self.graph.compile(list(outputs))
-        # Uploads every weight and hands it to DirectML. The library keeps no
-        # copy, so dropping ours here leaves exactly one, on the GPU -- that is
-        # 5.1 GiB for the UNet at half precision.
-        self._operator.initialize(self.weights)
-        self.weights.clear()
         return self
 
-    def run(self, *values):
-        """Bind ``values`` to the placeholders in order and execute the graph."""
+    def run(self, *values, readback=True):
+        """Bind ``values`` to the placeholders in order and execute the graph.
+
+        A value may be an array or a Buffer another run() left on the GPU.
+        ``readback=False`` leaves the outputs there too.
+        """
         if self._operator is None:
             raise RuntimeError("compile() the model before running it")
         if len(values) != len(self._placeholders):
             raise ValueError(f"expected {len(self._placeholders)} inputs, got {len(values)}")
-        return self._operator(dict(zip(self._placeholders, values)))
+        return self._operator(dict(zip(self._placeholders, values)), readback=readback)
 
     @property
     def temporary_size(self):
@@ -98,30 +92,6 @@ class Model:
     def persistent_size(self):
         """Bytes the weights occupy once DirectML has laid them out."""
         return self._operator.persistent_size
-
-
-def broadcast(expression, shape):
-    """View ``expression`` as ``shape``, repeating any axis whose extent is 1."""
-    source = expression.shape
-    if list(source) == list(shape):
-        return expression
-    if len(source) != len(shape):
-        raise ValueError(f"cannot broadcast {list(source)} to {list(shape)}: rank differs")
-
-    packed = [1] * len(source)
-    for i in range(len(source) - 2, -1, -1):
-        packed[i] = packed[i + 1] * source[i + 1]
-
-    strides = []
-    for size, target, stride in zip(source, shape, packed):
-        if size == target:
-            strides.append(stride)
-        elif size == 1:
-            strides.append(0)
-        else:
-            raise ValueError(f"cannot broadcast {list(source)} to {list(shape)}: axis of {size}")
-
-    return dml.reinterpret(expression, list(shape), strides)
 
 
 def to_tokens(expression):
@@ -170,13 +140,13 @@ def linear(model, x, weight, bias=None):
     # none of its own, so it is repeated across the batch at a stride of zero.
     batch = x.shape[0]
     if batch != 1:
-        weights = broadcast(weights, [batch, 1, out_features, weight.shape[1]])
+        weights = dml.broadcast(weights, [batch, 1, out_features, weight.shape[1]])
     if bias is None:
         return dml.gemm(x, weights, trans_b=transpose)
 
     biases = model.constant(bias, shape=[1, 1, 1, out_features])
     shape = [*x.shape[:-1], out_features]
-    return dml.gemm(x, weights, broadcast(biases, shape), trans_b=transpose)
+    return dml.gemm(x, weights, dml.broadcast(biases, shape), trans_b=transpose)
 
 
 def group_norm(model, x, weight, bias, groups=32, epsilon=1e-6):
@@ -189,8 +159,8 @@ def group_norm(model, x, weight, bias, groups=32, epsilon=1e-6):
     normalized = dml.mean_variance_normalization(grouped, axes=[2, 3], epsilon=epsilon)
     normalized = dml.reinterpret(normalized, shape)
 
-    scale = broadcast(model.constant(weight, shape=[1, c, 1, 1]), shape)
-    shift = broadcast(model.constant(bias, shape=[1, c, 1, 1]), shape)
+    scale = dml.broadcast(model.constant(weight, shape=[1, c, 1, 1]), shape)
+    shift = dml.broadcast(model.constant(bias, shape=[1, c, 1, 1]), shape)
     return normalized * scale + shift
 
 
@@ -273,8 +243,8 @@ def layer_norm(model, x, weight, bias, epsilon=1e-5):
     leading = [1] * (len(shape) - 1)
     normalized = dml.mean_variance_normalization(x, axes=[len(shape) - 1], epsilon=epsilon)
 
-    scale = broadcast(model.constant(weight, shape=leading + [shape[-1]]), shape)
-    shift = broadcast(model.constant(bias, shape=leading + [shape[-1]]), shape)
+    scale = dml.broadcast(model.constant(weight, shape=leading + [shape[-1]]), shape)
+    shift = dml.broadcast(model.constant(bias, shape=leading + [shape[-1]]), shape)
     return normalized * scale + shift
 
 
@@ -329,7 +299,7 @@ def attend(query, key, value, heads, mask=None):
 
     scores = dml.gemm(query, key, trans_b=dml.MatrixTransform.TRANSPOSE,
                       alpha=1.0 / math.sqrt(dim))
-    scores = scores + broadcast(mask, scores.shape)
+    scores = scores + dml.broadcast(mask, scores.shape)
 
     return merge_heads(dml.gemm(dml.activation_softmax(scores, axes=[3]), value))
 

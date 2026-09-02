@@ -23,9 +23,11 @@
 | `pydml::Device`（D3D12 + `IDMLDevice`） | `dml.Device` | 已有；执行方法移到 `CompiledOperator` 上（§4.7） |
 | `dml::Graph` | `dml.Graph` | 现名 `GraphBuilder`，改回 `Graph` 与 C++ 对齐；`compile` 对齐 `Graph::Compile`；构造补 `tensor_policy=` —— 图级 policy 现在进不去（`DirectMLX.h:3437` 走 `builder->GetTensorPolicy()`），中间张量只能是 `Default` |
 | `dml::Expression` | `dml.Expression` | 已有；加 `.shape` / `.strides` / `.dtype` / `.desc` 属性并实现可哈希（§4.3） |
+| `dml::InputTensor` + 已知的权重数据 | `graph.constant(array)` | 【已落地】声明 owned 输入并记下数据，`compile` 上传（§4.11） |
 | `dml::TensorDesc` | `dml.TensorDesc` | 已有；4 个靠实参类型消歧的重载收敛成单一构造 + 关键字默认值（§4.4） |
 | `IDMLCompiledOperator` + persistent resource | `dml.CompiledOperator` | 现名 `Model`，名字误导 —— 它不含权重、不含输入绑定，只是编译好的算子，sample 里的变量名 `op = builder.build(...)` 说明作者自己也不认这个名字。persistent resource 已在它身上【已落地】，`initialize` / `dispatch` 跟着资源走（§4.7） |
-| `DML_BUFFER_BINDING` 集合 | **`dict[Expression, np.ndarray]`** | 现为 `Binding` 类 + 按位置对齐的列表；类从公开面退场（§4.1） |
+| `DML_BUFFER_BINDING` 集合 | **`dict[Expression | str, np.ndarray | Buffer]`** | 现为 `Binding` 类 + 按位置对齐的列表；类从公开面退场（§4.1）。key 也可以是 `graph.input(name=)` 给的名字（§4.13） |
+| `ID3D12Resource`（DEFAULT 堆上的一块张量） | `dml.Buffer` | 【已落地】GPU 常驻张量：`dispatch(readback=False)` 的输出、绑定字典里的值、`constant()` 的实参（§4.10） |
 | `pydml::TensorData` | **`np.ndarray`** | dispatch 直接返回形状、dtype 都正确的 numpy 数组；类退场（§4.2） |
 | `DML_SIZE_2D` | **`(width, height)` 元组** | `Size2D` 类删除 |
 | `DML_TENSOR_DATA_TYPE` | 枚举保留，但**处处兼收 numpy dtype**（`np.float32`、`np.uint32`…） | 每个 sample 都自建 dtype 对照表，这张表该活在库里 —— 按 §1 的分层，它就是 Python 包装层里的一个 dict |
@@ -44,23 +46,25 @@ import directml as dml
 device = dml.Device()                      # use_gpu=True, use_debug_layer=False
 graph = dml.Graph(device)                  # optional tensor_policy=
 
-# input auto-assigns its index; owned=True is OWNED_BY_DML; dtype takes numpy dtypes
-x = graph.input([1, 1, 28, 28])                          # float32 is the default
-w = graph.input([8, 1, 5, 5],  np.float32, owned=True)
-b = graph.input([1, 8, 1, 1],  np.float32, owned=True)
+# input auto-assigns its index; dtype takes numpy dtypes; name= is an optional binding key
+x = graph.input([1, 1, 28, 28], name="image")            # float32 is the default
+w = graph.constant(np.load("w.npy"))                     # owned input, data recorded now
+b = graph.constant(np.load("b.npy"), sizes=[1, 8, 1, 1])
 s = graph.input([1, 8, 28, 28], strides=[8, 1, 0, 0])    # broadcast view, one line
 
-conv = dml.convolution(x, w, b, strides=[1, 1],
+conv = dml.convolution(x, w, strides=[1, 1],
                        start_padding=[2, 2], end_padding=[2, 2])
+conv = conv + dml.broadcast(b, conv.shape)               # explicit, zero-stride, no copy
 probs = dml.activation_softmax(conv, axes=[1])
 
-op = graph.compile([probs])                # outputs fixed here, not repeated at dispatch
+op = graph.compile([probs])                # outputs fixed here; constants uploaded, op initialized
 
-op.initialize({w: np.load("w.npy"), b: np.zeros([1, 8, 1, 1], np.float32)})
-result, = op({x: image})                   # __call__ == dispatch, returns np.ndarray list
+result, = op({"image": image})             # __call__ == dispatch, returns np.ndarray list
+gpu, = op({x: image}, readback=False)      # ...or a dml.Buffer that stays on the GPU
+next_op({y: gpu})                          # bound in place by the next graph
 ```
 
-迭代场景（sdxl 的采样循环）就是 `initialize` 一次、循环里只 `op({...})`。图里没有 owned 输入时 `initialize` 自动完成，所以 matmul 这类一次性计算一行都不用写它 —— 这恰好与 DML 的语义对齐：初始化本来就只为 persistent 权重存在。
+`owned=True` 的输入仍然存在，服务于数据在构图时还没有的情形：`op.initialize({w: array})` 一次，之后循环里只 `op({...})`。`compile` 时若每个 owned 输入都是 constant（包括一个都没有），初始化就地完成 —— 这恰好与 DML 的语义对齐：初始化本来就只为 persistent 权重存在。
 
 ## 4. 设计决策
 
@@ -179,11 +183,13 @@ namedtuple 用 `typing.NamedTuple` 定义在 Python 包装层，`_core` 返回�
 
 随之而来的契约保留：`OWNED_BY_DML` 张量的数据在 `initialize` 时被读走，之后换数据要重新 `initialize`，docstring 里写明。
 
-另一条契约收紧：**图里有 owned 输入而没 initialize 就 dispatch，抛错并点名缺哪些 owned expression**，不沿用现在首次 dispatch 隐式初始化的行为。「无 owned 输入免 initialize」（§3）是唯一的自动路径 —— 那种图的 initialize 是空操作，自动做掉没有歧义；有权重而忘了给，是错误不是默认值。
+另一条契约收紧：**图里有 owned 输入而没 initialize 就 dispatch，抛错并点名缺哪些 owned expression**，不沿用现在首次 dispatch 隐式初始化的行为。自动路径只有一条：`compile` 时每个 owned 输入都是 `constant`（包括一个都没有），初始化在 `compile` 里做掉（§4.11）；有权重而忘了给，是错误不是默认值。
 
 ### 4.8 打包成 package，发类型存根
 
 `directml/` 包内放 `_core.pyd`，`__init__.py` 就是 §1 分层原则里 Python 侧的落点：re-export `_core` 的类和枚举，再放签名整形的包装函数、namedtuple 定义、`FusedActivation` 工厂、dtype 对照表和校验报错。包装层是普通 Python 代码，签名和 docstring 自文档，mypy 直接读；`py.typed` 加 pybind11-stubgen 只需要对付 `_core` 里剩下的类。IDE 补全和 mypy 从零变一。代价是同一个函数的行为分两处看（包装层的整形 + `_core` 的执行），用「包装层不做领域逻辑、只做整形」的纪律控制住。
+
+包装层给 `_core` 的类加东西只用一种手法：**在 import 时把方法和属性挂到 `_core` 的类上**（`Expression.shape`、`Graph.input`、`CompiledOperator.dispatch`、`TensorDesc.__init__`、`Buffer.__init__`），不做 Python 子类。理由是实例都在 C++ 侧创建 —— `Expression` 来自算子、`Buffer` 来自 dispatch、`TensorDesc` 来自 `expr.desc` —— 子类只能覆盖用户自己构造的那些，库交回来的仍是基类，`isinstance(expr.desc, dml.TensorDesc)` 就会是 False。存根里把挂上去的成员照实声明。
 
 配套的实现细节（对 `_core` 仍然成立）：`py::class_` 注册整体移到 `module.def` 之前，类与类之间按依赖排序 —— pybind11 在 `def` 的那一刻渲染签名字符串，未注册的类型退回 C++ 原始名，现在 docstring 里漏着 `pydml::CompiledModel`、`dml::Expression` 这种 Python 里不合法的名字，存根也会跟着坏。
 
@@ -197,10 +203,49 @@ namedtuple 用 `typing.NamedTuple` 定义在 Python 包装层，`_core` 返回�
 - **`%` 取 floored 语义**。Python 的 `-7 % 5 == 3`；DirectMLX 的 `operator%` 选了 `ModulusTruncate`（即 C 的 fmod），绑定换成 `ModulusFloor`，与 Python/numpy 的 `%` 一致。
 - **不提供 in-place 形式**。`py::self += py::self` 会原地改写 C++ 节点——引用同一 Python 对象的所有别名一起变，hash 和 §4.1 的 dict 绑定身份随之失效。不定义 `__iadd__`，Python 自动退化为 `x = x + y`，只重绑一个名字，别名手里的输入原封不动。
 
+逐元素二元运算（运算符和 `add` / `subtract` / `multiply` / `divide`）在**写下的那一行**校验两个操作数的 shape 和 dtype 一致，不一致抛 `ValueError` 并把两个 `Expression` 的 repr 都打出来。DirectML 到 `compile` 才拒绝，而且只给一个不带节点名的 `E_INVALIDARG`；操作数就在手边，没有理由不说。float 操作数不校验。
+
 两条红线：
 
 - **比较运算符永远不构图**。`__eq__`/`__hash__` 按节点身份实现（§4.3，dict 绑定靠它），numpy 风格的逐元素 `==` 与之不可共存；`<`、`>` 等一并不做，避免「一半按身份一半构图」的割裂。
-- **不做隐式广播**。两个 Expression 的 shape 必须一致，广播由调用方用 `reinterpret` 的零步长视图显式表达（sdxl 样例的 `broadcast()` 即是）。shape 不匹配在 compile 时以 `E_INVALIDARG` 报出。
+- **不做隐式广播**。两个 Expression 的 shape 必须一致，广播由调用方用 `dml.broadcast` 显式表达（§4.12）。
+
+### 4.10 `dml.Buffer`：GPU 常驻张量
+
+§2 原先把 `DML_BUFFER_BINDING` 映射成 ndarray，丢掉了「数据在哪」这个维度：`dispatch` 的输入永远从 CPU 上传，输出永远经 readback 堆回到 CPU。而单个 D3D12 buffer 4 GiB 的上限（附录）**强迫**大模型拆图 —— sdxl 的 UNet 是两张 —— 于是每个图边界都是一次 PCIe 往返，采样循环里每一步都付。`Buffer` 就是概念表里漏掉的那个 `ID3D12Resource`，不是新抽象。
+
+- `op(inputs, readback=False)` 给每个输出分配一块 DEFAULT 堆资源，直接绑成输出，返回 `Buffer` 而不是 ndarray。
+- 绑定字典的值可以是 `Buffer`：直接绑定它的资源，不上传。dtype 必须与张量**完全一致**（GPU 上没有转换可做），字节数不得少于张量的 `TotalTensorSizeInBytes`，必须属于同一个 `Device`。`initialize` 和 `constant()` 同样收。
+- `dml.Buffer(device, array, dtype=None)` 显式上传；`buffer.numpy()` 显式回读。**没有 `__array__`**：`np.asarray(buffer)` 悄悄做一次 GPU→CPU 拷贝是隐式传输，正是这一节要消灭的东西。
+- `.shape` / `.strides` / `.dtype` / `.desc` / `.nbytes` 与 `Expression` 同一套属性。
+- 生命周期：`Buffer` 持有 `Device` 的 `shared_ptr`，可以比 graph 和 op 都活得久。
+
+同步模型不变：每次 dispatch 仍在 `WaitForQueueToComplete` 上阻塞。异步与流水线是另一个议题，`Buffer` 是它的前提。
+
+### 4.11 `graph.constant(array)`
+
+`owned=True` 把「值在构图时已知」和「DML 拥有它」绑在一起，多出一个阶段：sdxl 的 `Model.constant` 说明真实用法里每个 owned 输入的数组在声明那一刻就在手上，用户只好自己攒一个 `weights` 字典带到 `initialize`，编译完再手动 `clear()`。按 §1「吸收人人都会再写一遍的部分」，这层进库：
+
+```python
+w = graph.constant(array, dtype=None, *, sizes=None, name=None)
+```
+
+- 声明一个 `OWNED_BY_DML` 输入，graph 记下**数组的引用**（不是拷贝）。`dtype` 默认取数组自己的 dtype —— 数组就在手边，和 `input()` 默认 float32 的理由不同；cast 规则与 `dispatch` 同一张表，在 `constant()` 这一行就校验，报错指向声明处而不是 `compile`。`sizes` 允许用同元素数的另一个形状来看这块数据。
+- `compile()` 把 constants 交给 op，graph 随即**放手**。若 owned 输入全是 constant（包括一个都没有），`compile` 就地 `initialize`，转换逐张量进行，op 也随即放手 —— 库始终不保留拷贝。否则 constants 在 op 上等到 `initialize(weights)`，届时 `weights` 里没写的 constant 从记录里补，写了的以 `weights` 为准。
+- 首次初始化之后记录清空；**再次 `initialize` 必须给全所有 owned 输入，constant 也不例外**。这是 §4.7「换数据要重新 initialize」的直接推论。
+- graph 在 `compile` 后不再持有 constants，所以同一张 graph 第二次 `compile` 得不到它们。sdxl 的 `Model` 把 `self.graph` 一直挂着，不放手的话 UNet 5 GiB 的 CPU 数组会跟着活到进程结束。
+
+`owned=True` 保留给数据在构图时还没有的情形。
+
+### 4.12 `dml.broadcast(x, shape)`
+
+原先归为「领域知识，留在 sample」。归错了：零步长视图是纯粹的张量描述符机制，没有任何模型语义，numpy 的广播规则又是确定的，而每个写 `x * scale` 的用户都要抄一遍那 20 行。库拒绝隐式广播是对的，提供显式的 `broadcast` 与之不冲突 —— 它就是一个 `reinterpret`，不加算子、不拷贝。规则照 numpy：从右对齐，缺失的前导轴和长度为 1 的轴步长置 0，其余不一致报错；目标秩不得低于来源。来源已有 strides 的（比如 `to_tokens` 出来的转置视图）沿用其 strides，不重新按 packed 算 —— 这是 sample 版本没处理的情形。
+
+`to_tokens` / `split_heads` 这些仍在 sample 层：它们编码的是 attention 的布局约定，那才是领域知识。
+
+### 4.13 输入的 `name=`
+
+`Model.run(*values)` 按 `_placeholders` 的顺序 zip 成 dict，`UNet.__call__` 再按位置调用它 —— 用户层把位置绑定又造回来了。原因是持有 `Expression` 句柄的对象和调用它的对象往往不是同一个，以 `Expression` 为键是正确的**原语**，不是终端用户的自然形态。所以 `graph.input(..., name=)` 和 `graph.constant(..., name=)` 接受一个 graph 内唯一的名字，绑定字典的 key 可以是 `Expression` 或名字，两者混用也行，同一个输入绑两次报错。报错信息里带名字：`input 0 'latent' (float16 [1, 4, 128, 128])`。不给名字什么都不变。
 
 ## 5. 效果对照
 
@@ -263,29 +308,34 @@ instance_norm5 = dml.mean_variance_normalization(
     axes=[0, 2, 3], fused_activation=dml.FusedActivation.relu())
 ```
 
-sdxl 的 `dml_layers.Model` 里属于**库的缺陷**的部分全部蒸发：`_add_input` 的编号记账、`NUMPY_DTYPES`、`placeholder` 的 shape/dtype 记录与校验、`run` 里的 reshape、`release_data` 循环。剩下的只有**属于模型的**东西 —— 按名字取权重、决定谁是 constant 谁是 placeholder —— 大约 20 行，而且这 20 行本来就该由应用层写：
+sdxl 的 `dml_layers.Model` 里属于**库的缺陷**的部分全部蒸发：`_add_input` 的编号记账、`NUMPY_DTYPES`、`placeholder` 的 shape/dtype 记录与校验、`run` 里的 reshape、`release_data` 循环，以及（§4.11 之后）`weights` 字典和 `compile` 里的 `initialize` + `clear`。剩下的只有**属于模型的**东西 —— 决定谁是 constant 谁是 placeholder、按位置收 `run` 的实参：
 
 ```python
 class Model:
     def __init__(self, device, dtype=np.float32):
         self.graph = dml.Graph(device)
-        self.weights = {}                        # Expression -> ndarray
-        self.dtype = dtype
+        self.dtype = np.dtype(dtype)
+        self._placeholders = []
 
     def constant(self, array, shape=None):
-        array = np.ascontiguousarray(array, self.dtype)
-        expr = self.graph.input(shape or array.shape, self.dtype, owned=True)
-        self.weights[expr] = array
+        return self.graph.constant(array, self.dtype, sizes=shape)
+
+    def placeholder(self, shape, dtype=None):
+        expr = self.graph.input(shape, dtype or self.dtype)
+        self._placeholders.append(expr)
         return expr
 
     def compile(self, outputs):
-        self.op = self.graph.compile(outputs)
-        self.op.initialize(self.weights)
-        self.weights.clear()                     # the library keeps no copy; this was the only one
+        self.op = self.graph.compile(outputs)    # uploads the weights and initializes
         return self
+
+    def run(self, *values, readback=True):
+        return self.op(dict(zip(self._placeholders, values)), readback=readback)
 ```
 
-`broadcast` / `to_tokens` / `split_heads` 这些 stride 技巧函数保留在 sample 层 —— 它们是领域知识，不是 API 毛刺，吸进库里就违反「不引入新抽象」。
+UNet 的两半之间（§4.10）：`self.down.run(..., readback=False)` 留下的 `Buffer` 直接喂给 `self.up.run(...)`，mid、temb 和九条 skip 不再往返 PCIe。
+
+`to_tokens` / `split_heads` 这些 stride 技巧函数保留在 sample 层 —— 它们编码 attention 的布局约定，是领域知识，不是 API 毛刺。`broadcast` 不是，已进库（§4.12）。
 
 ## 6. 落地顺序
 
@@ -301,6 +351,7 @@ class Model:
 6. 算子签名：`py::kw_only()`、默认值与参数顺序、改名、`average_pooling` 的 `output_sizes`、`reinterpret` 新签名、`Size2D` → 元组（§4.5）；`FusedActivation` 工厂和 namedtuple 输出落在包装层（§4.5 / §4.6）。
 7. docstring 的 Args / Returns / Raises（包装层）+ 存根（§4.8）。
 8. `dml_layers.Model` 缩到 §5 的形态（其余 sample 改写已随第 4-6 步就地完成）。
+9. 【已落地】第二轮，来自对 1-8 落地后的第一性原理复查：`dml.Buffer`（§4.10）、`graph.constant`（§4.11）、`dml.broadcast`（§4.12）、`name=`（§4.13）、逐元素 shape 校验（§4.9）、包装层统一为挂载而非子类（§4.8）。sdxl 的 `Model` 随之缩到 §5 的最终形态，UNet 两半之间改走 `Buffer`。
 
 ## 7. 已拍板的争议项
 

@@ -10,10 +10,14 @@
 
 namespace pydml
 {
-    class Device
+    class Device : public std::enable_shared_from_this<Device>
     {
     public:
         explicit Device(bool useGpu = true, bool useDebugLayer = false, DXGI_GPU_PREFERENCE gpuPreference = DXGI_GPU_PREFERENCE_UNSPECIFIED);
+
+        // Inputs already on the GPU, by input index. They are bound in place;
+        // nothing is uploaded for them.
+        using BufferMap = std::map<uint32_t, std::shared_ptr<pydml::Buffer>>;
 
         // Bind the DML_TENSOR_FLAG_OWNED_BY_DML inputs and run the operator
         // initializer, leaving the result in the operator's persistent resource.
@@ -23,16 +27,26 @@ namespace pydml
         // and yielding lazily means only one converted copy exists at a time.
         void Initialize(
             pydml::CompiledOperator& op,
+            BufferMap const& buffers,
             py::iterable staged
             );
 
         // Upload the inputs that are not owned by DirectML, run the operator, and
-        // read the outputs back as numpy arrays shaped by the output descs.
+        // return the outputs: as numpy arrays shaped by the output descs when
+        // `readback` is set, otherwise as Buffers that stay on the GPU.
         // Requires an initialized operator.
         py::list Dispatch(
             pydml::CompiledOperator& op,
-            py::iterable staged
+            BufferMap const& buffers,
+            py::iterable staged,
+            bool readback
             );
+
+        // Copy a C-contiguous array of the desc's dtype into a new Buffer.
+        std::shared_ptr<pydml::Buffer> Upload(dml::TensorDesc desc, py::array array);
+
+        // Read a Buffer back as a numpy array shaped by its desc.
+        py::array Download(pydml::Buffer const& buffer);
 
         inline bool UseGpu() const
         {
@@ -52,6 +66,24 @@ namespace pydml
             std::vector<dml::TensorDesc> const& outputDescs,
             std::vector<DmlBufferBinding>& outputBindings
             );
+
+        // A packed numpy array of `desc`'s shape and dtype, copied out of mapped
+        // readback memory that holds the tensor in `desc`'s layout.
+        py::array ReadArray(byte const* data, dml::TensorDesc const& desc);
+
+        // The binding for input `index` when it is supplied as a Buffer: checks
+        // the buffer belongs to this device and is large enough, and marks it
+        // resident for the coming command list.
+        DmlBufferBinding BindBuffer(pydml::Buffer const& buffer, dml::TensorDesc const& desc, uint32_t index);
+
+        // Copy one array into mapped upload-heap memory at the binding's offset,
+        // zero-padding the tail up to the binding's size.
+        void CopyArrayToUploadHeap(byte* uploadHeapData, DmlBufferBinding const& binding, py::array const& array, uint32_t index);
+
+        // Record a copy of `sizeInBytes` between two DEFAULT/UPLOAD/READBACK
+        // buffers, with `resource` transitioned out of and back into UAV state.
+        void RecordCopyToBuffer(ID3D12Resource* resource, ID3D12Resource* source, uint64_t sizeInBytes);
+        void RecordCopyFromBuffer(ID3D12Resource* destination, ID3D12Resource* resource, uint64_t sizeInBytes);
 
         // Copy `staged` (index, array) pairs into the upload heap at the offsets
         // in `bindings`, zero-padding each tensor's tail, and record the copy

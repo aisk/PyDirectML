@@ -91,7 +91,8 @@ channel axis is normalized here, so it is a separate multiply and add.
 **Broadcasting is a stride of 0.** DirectML reads a tensor through whatever
 strides its descriptor carries, and a zero stride makes an axis repeat. A
 `[1, C, 1, 1]` bias becomes a `[1, C, H, W]` view with strides `[C, 1, 0, 0]`,
-no copy involved. That is what `broadcast()` builds.
+no copy involved. That is what `dml.broadcast()` builds, and nothing broadcasts
+without it.
 
 **Transposing is the same trick with non-zero strides.** Attention wants tokens,
 not pixels: `[1, C, H, W]` read as `[1, 1, H*W, C]` with strides
@@ -235,9 +236,10 @@ So it is two graphs, split at the mid block:
 | three up blocks, `conv_out` | 2.47 GiB |
 
 What crosses between them is the mid-block result, the timestep embedding, and
-nine skip connections -- about 54 MiB at 1024x1024, which is a millisecond of
-PCIe each way against a 1.2 second forward pass. The split is invisible from
-outside `unet.UNet`.
+nine skip connections -- about 54 MiB at 1024x1024. They never leave the GPU:
+the first half is dispatched with `readback=False`, which hands back a
+`dml.Buffer` per output, and the second half binds those in place. The split is
+invisible from outside `unet.UNet`.
 
 `--size` takes a `WIDTHxHEIGHT`, not just a square. A level that halves an odd
 extent on the way down cannot get back to it by doubling on the way up, so at

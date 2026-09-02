@@ -21,7 +21,7 @@ import numpy as np
 import directml as dml
 
 from dml_layers import (
-    Model, broadcast, conv2d, crop_to, diffusers_attention, geglu, group_norm,
+    Model, conv2d, crop_to, diffusers_attention, geglu, group_norm,
     layer_norm, linear, silu, to_channels, to_image, to_tokens,
     upsample_nearest)
 
@@ -131,7 +131,7 @@ def resnet_block(model, x, temb, params, prefix):
 
     projected = linear(model, silu(temb), params[f"{prefix}.time_emb_proj.weight"],
                        params[f"{prefix}.time_emb_proj.bias"])
-    h = h + broadcast(to_channels(projected), h.shape)
+    h = h + dml.broadcast(to_channels(projected), h.shape)
 
     h = conv2d(model, silu(group_norm(model, h, params[f"{prefix}.norm2.weight"],
                                       params[f"{prefix}.norm2.bias"],
@@ -280,8 +280,9 @@ class UNet:
     removes the device rather than failing. The UNet is 4.78 GiB at half
     precision. Split at the mid block it is 2.31 and 2.47 GiB, and the tensors
     that cross between the halves -- the mid-block result, the timestep
-    embedding, and nine skip connections -- come to about 54 MiB at 1024x1024,
-    which is a millisecond of PCIe each way.
+    embedding, and nine skip connections -- come to about 54 MiB at 1024x1024.
+    They stay on the GPU: the first half leaves them there as Buffers and the
+    second half binds those in place, so the split costs no PCIe traffic.
     """
 
     def __init__(self, device, params, height, width,
@@ -315,6 +316,7 @@ class UNet:
 
     def __call__(self, latent, time_input, add_input, context):
         """Predict the noise in ``latent``."""
-        mid, temb, *skips = self.down.run(latent, time_input, add_input, context)
+        mid, temb, *skips = self.down.run(latent, time_input, add_input, context,
+                                          readback=False)
         noise, = self.up.run(mid, temb, context, *skips)
         return noise

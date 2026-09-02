@@ -13,6 +13,8 @@
 #include <string>
 #include <functional>
 #include <numeric>
+#include <map>
+#include <memory>
 
 #ifdef __cpp_lib_span
 #include <span>

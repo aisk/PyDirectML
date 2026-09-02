@@ -305,11 +305,32 @@ PYBIND11_MODULE(_core, module)
                 return "dml.Device on " + std::string(device.UseGpu() ? "GPU" : "CPU");
             });
 
+    // A tensor on the GPU. Constructed from an array by the wrapper layer's
+    // __init__, which converts to the desc's dtype first; handed out by
+    // dispatch(readback=False); accepted wherever an array is.
+    py::class_<pydml::Buffer, std::shared_ptr<pydml::Buffer>>(module, "Buffer")
+        .def(py::init([](std::shared_ptr<pydml::Device> device, dml::TensorDesc desc, py::array array) {
+            return device->Upload(std::move(desc), std::move(array));
+            }),
+            "Upload a C-contiguous array of desc's dtype into a new Buffer.",
+            py::arg("device"),
+            py::arg("desc"),
+            py::arg("array"))
+        .def_property_readonly("desc", [](pydml::Buffer const& self) { return self.desc; },
+            "The TensorDesc this buffer is read through.")
+        .def_property_readonly("device", [](pydml::Buffer const& self) { return self.device; },
+            "The Device whose memory this is.")
+        .def_property_readonly("nbytes", &pydml::Buffer::SizeInBytes,
+            "Bytes of GPU memory the buffer holds.")
+        .def("numpy", [](pydml::Buffer const& self) { return self.device->Download(self); },
+            "Copy the buffer back to the host as a numpy array of its shape and dtype.");
+
     // The private surface of a compiled operator. The public initialize(),
     // dispatch() and __call__ live in the wrapper layer, which validates the
-    // dict of inputs and converts the arrays one at a time as _initialize and
-    // _dispatch pull on the staged iterable. py::dynamic_attr lets the wrapper
-    // cache its slot table on the instance.
+    // dict of inputs, separates the Buffers (bound in place) from the arrays
+    // (converted one at a time as _initialize and _dispatch pull on the staged
+    // iterable). py::dynamic_attr lets the wrapper cache its slot table on the
+    // instance.
     py::class_<pydml::CompiledOperator>(module, "CompiledOperator", py::dynamic_attr())
         .def_property_readonly("temporary_size", [](pydml::CompiledOperator& self) {
             return self.op->GetBindingProperties().TemporaryResourceSize;
@@ -340,16 +361,21 @@ PYBIND11_MODULE(_core, module)
             return slots;
             },
             "One (node id, owned, TensorDesc) tuple per graph input, in index order.")
-        .def("_initialize", [](pydml::CompiledOperator& self, py::iterable staged) {
-            self.device->Initialize(self, staged);
+        .def("_initialize", [](pydml::CompiledOperator& self, pydml::Device::BufferMap const& buffers, py::iterable staged) {
+            self.device->Initialize(self, buffers, staged);
             },
+            py::arg("buffers"),
             py::arg("staged"))
-        .def("_dispatch", [](pydml::CompiledOperator& self, py::iterable staged) {
-            return self.device->Dispatch(self, staged);
+        .def("_dispatch", [](pydml::CompiledOperator& self, pydml::Device::BufferMap const& buffers, py::iterable staged, bool readback) {
+            return self.device->Dispatch(self, buffers, staged, readback);
             },
-            py::arg("staged"));
+            py::arg("buffers"),
+            py::arg("staged"),
+            py::arg("readback"));
 
-    py::class_<pydml::Graph>(module, "Graph")
+    // py::dynamic_attr for the wrapper's input names and constants, which live
+    // on the graph until compile() hands them to the operator.
+    py::class_<pydml::Graph>(module, "Graph", py::dynamic_attr())
         .def(py::init([](std::shared_ptr<pydml::Device> device, std::optional<dml::TensorPolicy> tensorPolicy) {
             return new pydml::Graph(std::move(device), tensorPolicy.value_or(dml::TensorPolicy::Default()));
             }),

@@ -217,3 +217,278 @@ class TestExecution:
         result, = op({x: np.zeros((1, 2, 3, 4), np.float32)})
         assert result.shape == (1, 2, 3, 4)
         assert result.dtype == np.float32
+
+
+class TestConstants:
+    """graph.constant() records the data with the declaration; compile()
+    uploads it and lets it go."""
+
+    def test_compile_initializes_a_graph_of_constants(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        w = graph.constant(np.full((1, 1, 2, 2), 2.0, np.float32))
+        op = graph.compile([dml.multiply(x, w)])
+        assert op.initialized
+        result, = op({x: np.full((2, 2), 3.0, np.float32)})
+        assert np.all(result == 6.0)
+
+    def test_constant_takes_the_arrays_dtype_and_a_view_shape(self, device):
+        graph = dml.Graph(device)
+        w = graph.constant(np.arange(4, dtype=np.int32), sizes=[1, 1, 2, 2])
+        assert w.dtype == np.int32
+        assert w.shape == (1, 1, 2, 2)
+
+    def test_constant_converts_at_upload(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2], np.float16)
+        w = graph.constant(np.full((1, 1, 2, 2), 0.5, np.float64), np.float16)
+        op = graph.compile([dml.add(x, w)])
+        result, = op({x: np.zeros((2, 2), np.float16)})
+        assert result.dtype == np.float16
+        assert np.all(result == 0.5)
+
+    def test_constant_refuses_an_unsafe_cast_at_declaration(self, device):
+        graph = dml.Graph(device)
+        with pytest.raises(ValueError, match="astype"):
+            graph.constant(np.zeros((2, 2), np.int32), np.float32)
+
+    def test_constant_refuses_a_shape_it_does_not_fill(self, device):
+        graph = dml.Graph(device)
+        with pytest.raises(ValueError, match="does not fill"):
+            graph.constant(np.zeros((2, 2), np.float32), sizes=[1, 1, 2, 3])
+
+    def test_constants_wait_for_the_other_owned_inputs(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        c = graph.constant(np.full((1, 1, 2, 2), 1.0, np.float32))
+        w = graph.input([1, 1, 2, 2], owned=True)
+        op = graph.compile([dml.add(dml.add(x, c), w)])
+        assert not op.initialized
+        # The constant need not be named again; the plain owned input must be.
+        with pytest.raises(ValueError, match="missing input 2"):
+            op.initialize({})
+        op.initialize({w: np.full((2, 2), 2.0, np.float32)})
+        result, = op({x: np.zeros((2, 2), np.float32)})
+        assert np.all(result == 3.0)
+
+    def test_reinitializing_needs_the_constants_again(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        c = graph.constant(np.full((1, 1, 2, 2), 1.0, np.float32))
+        op = graph.compile([dml.add(x, c)])
+        with pytest.raises(ValueError, match="missing input 1"):
+            op.initialize({})
+        op.initialize({c: np.full((2, 2), 5.0, np.float32)})
+        result, = op({x: np.zeros((2, 2), np.float32)})
+        assert np.all(result == 5.0)
+
+    def test_graph_drops_the_arrays_at_compile(self, device):
+        graph = dml.Graph(device)
+        w = graph.constant(np.zeros((1, 1, 2, 2), np.float32))
+        assert graph._constants
+        graph.compile([dml.activation_identity(w)])
+        assert "_constants" not in graph.__dict__
+
+
+class TestNames:
+    def test_named_inputs_bind_by_name(self, device):
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2], name="a")
+        b = graph.input([1, 1, 2, 2], name="b")
+        op = graph.compile([dml.subtract(a, b)])
+        result, = op({"a": np.full((2, 2), 3.0, np.float32),
+                      b: np.full((2, 2), 1.0, np.float32)})
+        assert np.all(result == 2.0)
+
+    def test_unknown_name_is_refused(self, device):
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2], name="a")
+        op = graph.compile([dml.activation_identity(a)])
+        with pytest.raises(ValueError, match="no input named 'b'"):
+            op({"b": np.zeros((2, 2), np.float32)})
+
+    def test_duplicate_name_is_refused(self, device):
+        graph = dml.Graph(device)
+        graph.input([1, 1, 2, 2], name="a")
+        with pytest.raises(ValueError, match="already has an input named 'a'"):
+            graph.constant(np.zeros((1, 1, 2, 2), np.float32), name="a")
+
+    def test_binding_twice_is_refused(self, device):
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2], name="a")
+        op = graph.compile([dml.activation_identity(a)])
+        with pytest.raises(ValueError, match="'a'.*bound twice"):
+            op({"a": np.zeros((2, 2), np.float32), a: np.zeros((2, 2), np.float32)})
+
+    def test_errors_name_the_input(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2], name="latent")
+        op = graph.compile([dml.activation_identity(x)])
+        with pytest.raises(ValueError, match="input 0 'latent'"):
+            op({})
+
+
+class TestBuffers:
+    """A Buffer is a tensor on the GPU: uploaded once, bound in place, and
+    handed out by dispatch(readback=False) so the next graph can bind it."""
+
+    def test_round_trip(self, device):
+        array = np.arange(6, dtype=np.float32).reshape(1, 1, 2, 3)
+        buffer = dml.Buffer(device, array)
+        assert buffer.shape == (1, 1, 2, 3)
+        assert buffer.dtype == np.float32
+        assert buffer.nbytes == 24
+        assert np.array_equal(buffer.numpy(), array)
+
+    def test_upload_converts_under_the_cast_table(self, device):
+        buffer = dml.Buffer(device, np.full((2, 2), 0.5, np.float64), np.float16)
+        assert buffer.dtype == np.float16
+        assert np.all(buffer.numpy() == 0.5)
+        with pytest.raises(ValueError, match="astype"):
+            dml.Buffer(device, np.zeros((2, 2), np.int32), np.float32)
+
+    def test_buffer_binds_as_an_input(self, device):
+        x, op = identity_op(device, [1, 1, 2, 2])
+        buffer = dml.Buffer(device, np.full((1, 1, 2, 2), 4.0, np.float32))
+        result, = op({x: buffer})
+        assert np.all(result == 4.0)
+
+    def test_buffer_dtype_must_match(self, device):
+        x, op = identity_op(device, [1, 1, 2, 2])
+        buffer = dml.Buffer(device, np.zeros((1, 1, 2, 2), np.float16))
+        with pytest.raises(ValueError, match="not converted"):
+            op({x: buffer})
+
+    def test_buffer_must_fill_the_tensor(self, device):
+        x, op = identity_op(device, [1, 1, 2, 2])
+        buffer = dml.Buffer(device, np.zeros((1, 1, 2, 3), np.float32))
+        with pytest.raises(ValueError, match="does not fill"):
+            op({x: buffer})
+
+    def test_outputs_stay_on_the_gpu_and_feed_the_next_graph(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        first = graph.compile([x * 2.0, x + 1.0])
+
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2])
+        b = graph.input([1, 1, 2, 2])
+        second = graph.compile([dml.multiply(a, b)])
+
+        values = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+        doubled, incremented = first({x: values}, readback=False)
+        assert isinstance(doubled, dml.Buffer)
+        assert doubled.shape == (1, 1, 2, 2)
+        result, = second({a: doubled, b: incremented})
+        assert np.array_equal(result, values * 2 * (values + 1))
+        assert np.array_equal(doubled.numpy(), values * 2)
+
+    def test_buffer_initializes_an_owned_input(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        w = graph.input([1, 1, 2, 2], owned=True)
+        op = graph.compile([dml.add(x, w)])
+        op.initialize({w: dml.Buffer(device, np.full((1, 1, 2, 2), 7.0, np.float32))})
+        result, = op({x: np.zeros((2, 2), np.float32)})
+        assert np.all(result == 7.0)
+
+    def test_buffer_as_a_constant(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        w = graph.constant(dml.Buffer(device, np.full((1, 1, 2, 2), 7.0, np.float32)))
+        op = graph.compile([dml.add(x, w)])
+        result, = op({x: np.zeros((2, 2), np.float32)})
+        assert np.all(result == 7.0)
+
+    def test_buffer_from_another_device_is_refused(self, device):
+        x, op = identity_op(device, [1, 1, 2, 2])
+        other = dml.Device()
+        buffer = dml.Buffer(other, np.zeros((1, 1, 2, 2), np.float32))
+        with pytest.raises(ValueError, match="different device"):
+            op({x: buffer})
+
+    def test_buffer_outlives_its_graph_and_operator(self, device):
+        x, op = identity_op(device, [1, 1, 2, 2])
+        buffer, = op({x: np.full((2, 2), 9.0, np.float32)}, readback=False)
+        del op, x
+        assert np.all(buffer.numpy() == 9.0)
+
+
+class TestBroadcast:
+    def test_axes_of_one_get_a_zero_stride(self, device):
+        graph = dml.Graph(device)
+        view = dml.broadcast(graph.input([1, 3, 1, 1]), [2, 3, 4, 5])
+        assert view.shape == (2, 3, 4, 5)
+        assert view.strides == (0, 1, 0, 0)
+
+    def test_leading_axes_are_added(self, device):
+        graph = dml.Graph(device)
+        view = dml.broadcast(graph.input([3, 4]), [2, 3, 4])
+        assert view.strides == (0, 4, 1)
+
+    def test_same_shape_is_the_same_expression(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 1, 2, 2])
+        assert dml.broadcast(x, [1, 1, 2, 2]) == x
+
+    def test_existing_strides_are_kept(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 2, 3, 4])
+        transposed = dml.reinterpret(x, [1, 2, 4, 3], [24, 12, 1, 4])
+        view = dml.broadcast(transposed, [5, 2, 4, 3])
+        assert view.strides == (0, 12, 1, 4)
+
+    def test_mismatch_is_refused(self, device):
+        graph = dml.Graph(device)
+        x = graph.input([1, 3, 2, 2])
+        with pytest.raises(ValueError, match="cannot broadcast"):
+            dml.broadcast(x, [1, 3, 4, 4])
+        with pytest.raises(ValueError, match="fewer axes"):
+            dml.broadcast(x, [3, 2, 2])
+
+    def test_broadcast_computes(self, device):
+        graph = dml.Graph(device)
+        image = graph.input([1, 3, 2, 2])
+        bias = graph.constant(np.array([1, 2, 3], np.float32), sizes=[1, 3, 1, 1])
+        op = graph.compile([image + dml.broadcast(bias, image.shape)])
+        result, = op({image: np.zeros((1, 3, 2, 2), np.float32)})
+        assert np.array_equal(result[0, :, 1, 1], [1, 2, 3])
+
+
+class TestElementwiseChecks:
+    """A mismatched elementwise pair is refused where it is written, naming
+    both operands, rather than at compile as a bare E_INVALIDARG."""
+
+    def test_shape_mismatch_names_the_operands(self, device):
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2])
+        b = graph.input([1, 1, 2, 3])
+        with pytest.raises(ValueError, match=r"\[1, 1, 2, 2\].*\[1, 1, 2, 3\].*broadcast"):
+            a + b
+        with pytest.raises(ValueError, match="shapes differ"):
+            dml.add(a, b)
+
+    def test_dtype_mismatch_is_refused(self, device):
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2], np.float32)
+        b = graph.input([1, 1, 2, 2], np.float16)
+        with pytest.raises(ValueError, match="element types differ"):
+            a * b
+
+    def test_float_operands_are_not_checked(self, device):
+        graph = dml.Graph(device)
+        a = graph.input([1, 1, 2, 2])
+        assert (a * 2.0).shape == (1, 1, 2, 2)
+
+
+class TestTensorDesc:
+    def test_accepts_numpy_dtypes(self):
+        desc = dml.TensorDesc(np.float16, [2, 3])
+        assert desc.data_type == dml.TensorDataType.FLOAT16
+        assert desc.total_tensor_size_in_bytes == 12
+
+    def test_is_the_class_the_library_hands_back(self, device):
+        # One class, not a Python subclass over a C++ one: what an Expression
+        # reports is a dml.TensorDesc too.
+        graph = dml.Graph(device)
+        assert isinstance(graph.input([1, 1, 2, 2]).desc, dml.TensorDesc)
