@@ -66,8 +66,7 @@ class Model:
         return expression
 
     def compile(self, outputs):
-        # Every owned input is a constant, so this also initializes: the
-        # weights go up and the graph lets go of them.
+        # Every owned input is a constant, so this also initializes.
         self._operator = self.graph.compile(list(outputs))
         return self
 
