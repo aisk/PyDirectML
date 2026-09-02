@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "directml"
-version = "1.0.0"
+version = "0.1.0"
 description = "Python binding for DirectML"
 readme = "README.md"
 license = "MIT"

@@ -1,0 +1,11 @@
+# The sdist must carry everything CMake needs: the extension sources, the
+# vendored headers and both submodules. setuptools ships only the package
+# directory on its own.
+include CMakeLists.txt
+recursive-include src *
+recursive-include third_party *
+graft gpgmm
+graft pybind11
+prune gpgmm/.git
+prune pybind11/.git
+global-exclude __pycache__ *.py[cod] *.pyd
