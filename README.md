@@ -1,59 +1,8 @@
-# Python Binding for DirectML Samples
+# Python Binding for DirectML
 
 > Forked from the `Python/` directory of [microsoft/DirectML](https://github.com/microsoft/DirectML), which is no longer maintained. `third_party/DirectMLX.h` comes from that repository's `Libraries/` directory. Licensed under MIT, see [LICENSE](./LICENSE).
 
-PyDirectML is an open source Python binding library for DirectML written to facilitate DirectML sample authoring in Python. It provides the following capabilities to Python sample authors:
-- Simplified DirectML graph authoring and compilation with operator composition
-- Wrapper of DirectML device and resource management
-- Binding support through NumPy arrays
-
-## Differences from upstream
-
-- The extension module is imported as **`directml`**, not `pydirectml`.
-- `DirectML.h` and `DirectML.lib` come from the Windows SDK. Upstream downloaded the `microsoft.ai.directml` NuGet package at build time and shipped its `DirectML.dll` inside the wheel, where nothing ever loaded it.
-- `average_pooling` takes `dilations` and `mean_variance_normalization` takes `normalize_mean`, in the position the DirectMLX signature gives them. The samples are updated to match.
-- `activation_soft_max` is spelled `activation_softmax` and takes an `axes` argument, binding `DML_ACTIVATION_SOFTMAX1`. The old binding normalized a flattened 2-D view and could not express softmax over the last axis of a 4-D tensor, which attention needs. `activation_gelu` is bound as well.
-- Inputs are bound as a **dict from `Expression` to array**: `op.initialize({weight: array})` for the tensors DirectML owns, `op({input: array})` for the rest. Upstream matched a list of `Binding`s to inputs by position, with no validation — a misordered list silently computed garbage. The dict also means the library keeps no CPU copy of any weight: data is uploaded from the caller's array at the moment of the call. An input given a `name=` can be bound by that name instead of by its `Expression`.
-- **`graph.constant(array)`** declares an owned input and records its data in one call, for the weight that is already in hand when the graph is built. `compile()` uploads the constants, initializes the operator if they are its only owned inputs, and lets the arrays go. That is the whole of what `samples/sdxl` used to do by hand around `initialize`.
-- **`dml.Buffer`** is a tensor that stays on the GPU. `op(inputs, readback=False)` returns one per output instead of copying the outputs back; a binding dict accepts one wherever it accepts an array, bound in place with no upload; `buffer.numpy()` reads it back. A single D3D12 buffer stops at 4 GiB, so a model with more weight than that has to be two graphs — the SDXL UNet is — and without a GPU-resident handle every tensor crossing between them crossed PCIe twice per step.
-- **`dml.broadcast(x, shape)`** views a tensor through a larger shape with NumPy's rule, as a zero-stride `reinterpret`; no data is copied and no operator is added. Nothing broadcasts implicitly, and an elementwise operator with mismatched operands is refused where it is written, naming both, rather than at compile as a bare `E_INVALIDARG`.
-- A tensor's declared data type is honored on both ends, and every API that takes one accepts numpy dtypes. What you hand to `initialize()` or `dispatch()` is converted to the tensor's type, refusing conversions that cross a dtype kind unsafely; results come back as numpy arrays of that type and shape. Upstream forced float32 in and read float32 out, which reads out of bounds for any narrower type. Half precision works: see `samples/dtypes.py`.
-- `initialize` and `dispatch` live on the `CompiledOperator`, whose persistent resource belongs to it rather than to the device, so a tensor flagged `owned=True` is uploaded once and then stays on the GPU. A graph whose owned inputs are all `constant()`s, or that has none, is initialized by `compile()`. Upstream re-ran initialization on every `compute`, re-uploading every weight each time.
-- `multihead_attention` binds `DML_OPERATOR_MULTIHEAD_ATTENTION`, which DirectMLX has no helper for, so `src/attention.h` builds the graph node from the raw descriptor in the style of the helpers it sits beside. Attention written out as a `gemm`, a softmax and a `gemm` materializes the whole score matrix; the one operator does not, and in `samples/sdxl` it cut a 1024×1024 image from 107 seconds to 63 and nearly halved the UNet's scratch.
-- Arithmetic on `Expression` (`x + y`, `x * 0.5`, `1.0 - x`, `-x`) comes from DirectMLX's C++ overloads — a float operand rides on an identity operator's scale-bias — with three corrections. `float / x` scales the reciprocal: DirectMLX hands the scale to `Recip`, whose scale-bias applies to the *input*, so it computed `1/(ax)`. `%` binds `ModulusFloor` to match Python's floored semantics instead of `ModulusTruncate`. And the in-place forms are gone: `+=` mutated the node behind every alias of the Python object, silently changing the identity that `hash()` and dict binding match on; without `__iadd__`, `x += y` rebinds one name and leaves the aliases alone. Comparison operators stay identity-based — `__eq__` is what makes an `Expression` a dict key — and nothing broadcasts implicitly; mismatched shapes are refused at compile with `E_INVALIDARG`.
-- `CompiledOperator.temporary_size`, `persistent_size` and `descriptor_count` expose `IDMLCompiledOperator::GetBindingProperties`, which is how much scratch one dispatch of a graph needs, how much DirectML keeps between dispatches, and how many descriptors it binds. The first two are the whole memory budget of a compiled graph, and without them a card that runs out of it can only be investigated with a system-wide counter. `samples/sdxl/README.md` has what they turned up.
-- Buffers grow by a fixed step once they pass 256 MiB instead of doubling forever. A single D3D12 buffer stops at 4 GiB — allocating one past that removes the device (`DXGI_ERROR_DEVICE_REMOVED`) rather than failing the allocation — and doubling turned a 2.1 GiB request into exactly that. `ThrowIfFailed` also reports the HRESULT now, by name where there is one; it used to throw a bare `std::exception`, which reached Python as "Unknown exception". DirectMLX's own `DMLX_THROW_IF_FAILED` is routed through the same reporting, so a graph DirectML refuses to compile says `E_INVALIDARG` instead of surfacing the bare call-site expression. A removed device says *why* it was removed: every dispatch drains the queue through `WaitForQueueToComplete`, which now asks `GetDeviceRemovedReason` there, so the failure is attributed to the work that caused it and names the reason instead of surfacing `DXGI_ERROR_DEVICE_REMOVED` from whatever unrelated call notices first.
-
-## Prerequisites
-
-- Windows with a DirectX 12 capable GPU
-- Visual Studio with the **Desktop development with C++** workload, including Windows SDK **10.0.26100.0 or newer**. The bindings call DirectML feature level 6.2 and 6.3 entry points, which earlier headers do not expose.
-- CMake 3.15 or newer, on `PATH`. Visual Studio bundles one under `<VS install>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`.
-- Python 3.6 or newer, with `setuptools` and `wheel`
-
-A Visual Studio Developer Command Prompt is *not* required, and the build needs no network access.
-
-## Build and Installation
-
-```powershell
-git clone --recursive https://github.com/aisk/PyDirectML.git
-cd PyDirectML
-
-pip install . --no-build-isolation
-
-# To run the samples, install the extra dependencies as well.
-pip install .[dev] --no-build-isolation
-```
-
-The samples under `samples/` need NumPy, the image samples additionally need Pillow, and `samples/sdxl/` needs `safetensors`, `huggingface_hub` and `transformers` (for its CLIP tokenizer only — no PyTorch). The `dev` extra pulls in all of them.
-
-## Samples
-
-`samples/matmul.py` is the smallest thing that works, and `samples/dtypes.py` runs one graph at float32 and at float16 and shows what `dispatch` refuses. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `candy.py` and `superres.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them.
-
-[`samples/sdxl/`](./samples/sdxl/) is Stable Diffusion XL built on these bindings — both CLIP text encoders, the UNet, the VAE, and the Euler sampler — running against the real SDXL weights. `python generate.py "a prompt"` produces a 1024×1024 image in 63 seconds on a Radeon RX 6800. It reads either the weights diffusers publishes or, with `--checkpoint`, a single-file checkpoint of the kind ComfyUI and A1111 use. The VAE and the text encoders are checked against a NumPy reference implementation that ships with it.
-
-If the repository was cloned without `--recursive`, run `git submodule update --init --recursive` first. The build needs both the `pybind11` and `gpgmm` submodules.
+`directml` is a small Python binding for DirectML: DirectMLX's operators as Python functions, a device and resource layer that stays out of the way, and NumPy arrays in and out. It exists to write DirectML models in Python without a framework in between; `samples/sdxl/` runs Stable Diffusion XL on it.
 
 ## Usage
 
@@ -76,10 +25,55 @@ op = graph.compile([probs])                              # initialized: every we
 result, = op({"image": image})                           # a shaped, typed ndarray
 ```
 
-An input declared with `owned=True` instead of `constant()` is bound at `op.initialize({w: array})` and lives on the GPU from then on. `op(inputs, readback=False)` leaves the outputs on the GPU as `dml.Buffer`s, which the next graph binds in place.
+An input declared with `owned=True` instead of `constant()` is bound once at `op.initialize({w: array})` and lives on the GPU from then on. `op(inputs, readback=False)` leaves the outputs on the GPU as `dml.Buffer`s, which the next graph binds in place.
 
 DirectML's tensors are 4-D (up to 8-D for some operators), and the bindings expose that as it is: a matrix is fed to `gemm` as `[1, 1, M, K]`, and a `[C]` bias is viewed as `[1, C, 1, 1]` before it is broadcast. `samples/matmul.py` shows the reshape on the way in and out.
 
-The API and the reasoning behind it are documented in [docs/api-design.md](./docs/api-design.md).
+The API and the reasoning behind it are in [docs/api-design.md](./docs/api-design.md).
 
-The extension links against the Windows SDK import library and loads the `DirectML.dll` that ships with Windows; nothing is bundled or redistributed. To run against a different build, place that `DirectML.dll` next to the installed `.pyd` in `site-packages`.
+## Differences from upstream
+
+- The module is imported as **`directml`**. `DirectML.h` and `DirectML.lib` come from the Windows SDK and the extension loads the `DirectML.dll` that ships with Windows; nothing is bundled.
+- Inputs are bound as a **dict** from `Expression` (or the `name=` it was given) to an array or `Buffer`, not a list matched by position. `op.initialize({...})` takes the tensors DirectML owns, `op({...})` the rest; a missing, extra, misplaced or mistyped input is a `ValueError` that names it. The library keeps no CPU copy of any weight.
+- **`graph.constant(array)`** declares an owned input and records its data; `compile()` uploads the constants and initializes the operator when they are its only owned inputs.
+- **`dml.Buffer`** is a tensor that stays on the GPU: `op(inputs, readback=False)` returns one per output, a binding dict accepts one in place of an array, `buffer.numpy()` reads it back.
+- **`dml.broadcast(x, shape)`** views a tensor through a larger shape as a zero-stride `reinterpret`. Nothing broadcasts implicitly, and a mismatched elementwise pair is refused where it is written, naming both operands.
+- A tensor's data type is honored on both ends and every API that takes one accepts numpy dtypes. Arrays are converted to the tensor's type when the conversion stays within a dtype kind or NumPy calls it safe; anything else must be an explicit `astype()`. Results come back as arrays of the tensor's type and shape.
+- `initialize` and `dispatch` live on the `CompiledOperator`, which owns its persistent resource, so weights are uploaded once and stay on the GPU. Upstream re-initialized on every `compute`.
+- Operator signatures take tensors positionally and everything else as keywords with DirectMLX's defaults; multi-output operators return namedtuples; `FusedActivation.relu()` and its siblings replace bare `FusedActivation(OperatorType.ACTIVATION_RELU)`. `activation_softmax` takes `axes=`, and `activation_gelu` and `multihead_attention` are bound as well.
+- Arithmetic on `Expression` comes from DirectMLX's overloads with three deviations: `%` is floored like Python's, `float / x` is corrected, and there are no in-place forms. Comparison operators stay identity-based, which is what makes an `Expression` a dict key.
+- `CompiledOperator.temporary_size`, `persistent_size` and `descriptor_count` expose the operator's binding properties, which is the memory budget of a compiled graph.
+- Errors carry the HRESULT by name, and a removed device reports why it was removed. Buffers grow by a fixed step past 256 MiB, because a single D3D12 buffer stops at 4 GiB.
+
+## Prerequisites
+
+- Windows with a DirectX 12 capable GPU
+- Visual Studio with the **Desktop development with C++** workload, including Windows SDK **10.0.26100.0 or newer**. The bindings call DirectML feature level 6.2 and 6.3 entry points, which earlier headers do not expose.
+- Python 3.8 or newer
+
+CMake comes from PyPI as a build requirement; a Visual Studio Developer Command Prompt is not required.
+
+## Build and installation
+
+```powershell
+git clone --recursive https://github.com/aisk/PyDirectML.git
+cd PyDirectML
+
+pip install .                    # the package
+pip install .[samples]           # plus what samples/ needs
+```
+
+If the repository was cloned without `--recursive`, run `git submodule update --init --recursive` first; the build needs both the `pybind11` and `gpgmm` submodules.
+
+To work on the bindings, install in editable mode: the extension is built into `directml/` and imported from the source tree.
+
+```powershell
+pip install -e .[samples,test]
+python -m pytest tests
+```
+
+## Samples
+
+`samples/matmul.py` is the smallest thing that works, and `samples/dtypes.py` runs one graph at float32 and at float16 and shows what `dispatch` refuses. `samples/mnist.py`, `squeezenet.py`, `mobilenet.py`, `superres.py` and `candy.py` come from upstream and run ONNX models from the `.npy` weights checked in beside them, under `samples/<model>_tensor_data/`. `candy.py` takes another style's directory as its second argument: `la_muse_tensor_data`, `mosaic_tensor_data` or `udnie_tensor_data`.
+
+[`samples/sdxl/`](./samples/sdxl/) is Stable Diffusion XL built on these bindings: both CLIP text encoders, the UNet, the VAE, and the Euler sampler, running against the real SDXL weights. `python generate.py "a prompt"` produces a 1024×1024 image in 63 seconds on a Radeon RX 6800. It reads either the weights diffusers publishes or, with `--checkpoint`, a single-file checkpoint of the kind ComfyUI and A1111 use. The VAE and the text encoders are checked against a NumPy reference implementation that ships with it.
