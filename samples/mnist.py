@@ -48,8 +48,8 @@ def load(file_name):
 input = graph.input([1, 1, 28, 28])
 
 # convolution28
-convolution28_weight = graph.input([8, 1, 5, 5], owned=True)
-convolution28_bias = graph.input([1, 8, 1, 1], owned=True)
+convolution28_weight = graph.constant(load("Parameter5.npy"), np.float32, sizes=[8, 1, 5, 5])
+convolution28_bias = graph.constant(np.zeros([1, 8, 1, 1], np.float32))
 convolution28 = dml.convolution(input, convolution28_weight, convolution28_bias, strides = [1, 1], start_padding = [2, 2], end_padding = [2, 2])
 
 # plus30
@@ -63,8 +63,8 @@ relu32 = dml.activation_relu(plus30)
 pooling66 = dml.max_pooling(relu32, strides = [2, 2], window_sizes = [2, 2])
 
 # convolution110
-convolution110_weight = graph.input([16, 8, 5, 5], owned=True)
-convolution110_bias = graph.input([1, 16, 1, 1], owned=True)
+convolution110_weight = graph.constant(load("Parameter87.npy"), np.float32, sizes=[16, 8, 5, 5])
+convolution110_bias = graph.constant(np.zeros([1, 16, 1, 1], np.float32))
 convolution110 = dml.convolution(pooling66.values, convolution110_weight, convolution110_bias, strides = [1, 1], start_padding = [2, 2], end_padding = [2, 2])
 
 # plus112
@@ -81,7 +81,7 @@ pooling160 = dml.max_pooling(relu114, strides = [3, 3], window_sizes = [3, 3])
 times212_reshape0 = dml.reinterpret(pooling160.values, [1, 1, 1, 256], [256, 256, 256, 1])
 
 # times212_reshape1
-times212_reshape1_param193 = graph.input([16, 4, 4, 10], owned=True)
+times212_reshape1_param193 = graph.constant(load("Parameter193.npy"), np.float32, sizes=[16, 4, 4, 10])
 identity = dml.activation_identity(times212_reshape1_param193)
 times212_reshape1 = dml.reinterpret(identity, [1, 1, 256, 10], [2560, 2560, 10, 1])
 
@@ -89,23 +89,12 @@ times212_reshape1 = dml.reinterpret(identity, [1, 1, 256, 10], [2560, 2560, 10, 
 times212 = dml.gemm(times212_reshape0, times212_reshape1)
 
 # plus214
-plus214_param194 = graph.input([1, 1, 1, 10], owned=True)
+plus214_param194 = graph.constant(load("Parameter194.npy"), np.float32, sizes=[1, 1, 1, 10])
 plus214 = dml.add(times212, plus214_param194)
 
 softmax = dml.activation_softmax(plus214)
 # Compile the expression graph into a compiled operator
 op = graph.compile([softmax])
-
-# The weights DirectML owns are read once here; the rest ride along with each
-# dispatch.
-op.initialize({
-    convolution28_weight: load("Parameter5.npy"),
-    convolution28_bias: np.zeros([1, 8, 1, 1]),
-    convolution110_weight: load("Parameter87.npy"),
-    convolution110_bias: np.zeros([1, 16, 1, 1]),
-    times212_reshape1_param193: load("Parameter193.npy"),
-    plus214_param194: load("Parameter194.npy"),
-})
 
 # Compute the result
 output_tensor, = op({

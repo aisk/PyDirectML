@@ -58,7 +58,7 @@ to survive the trip through this decoder.
 
 | File | |
 | --- | --- |
-| `dml_layers.py` | Conv, GroupNorm, LayerNorm, SiLU, attention -- the layers, as DirectML expressions |
+| `dml_layers.py` | Conv, GroupNorm, LayerNorm, SiLU, attention -- the layers, as DirectML expressions -- and `Model`, which names what feeds which input |
 | `vae.py` | The encoder and decoder graphs |
 | `text_encoder.py` | Both CLIP towers, and the tokenizing that feeds them |
 | `unet.py` | The UNet, as two graphs |
@@ -404,8 +404,9 @@ Classifier-free guidance runs the UNet twice per step, once under the negative
 conditioning and once under the positive, and the two differ only in two of the
 four input tensors. Putting them through as one batch of two is the obvious
 optimization, and `--cfg-batch` does it: every graph here already takes its batch
-from `sizes()`, so it needed only wider placeholders and one broadcast, since a
-`gemm` will not take a weight whose batch axis disagrees with its activation's.
+from its input's `.shape`, so it needed only wider placeholders and one
+`dml.broadcast`, since a `gemm` will not take a weight whose batch axis disagrees
+with its activation's.
 
 It is slower. 768x768, 10 steps, one prompt:
 

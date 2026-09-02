@@ -22,7 +22,7 @@
 | --- | --- | --- |
 | `pydml::Device`（D3D12 + `IDMLDevice`） | `dml.Device` | 已有；执行方法移到 `CompiledOperator` 上（§4.7） |
 | `dml::Graph` | `dml.Graph` | 现名 `GraphBuilder`，改回 `Graph` 与 C++ 对齐；`compile` 对齐 `Graph::Compile`；构造补 `tensor_policy=` —— 图级 policy 现在进不去（`DirectMLX.h:3437` 走 `builder->GetTensorPolicy()`），中间张量只能是 `Default` |
-| `dml::Expression` | `dml.Expression` | 已有；加 `.shape` / `.strides` / `.dtype` / `.desc` 属性并实现可哈希（§4.3） |
+| `dml::Expression` | `dml.Expression` | 已有；加 `.shape` / `.strides` / `.dtype` / `.size` / `.desc` 属性并实现可哈希（§4.3） |
 | `dml::InputTensor` + 已知的权重数据 | `graph.constant(array)` | 【已落地】声明 owned 输入并记下数据，`compile` 上传（§4.11） |
 | `dml::TensorDesc` | `dml.TensorDesc` | 已有；4 个靠实参类型消歧的重载收敛成单一构造 + 关键字默认值（§4.4） |
 | `IDMLCompiledOperator` + persistent resource | `dml.CompiledOperator` | 现名 `Model`，名字误导 —— 它不含权重、不含输入绑定，只是编译好的算子，sample 里的变量名 `op = builder.build(...)` 说明作者自己也不认这个名字。persistent resource 已在它身上【已落地】，`initialize` / `dispatch` 跟着资源走（§4.7） |
@@ -113,7 +113,7 @@ dict 方案不是给这份契约加护栏，而是让它不存在，一次解决
 
 ### 4.3 `Expression` 的属性与可哈希
 
-加 `.shape`（tuple）、`.strides`、`.dtype`（numpy dtype）、`.desc`（完整 `TensorDesc`）。`dml_layers.py` 开头的 `sizes()` 和 `data_type()` 两个 helper 就是这条的直接证据。`get_output_desc()` 这种 getter 换成属性。`__repr__` 输出 `<dml.Expression float16 [1, 64, 512, 512]>`，调试图结构时省一半功夫。
+加 `.shape`（tuple）、`.strides`、`.dtype`（numpy dtype）、`.size`（元素数）、`.desc`（完整 `TensorDesc`）；`Buffer` 用同一套（§4.10）。`dml_layers.py` 开头的 `sizes()` 和 `data_type()` 两个 helper 就是这条的直接证据。`get_output_desc()` 这种 getter 换成属性。`__repr__` 输出 `<dml.Expression float16 [1, 64, 512, 512]>`，调试图结构时省一半功夫。
 
 默认构造已删除【已落地 40baaad】—— `Expression::Impl()` 的 `m_nodeOutput` 是 nullptr，`dml.Expression().get_output_desc()` 曾直接段错误。
 
@@ -122,7 +122,7 @@ dict 方案不是给这份契约加护栏，而是让它不存在，一次解决
 `input_tensor(builder, index, desc)` 变成 `Graph` 的方法 —— 概念仍是 `dml::InputTensor`，但归属关系摆到语法上，index 由 graph 自动分配。签名：
 
 ```python
-graph.input(sizes=None, dtype=np.float32, *, owned=False, strides=None, desc=None)
+graph.input(sizes=None, dtype=np.float32, *, owned=False, strides=None, desc=None, name=None)
 ```
 
 常用路径不碰 `TensorDesc` 和 `TensorFlags`；要精确控制（`total_tensor_size_in_bytes`、`guaranteed_base_offset_alignment`）就传完整 `desc=`，此时其余参数一律非法（`TypeError`，`sizes` 也不例外）—— desc 里已经写了一遍的东西再收一遍，就得回答「哪个赢」，而这正是 §4.1 刚消灭掉的那类隐式契约。`TensorDesc` 本身收敛成一个构造函数加关键字默认值。
@@ -285,12 +285,11 @@ device = dml.Device(use_gpu=True, use_debug_layer=True)
 graph = dml.Graph(device)
 
 x = graph.input([1, 1, 28, 28])
-w = graph.input([8, 1, 5, 5], owned=True)
-b = graph.input([1, 8, 1, 1], owned=True)
+w = graph.constant(np.load(path / "Parameter5.npy"))
+b = graph.constant(np.zeros([1, 8, 1, 1], np.float32))
 conv = dml.convolution(x, w, b, strides=[1, 1], start_padding=[2, 2], end_padding=[2, 2])
 ...
-op = graph.compile([softmax])
-op.initialize({w: np.load(path / "Parameter5.npy"), b: np.zeros([1, 8, 1, 1], np.float32)})
+op = graph.compile([softmax])                  # the constants go up here
 probs, = op({x: rescaled_image})
 ```
 
@@ -351,7 +350,7 @@ UNet 的两半之间（§4.10）：`self.down.run(..., readback=False)` 留下�
 6. 算子签名：`py::kw_only()`、默认值与参数顺序、改名、`average_pooling` 的 `output_sizes`、`reinterpret` 新签名、`Size2D` → 元组（§4.5）；`FusedActivation` 工厂和 namedtuple 输出落在包装层（§4.5 / §4.6）。
 7. docstring 的 Args / Returns / Raises（包装层）+ 存根（§4.8）。
 8. `dml_layers.Model` 缩到 §5 的形态（其余 sample 改写已随第 4-6 步就地完成）。
-9. 【已落地】第二轮，来自对 1-8 落地后的第一性原理复查：`dml.Buffer`（§4.10）、`graph.constant`（§4.11）、`dml.broadcast`（§4.12）、`name=`（§4.13）、逐元素 shape 校验（§4.9）、包装层统一为挂载而非子类（§4.8）。sdxl 的 `Model` 随之缩到 §5 的最终形态，UNet 两半之间改走 `Buffer`。
+9. 【已落地】第二轮，来自对 1-8 落地后的第一性原理复查：`dml.Buffer`（§4.10）、`graph.constant`（§4.11）、`dml.broadcast`（§4.12）、`name=`（§4.13）、逐元素 shape 校验（§4.9）、包装层统一为挂载而非子类（§4.8）。sdxl 的 `Model` 随之缩到 §5 的最终形态，UNet 两半之间改走 `Buffer`；五个经典 sample 的 `weights` 字典和 `initialize` 调用全部换成 `constant`。
 
 ## 7. 已拍板的争议项
 

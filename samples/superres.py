@@ -39,45 +39,32 @@ img_5 = img_4.astype(np.float32) / 255.0
 device = dml.Device(use_debug_layer=True)
 graph = dml.Graph(device)
 
+def load(file_name):
+    return tensor_data.load(tensor_data_path + '/' + file_name)
+
 input = graph.input([batch_size, 1, 224, 224])
 
 # conv1
-conv1_filter = graph.input([64, 1, 5, 5], owned=True)
-conv1_bias = graph.input([1,64,1,1], owned=True)
+conv1_filter = graph.constant(load("conv1.weight.npy"), np.float32, sizes=[64, 1, 5, 5])
+conv1_bias = graph.constant(load("conv1.bias.npy"), np.float32, sizes=[1,64,1,1])
 conv1 = dml.convolution(input, conv1_filter, conv1_bias, start_padding = [2,2], end_padding = [2,2], fused_activation = dml.FusedActivation.relu())
 
 # conv2
-conv2_filter = graph.input([64,64,3,3], owned=True)
-conv2_bias = graph.input([1,64,1,1], owned=True)
+conv2_filter = graph.constant(load("conv2.weight.npy"), np.float32, sizes=[64,64,3,3])
+conv2_bias = graph.constant(load("conv2.bias.npy"), np.float32, sizes=[1,64,1,1])
 conv2 = dml.convolution(conv1, conv2_filter, conv2_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation.relu())
 
 # conv3
-conv3_filter = graph.input([32,64,3,3], owned=True)
-conv3_bias = graph.input([1,32,1,1], owned=True)
+conv3_filter = graph.constant(load("conv3.weight.npy"), np.float32, sizes=[32,64,3,3])
+conv3_bias = graph.constant(load("conv3.bias.npy"), np.float32, sizes=[1,32,1,1])
 conv3 = dml.convolution(conv2, conv3_filter, conv3_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation.relu())
 
-conv4_filter = graph.input([9, 32, 3, 3], owned=True)
-conv4_bias = graph.input([1,9,1,1], owned=True)
+conv4_filter = graph.constant(load("conv4.weight.npy"), np.float32, sizes=[9, 32, 3, 3])
+conv4_bias = graph.constant(load("conv4.bias.npy"), np.float32, sizes=[1,9,1,1])
 conv4 = dml.convolution(conv3, conv4_filter, conv4_bias, start_padding = [1,1], end_padding = [1,1], fused_activation = dml.FusedActivation.relu())
 
 # Compile the expression graph into a compiled operator
-op = graph.compile([conv4])
-
-# Model inputs in the previously designated order
-inputs = [
-        (conv1_filter,"conv1.weight.npy"), 
-        (conv1_bias,"conv1.bias.npy"), 
-        (conv2_filter,"conv2.weight.npy"), 
-        (conv2_bias,"conv2.bias.npy"), 
-        (conv3_filter,"conv3.weight.npy"), 
-        (conv3_bias,"conv3.bias.npy"), 
-        (conv4_filter,"conv4.weight.npy"), 
-        (conv4_bias,"conv4.bias.npy")
-]
-
-# Every filter and bias is owned by DirectML, so they are all read once here.
-op.initialize({tensor: tensor_data.load(tensor_data_path + '/' + file_name)
-               for tensor, file_name in inputs})
+op = graph.compile([conv4])            # every filter and bias went up here
 
 # Compute the result
 output_tensor, = op({input: img_5})

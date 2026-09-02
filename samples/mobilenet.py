@@ -35,19 +35,18 @@ mean = np.array([[[0.485]],[[ 0.456]],[[0.406]]])
 standard_deviation = np.array([[[0.229]],[[0.224]],[[0.225]]])
 processed_image = (rescaled_image - mean) / standard_deviation
 
-weights = {}      # tensors DirectML owns, read once at initialize
 feeds = {}        # tensors bound per dispatch
 
 def append_input_tensor(graph: dml.Graph, sizes: list, owned: bool, file_name: str):
-    tensor = graph.input(sizes, owned=owned)
     if file_name == "":
-        array = np.zeros(tensor.shape)
+        array = np.zeros(sizes, np.float32)
     else:
         array = tensor_data.load(tensor_data_path + "/" + file_name)
     if owned:
-        weights[tensor] = array
-    else:
-        feeds[tensor] = array
+        # A weight: the graph records it now and uploads it at compile.
+        return graph.constant(array, np.float32, sizes=sizes)
+    tensor = graph.input(sizes)
+    feeds[tensor] = array
     return tensor
 
 # Create a GPU device, and build a model graph.
@@ -738,8 +737,6 @@ soft_max = dml.activation_softmax(reshape)
 
 # Compile the expression graph into a compiled operator
 op = graph.compile([soft_max])
-
-op.initialize(weights)
 
 # Compute the result
 output_tensor, = op({input: processed_image, **feeds})
