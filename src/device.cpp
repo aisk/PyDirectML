@@ -6,18 +6,20 @@
 
 #include "precomp.h"
 
+// CD3DX12_RESOURCE_BARRIER::Transition() returns a temporary whose address is
+// taken; MSVC flags that as a non-standard extension.
 #pragma warning(push)
 #pragma warning(disable:4238)
 
 using namespace pydml;
 using Microsoft::WRL::ComPtr;
 
-// An adapter called the "Microsoft Basic Render Driver" is always present. This adapter is a render-only device that has no display outputs.
+// The "Microsoft Basic Render Driver" is always present and has no display
+// outputs; skip it when looking for a real GPU.
 bool IsWarpAdapter(IDXGIAdapter1* pAdapter)
 {
     DXGI_ADAPTER_DESC1 pDesc;
     ThrowIfFailed(pAdapter->GetDesc1(&pDesc));
-    // See here for documentation on filtering WARP adapter:
     // https://docs.microsoft.com/en-us/windows/desktop/direct3ddxgi/d3d10-graphics-programming-guide-dxgi#new-info-about-enumerating-adapters-for-windows-8
     auto isBasicRenderDriverVendorId = pDesc.VendorId == 0x1414;
     auto isBasicRenderDriverDeviceId = pDesc.DeviceId == 0x8c;
@@ -25,13 +27,9 @@ bool IsWarpAdapter(IDXGIAdapter1* pAdapter)
     return isSoftwareAdapter || (isBasicRenderDriverVendorId && isBasicRenderDriverDeviceId);
 }
 
-Device::Device(bool useGpu, bool useDebugLayer, DXGI_GPU_PREFERENCE gpuPreference) :
-    m_useGpu(useGpu), m_gpuPreference(gpuPreference)
+Device::Device(bool useGpu, bool useDebugLayer) :
+    m_useGpu(useGpu)
 {
-    // 
-    // Create D3D12 resources
-    //
-
     if (useDebugLayer)
     {
         ComPtr<ID3D12Debug> debugController;
@@ -47,7 +45,7 @@ Device::Device(bool useGpu, bool useDebugLayer, DXGI_GPU_PREFERENCE gpuPreferenc
         ComPtr<IDXGIFactory6> spFactory;
         ThrowIfFailed(CreateDXGIFactory1(IID_PPV_ARGS(&spFactory)));
         UINT i = 0;
-        while (spFactory->EnumAdapterByGpuPreference(i, m_gpuPreference, IID_PPV_ARGS(&dxgiAdapter)) != DXGI_ERROR_NOT_FOUND)
+        while (spFactory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_UNSPECIFIED, IID_PPV_ARGS(&dxgiAdapter)) != DXGI_ERROR_NOT_FOUND)
         {
             if (!IsWarpAdapter(dxgiAdapter.Get()))
             {
@@ -57,7 +55,7 @@ Device::Device(bool useGpu, bool useDebugLayer, DXGI_GPU_PREFERENCE gpuPreferenc
         }
     }
 
-    if (    !useGpu 
+    if (    !useGpu
         ||  FAILED(D3D12CreateDevice(dxgiAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_d3d12Device))))
     {
         ComPtr<IDXGIFactory4> dxgiFactory;
@@ -94,34 +92,20 @@ Device::Device(bool useGpu, bool useDebugLayer, DXGI_GPU_PREFERENCE gpuPreferenc
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
     queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    ThrowIfFailed(m_d3d12Device->CreateCommandQueue(&queueDesc, IID_GRAPHICS_PPV_ARGS(m_commandQueue.GetAddressOf())));
+    ThrowIfFailed(m_d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(m_commandQueue.GetAddressOf())));
 
     ThrowIfFailed(m_d3d12Device->CreateCommandAllocator(
         D3D12_COMMAND_LIST_TYPE_COMPUTE,
-        IID_GRAPHICS_PPV_ARGS(m_commandAllocator.GetAddressOf())));
+        IID_PPV_ARGS(m_commandAllocator.GetAddressOf())));
 
     ThrowIfFailed(m_d3d12Device->CreateCommandList(
         0, // node mask
         D3D12_COMMAND_LIST_TYPE_COMPUTE,
         m_commandAllocator.Get(),
         nullptr, // initial pipeline state
-        IID_GRAPHICS_PPV_ARGS(m_commandList.GetAddressOf())));
+        IID_PPV_ARGS(m_commandList.GetAddressOf())));
 
-    D3D12_DESCRIPTOR_HEAP_DESC descriptorHeapDesc = {};
-    descriptorHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptorHeapDesc.NumDescriptors = 4; // One each for the input, output, persistent, and temporary resources
-    descriptorHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    ThrowIfFailed(m_d3d12Device->CreateDescriptorHeap(&descriptorHeapDesc, IID_GRAPHICS_PPV_ARGS(m_clearUavDescriptorHeapCpu.GetAddressOf())));
-
-    descriptorHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    ThrowIfFailed(m_d3d12Device->CreateDescriptorHeap(&descriptorHeapDesc, IID_GRAPHICS_PPV_ARGS(m_clearUavDescriptorHeapGpu.GetAddressOf())));
-
-
-    // 
-    // Create DML resources
-    //
-
-    if (    !useDebugLayer 
+    if (    !useDebugLayer
         ||  FAILED(DMLCreateDevice(m_d3d12Device.Get(), DML_CREATE_DEVICE_FLAG_DEBUG, IID_PPV_ARGS(&m_dmlDevice))))
     {
         ThrowIfFailed(DMLCreateDevice(m_d3d12Device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&m_dmlDevice)));
@@ -138,16 +122,9 @@ Graph::Graph(std::shared_ptr<Device> device, dml::TensorPolicy tensorPolicy) :
 {
 }
 
-dml::Expression Graph::Input(uint32_t index, dml::TensorDesc desc)
+dml::Expression Graph::Input(dml::TensorDesc desc)
 {
-    if (index != slots.size())
-    {
-        throw std::invalid_argument(
-            "input index " + std::to_string(index) + " is out of order; the graph's next input is " +
-            std::to_string(slots.size()));
-    }
-
-    auto expression = dml::InputTensor(graph, index, desc);
+    auto expression = dml::InputTensor(graph, static_cast<uint32_t>(slots.size()), desc);
     slots.push_back(InputSlot {
         reinterpret_cast<uintptr_t>(expression.Impl()),
         expression.GetOutputDesc(),
@@ -171,9 +148,23 @@ CompiledOperator::CompiledOperator(
     }
 }
 
+// Append a binding for `desc` at the end of a resource being laid out, aligned
+// as the tensor demands, and return the binding with its buffer still unset.
+static DML_BUFFER_BINDING AppendBinding(dml::TensorDesc const& desc, uint64_t& resourceSize)
+{
+    uint32_t alignment = std::max(desc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
+
+    DML_BUFFER_BINDING binding = {};
+    binding.Offset = RoundUpToMultiple(resourceSize, static_cast<uint64_t>(alignment));
+    binding.SizeInBytes = desc.totalTensorSizeInBytes;
+
+    resourceSize = binding.Offset + binding.SizeInBytes;
+    return binding;
+}
+
 void Device::CopyArrayToUploadHeap(
     byte* uploadHeapData,
-    DmlBufferBinding const& binding,
+    DML_BUFFER_BINDING const& binding,
     py::array const& array,
     uint32_t index
     )
@@ -181,22 +172,22 @@ void Device::CopyArrayToUploadHeap(
     py::buffer_info info = array.request();
     auto sizeInBytes = static_cast<uint64_t>(info.size) * static_cast<uint64_t>(info.itemsize);
 
-    if ((array.flags() & py::array::c_style) == 0 || sizeInBytes > binding.sizeInBytes)
+    if ((array.flags() & py::array::c_style) == 0 || sizeInBytes > binding.SizeInBytes)
     {
         throw std::invalid_argument(
             "staged input " + std::to_string(index) +
             " is not a contiguous array that fits its tensor");
     }
 
-    byte* dest = uploadHeapData + binding.offset;
+    byte* dest = uploadHeapData + binding.Offset;
     memcpy(dest, info.ptr, static_cast<size_t>(sizeInBytes));
 
     // DirectML rounds a tensor's size up to a 4-byte boundary, so a packed
     // array can come up a few bytes short of it; the tail still has to hold
     // defined values.
-    if (sizeInBytes < binding.sizeInBytes)
+    if (sizeInBytes < binding.SizeInBytes)
     {
-        memset(dest + sizeInBytes, 0, static_cast<size_t>(binding.sizeInBytes - sizeInBytes));
+        memset(dest + sizeInBytes, 0, static_cast<size_t>(binding.SizeInBytes - sizeInBytes));
     }
 }
 
@@ -242,7 +233,7 @@ void Device::RecordCopyFromBuffer(ID3D12Resource* destination, ID3D12Resource* r
         );
 }
 
-DmlBufferBinding Device::BindBuffer(pydml::Buffer const& buffer, dml::TensorDesc const& desc, uint32_t index)
+DML_BUFFER_BINDING Device::BindBuffer(pydml::Buffer const& buffer, dml::TensorDesc const& desc, uint32_t index)
 {
     if (buffer.device.get() != this)
     {
@@ -259,17 +250,17 @@ DmlBufferBinding Device::BindBuffer(pydml::Buffer const& buffer, dml::TensorDesc
 
     buffer.resource->UpdateResidency(&m_residencySet);
 
-    DmlBufferBinding binding;
-    binding.buffer = buffer.resource->GetResource();
-    binding.offset = 0;
-    binding.sizeInBytes = desc.totalTensorSizeInBytes;
+    DML_BUFFER_BINDING binding = {};
+    binding.Buffer = buffer.resource->GetResource();
+    binding.Offset = 0;
+    binding.SizeInBytes = desc.totalTensorSizeInBytes;
     return binding;
 }
 
 void Device::UploadStagedInputs(
     py::iterable staged,
     std::vector<pydml::InputSlot> const& slots,
-    std::vector<DmlBufferBinding> const& bindings,
+    std::vector<DML_BUFFER_BINDING> const& bindings,
     gpgmm::d3d12::ResourceAllocation* inputsResource,
     uint64_t inputsResourceSize,
     bool owned
@@ -280,10 +271,10 @@ void Device::UploadStagedInputs(
         return;
     }
 
-    // Copy the data into the upload heap. The wrapper layer validated shapes and
-    // dtypes and converts one array at a time as this loop pulls on `staged`, so
-    // only one converted copy is alive at once; the guards below only keep a bad
-    // caller of the private API from corrupting a neighboring tensor's bytes.
+    // The wrapper layer validated shapes and dtypes and converts one array at a
+    // time as this loop pulls on `staged`, so only one converted copy is alive
+    // at once. The guards below only keep a bad caller of the private API from
+    // corrupting a neighboring tensor's bytes.
     byte* uploadHeapData = nullptr;
     ThrowIfFailed(m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&uploadHeapData)));
 
@@ -300,7 +291,7 @@ void Device::UploadStagedInputs(
                     "staged input " + std::to_string(index) + " is not bound in this phase");
             }
 
-            if (bindings[index].buffer != inputsResource->GetResource())
+            if (bindings[index].Buffer != inputsResource->GetResource())
             {
                 throw std::invalid_argument(
                     "staged input " + std::to_string(index) + " is already bound to a Buffer");
@@ -334,21 +325,20 @@ py::list Device::Dispatch(
 
     IDMLCompiledOperator* op = model.op.Get();
 
-    std::vector<DmlBufferBinding> inputBindings(model.inputs.size());
+    // Lay out the inputs: owned ones live in the persistent resource and are
+    // not bound here, Buffers are bound where they are, and the rest are
+    // packed into the device's inputs resource.
+    std::vector<DML_BUFFER_BINDING> inputBindings(model.inputs.size());
     uint64_t inputsResourceSize = 0;
 
     for (size_t i = 0; i < model.inputs.size(); ++i)
     {
         auto& slot = model.inputs[i];
-
-        // An input owned by DirectML lives in the persistent resource and is
-        // not bound at execution.
         if (slot.owned)
         {
             continue;
         }
 
-        // One already on the GPU is bound where it is.
         auto bound = buffers.find(static_cast<uint32_t>(i));
         if (bound != buffers.end())
         {
@@ -356,94 +346,67 @@ py::list Device::Dispatch(
             continue;
         }
 
-        DmlBufferTensorDesc desc = *slot.desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-        uint32_t requiredAlignment = std::max(desc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
-
-        // Bind to the end of the inputs resource (with appropriate alignment)
-        inputBindings[i].offset = RoundUpToMultiple(inputsResourceSize, (uint64_t)requiredAlignment);
-        inputBindings[i].sizeInBytes = desc.totalTensorSizeInBytes;
-
-        inputsResourceSize = inputBindings[i].offset + desc.totalTensorSizeInBytes;
+        inputBindings[i] = AppendBinding(slot.desc, inputsResourceSize);
     }
 
-    std::vector<DmlBufferBinding> outputBindings(model.outputDescs.size());
+    // Lay out the outputs: a resource of its own per output when they stay on
+    // the GPU, otherwise packed into the device's outputs resource.
+    std::vector<DML_BUFFER_BINDING> outputBindings(model.outputDescs.size());
     std::vector<std::shared_ptr<pydml::Buffer>> outputBuffers;
     uint64_t outputsResourceSize = 0;
 
     for (size_t i = 0; i < model.outputDescs.size(); ++i)
     {
-        DmlBufferTensorDesc bufferDesc = *model.outputDescs[i].AsPtr<DML_BUFFER_TENSOR_DESC>();
+        auto const& desc = model.outputDescs[i];
 
-        if (!readback)
+        if (readback)
         {
-            // Each output gets a resource of its own that the caller keeps.
-            auto resource = CreateDefaultBuffer(
-                m_resourceAllocator.Get(),
-                RoundUpToMultiple<uint64_t>(bufferDesc.totalTensorSizeInBytes, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT));
-            resource->UpdateResidency(&m_residencySet);
-
-            outputBindings[i].buffer = resource->GetResource();
-            outputBindings[i].offset = 0;
-            outputBindings[i].sizeInBytes = bufferDesc.totalTensorSizeInBytes;
-            outputBuffers.push_back(std::make_shared<pydml::Buffer>(model.device, model.outputDescs[i], std::move(resource)));
+            outputBindings[i] = AppendBinding(desc, outputsResourceSize);
             continue;
         }
 
-        uint32_t requiredAlignment = std::max(bufferDesc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
+        auto resource = CreateDefaultBuffer(
+            m_resourceAllocator.Get(),
+            RoundUpToMultiple<uint64_t>(desc.totalTensorSizeInBytes, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT));
+        resource->UpdateResidency(&m_residencySet);
 
-        // Bind to the end of the outputs resource (with appropriate alignment)
-        outputBindings[i].offset = RoundUpToMultiple(outputsResourceSize, (uint64_t)requiredAlignment);
-        outputBindings[i].sizeInBytes = bufferDesc.totalTensorSizeInBytes;
-
-        outputsResourceSize = outputBindings[i].offset + outputBindings[i].sizeInBytes;
+        outputBindings[i].Buffer = resource->GetResource();
+        outputBindings[i].Offset = 0;
+        outputBindings[i].SizeInBytes = desc.totalTensorSizeInBytes;
+        outputBuffers.push_back(std::make_shared<pydml::Buffer>(model.device, desc, std::move(resource)));
     }
 
     DML_BINDING_PROPERTIES bindingProps = op->GetBindingProperties();
 
     EnsureUploadHeapSize(inputsResourceSize);
-    EnsureCpuOrDefaultBufferSize(inputsResourceSize, m_inputsResource);
+    EnsureDefaultBufferSize(inputsResourceSize, m_inputsResource);
     if (readback)
     {
         EnsureReadBackHeapSize(outputsResourceSize);
-        EnsureCpuOrDefaultBufferSize(outputsResourceSize, m_outputsResource);
+        EnsureDefaultBufferSize(outputsResourceSize, m_outputsResource);
     }
     EnsureDefaultBufferSize(bindingProps.TemporaryResourceSize, m_temporaryResource);
     EnsureDescriptorHeapSize(bindingProps.RequiredDescriptorCount);
 
-    // Inputs and outputs without a resource of their own share the device's.
     for (auto& binding : inputBindings)
     {
-        if (binding.sizeInBytes != 0 && binding.buffer == nullptr)
+        if (binding.SizeInBytes != 0 && binding.Buffer == nullptr)
         {
-            binding.buffer = m_inputsResource->GetResource();
+            binding.Buffer = m_inputsResource->GetResource();
         }
     }
 
     for (auto& binding : outputBindings)
     {
-        if (binding.sizeInBytes != 0 && binding.buffer == nullptr)
+        if (binding.SizeInBytes != 0 && binding.Buffer == nullptr)
         {
-            binding.buffer = m_outputsResource->GetResource();
+            binding.Buffer = m_outputsResource->GetResource();
         }
     }
 
-    // The persistent resource should have already been initialized when the operator was initialized
     assert(model.persistentResource->GetResource()->GetDesc().Width >= bindingProps.PersistentResourceSize);
 
-    // Upload inputs for execution
-    std::vector<ID3D12Resource*> buffersToClear =
-    {
-        m_inputsResource->GetResource(),
-        m_temporaryResource->GetResource(),
-        readback ? m_outputsResource->GetResource() : nullptr
-    };
-
-    ClearGpuBuffers(buffersToClear);
-
     UploadStagedInputs(staged, model.inputs, inputBindings, m_inputsResource.Get(), inputsResourceSize, false);
-
-    // Bind for execution
-    DmlTypeConverter<1024> converter;
 
     DML_BINDING_TABLE_DESC bindingTableDesc = {};
     bindingTableDesc.Dispatchable = op;
@@ -453,25 +416,24 @@ py::list Device::Dispatch(
 
     ThrowIfFailed(m_bindingTable->Reset(&bindingTableDesc));
 
-    // Bind inputs
     std::vector<DML_BINDING_DESC> inputBindingDescs(inputBindings.size());
     for (size_t i = 0; i < inputBindings.size(); ++i)
     {
-        inputBindingDescs[i] = converter.ToBindingDesc(inputBindings[i]);
+        inputBindingDescs[i] = inputBindings[i].SizeInBytes != 0
+            ? DML_BINDING_DESC { DML_BINDING_TYPE_BUFFER, &inputBindings[i] }
+            : DML_BINDING_DESC { DML_BINDING_TYPE_NONE, nullptr };
     }
 
     m_bindingTable->BindInputs(static_cast<uint32_t>(inputBindingDescs.size()), inputBindingDescs.data());
 
-    // Bind outputs
     std::vector<DML_BINDING_DESC> outputBindingDescs(outputBindings.size());
     for (size_t i = 0; i < outputBindings.size(); ++i)
     {
-        outputBindingDescs[i] = converter.ToBindingDesc(outputBindings[i]);
+        outputBindingDescs[i] = DML_BINDING_DESC { DML_BINDING_TYPE_BUFFER, &outputBindings[i] };
     }
 
     m_bindingTable->BindOutputs(static_cast<uint32_t>(outputBindingDescs.size()), outputBindingDescs.data());
 
-    // Bind persistent/temporary resources
     if (bindingProps.PersistentResourceSize != 0)
     {
         DML_BUFFER_BINDING persistentBinding = { model.persistentResource->GetResource(), 0, bindingProps.PersistentResourceSize };
@@ -486,7 +448,6 @@ py::list Device::Dispatch(
         m_bindingTable->BindTemporaryResource(&bindingDesc);
     }
 
-    // Record and execute commands, and wait for completion
     m_commandList->SetDescriptorHeaps(1, m_descriptorHeap->m_Heap.GetAddressOf());
     m_commandRecorder->RecordDispatch(m_commandList.Get(), op, m_bindingTable.Get());
 
@@ -505,20 +466,13 @@ py::list Device::Dispatch(
         return outputs;
     }
 
-    RecordOutputReadBack(outputsResourceSize);
-    ExecuteCommandListAndWait();
-
-    // Read the output data back from the readback heap
-    return DownloadFromReadBackHeap(outputsResourceSize, model.outputDescs, outputBindings);
-}
-
-void Device::RecordOutputReadBack(uint64_t outputsResourceSize)
-{
-    // Copy output to readback heap
     if (outputsResourceSize != 0)
     {
         RecordCopyFromBuffer(m_readbackHeap->GetResource(), m_outputsResource->GetResource(), outputsResourceSize);
     }
+    ExecuteCommandListAndWait();
+
+    return DownloadFromReadBackHeap(outputsResourceSize, model.outputDescs, outputBindings);
 }
 
 py::array Device::ReadArray(byte const* data, dml::TensorDesc const& desc)
@@ -547,7 +501,7 @@ py::array Device::ReadArray(byte const* data, dml::TensorDesc const& desc)
 py::list Device::DownloadFromReadBackHeap(
     uint64_t outputsResourceSize,
     std::vector<dml::TensorDesc> const& outputDescs,
-    std::vector<DmlBufferBinding>& outputBindings
+    std::vector<DML_BUFFER_BINDING> const& outputBindings
     )
 {
     py::list outputs;
@@ -562,7 +516,7 @@ py::list Device::DownloadFromReadBackHeap(
 
         for (size_t i = 0; i < outputDescs.size(); ++i)
         {
-            outputs.append(ReadArray(readbackHeapData + outputBindings[i].offset, outputDescs[i]));
+            outputs.append(ReadArray(readbackHeapData + outputBindings[i].Offset, outputDescs[i]));
         }
 
         m_readbackHeap->Unmap(0, nullptr);
@@ -582,10 +536,7 @@ std::shared_ptr<pydml::Buffer> Device::Upload(dml::TensorDesc desc, py::array ar
 
     EnsureUploadHeapSize(sizeInBytes);
 
-    DmlBufferBinding binding;
-    binding.buffer = nullptr;
-    binding.offset = 0;
-    binding.sizeInBytes = sizeInBytes;
+    DML_BUFFER_BINDING binding = { nullptr, 0, sizeInBytes };
 
     byte* uploadHeapData = nullptr;
     ThrowIfFailed(m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&uploadHeapData)));
@@ -648,38 +599,29 @@ void Device::Initialize(
 {
     IDMLCompiledOperator* op = model.op.Get();
 
-    // Allocate resources for initialization
     ThrowIfFailed(m_operatorInitializer->Reset(1, &op));
 
-    DmlBufferArrayBinding inputBinding;
-    inputBinding.bindings.resize(model.inputs.size());
-
-    // Fill in the offsets and sizes for each binding, which will also tell us how big we need to make our buffer
+    // Only the inputs owned by DirectML are bound at initialize; the initializer
+    // takes them as one buffer array with an entry per graph input.
+    std::vector<DML_BUFFER_BINDING> inputBindings(model.inputs.size());
     uint64_t inputsResourceSize = 0;
 
     for (size_t i = 0; i < model.inputs.size(); ++i)
     {
         auto& slot = model.inputs[i];
-
-        // Only the inputs owned by DirectML are bound at initialize.
-        if (slot.owned)
+        if (!slot.owned)
         {
-            auto bound = buffers.find(static_cast<uint32_t>(i));
-            if (bound != buffers.end())
-            {
-                inputBinding.bindings[i] = BindBuffer(*bound->second, slot.desc, static_cast<uint32_t>(i));
-                continue;
-            }
-
-            DmlBufferTensorDesc bufferDesc = *slot.desc.AsPtr<DML_BUFFER_TENSOR_DESC>();
-            uint32_t requiredAlignment = std::max(bufferDesc.guaranteedBaseOffsetAlignment, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT);
-
-            // Bind to the end of the inputs resource (with appropriate alignment)
-            inputBinding.bindings[i].offset = RoundUpToMultiple(inputsResourceSize, (uint64_t)requiredAlignment);
-            inputBinding.bindings[i].sizeInBytes = bufferDesc.totalTensorSizeInBytes;
-
-            inputsResourceSize = inputBinding.bindings[i].offset + bufferDesc.totalTensorSizeInBytes;
+            continue;
         }
+
+        auto bound = buffers.find(static_cast<uint32_t>(i));
+        if (bound != buffers.end())
+        {
+            inputBindings[i] = BindBuffer(*bound->second, slot.desc, static_cast<uint32_t>(i));
+            continue;
+        }
+
+        inputBindings[i] = AppendBinding(slot.desc, inputsResourceSize);
     }
 
     uint64_t temporaryResourceSize = m_operatorInitializer->GetBindingProperties().TemporaryResourceSize;
@@ -687,37 +629,21 @@ void Device::Initialize(
     uint32_t descriptorHeapSize = m_operatorInitializer->GetBindingProperties().RequiredDescriptorCount;
 
     EnsureUploadHeapSize(inputsResourceSize);
-    EnsureCpuOrDefaultBufferSize(inputsResourceSize, m_inputsResource);
+    EnsureDefaultBufferSize(inputsResourceSize, m_inputsResource);
     EnsureDefaultBufferSize(temporaryResourceSize, m_temporaryResource);
     model.allocator = m_resourceAllocator;
     EnsureDefaultBufferSize(persistentResourceSize, model.persistentResource);
     EnsureDescriptorHeapSize(descriptorHeapSize);
 
-    model.persistentResourceSize = persistentResourceSize;
-
-    // Set up the bindings to point to our input resource
-    for (auto& binding : inputBinding.bindings)
+    for (auto& binding : inputBindings)
     {
-        if (binding.sizeInBytes != 0 && binding.buffer == nullptr)
+        if (binding.SizeInBytes != 0 && binding.Buffer == nullptr)
         {
-            binding.buffer = m_inputsResource->GetResource();
+            binding.Buffer = m_inputsResource->GetResource();
         }
     }
 
-    // Upload inputs for initialization
-    std::vector<ID3D12Resource*> buffersToClear =
-    {
-        m_inputsResource->GetResource(),
-        m_temporaryResource->GetResource(),
-        model.persistentResource->GetResource()
-    };
-
-    ClearGpuBuffers(buffersToClear);
-
-    UploadStagedInputs(staged, model.inputs, inputBinding.bindings, m_inputsResource.Get(), inputsResourceSize, true);
-
-    // Bind for initialization
-    DmlTypeConverter<1024> converter;
+    UploadStagedInputs(staged, model.inputs, inputBindings, m_inputsResource.Get(), inputsResourceSize, true);
 
     DML_BINDING_TABLE_DESC bindingTableDesc = {};
     bindingTableDesc.Dispatchable = m_operatorInitializer.Get();
@@ -727,7 +653,8 @@ void Device::Initialize(
 
     ThrowIfFailed(m_bindingTable->Reset(&bindingTableDesc));
 
-    DML_BINDING_DESC inputBindingDesc = converter.ToBindingDesc(inputBinding);
+    DML_BUFFER_ARRAY_BINDING inputArrayBinding = { static_cast<UINT>(inputBindings.size()), inputBindings.data() };
+    DML_BINDING_DESC inputBindingDesc = { DML_BINDING_TYPE_BUFFER_ARRAY, &inputArrayBinding };
     m_bindingTable->BindInputs(1, &inputBindingDesc);
 
     if (persistentResourceSize != 0)
@@ -744,7 +671,6 @@ void Device::Initialize(
         m_bindingTable->BindTemporaryResource(&desc);
     }
 
-    // Record and execute commands, and wait for completion
     m_commandList->SetDescriptorHeaps(1, m_descriptorHeap->m_Heap.GetAddressOf());
     m_commandRecorder->RecordDispatch(m_commandList.Get(), m_operatorInitializer.Get(), m_bindingTable.Get());
     ExecuteCommandListAndWait();
@@ -791,32 +717,6 @@ void Device::EnsureUploadHeapSize(uint64_t requestedSizeInBytes)
     }
 }
 
-void Device::EnsureCpuOrDefaultBufferSize(uint64_t requestedSizeInBytes, _Inout_ ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer)
-{
-    if (m_useCpuCustomHeapResources)
-    {
-        EnsureCpuBufferSize(requestedSizeInBytes, buffer);
-    }
-    else
-    {
-        EnsureDefaultBufferSize(requestedSizeInBytes, buffer);
-    }
-}
-
-void Device::EnsureCpuBufferSize(uint64_t requestedSizeInBytes, _Inout_ ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer)
-{
-    uint64_t existingSize = buffer ? buffer->GetResource()->GetDesc().Width : 0;
-    uint64_t newSize = GrowBufferSize(requestedSizeInBytes);
-
-    if (newSize != existingSize)
-    {
-        buffer = nullptr;
-        buffer = CreateCpuCustomBuffer(m_resourceAllocator.Get(), newSize);
-    }
-
-    buffer->UpdateResidency(&m_residencySet);
-}
-
 void Device::EnsureDefaultBufferSize(uint64_t requestedSizeInBytes, _Inout_ ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer)
 {
     uint64_t existingSize = buffer ? buffer->GetResource()->GetDesc().Width : 0;
@@ -854,8 +754,8 @@ void Device::EnsureDescriptorHeapSize(uint32_t requestedSizeInDescriptors)
         desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
         ComPtr<ID3D12DescriptorHeap> d3d12DescriptorHeap;
-        ThrowIfFailed(m_d3d12Device->CreateDescriptorHeap(&desc, IID_GRAPHICS_PPV_ARGS(d3d12DescriptorHeap.GetAddressOf())));
-    
+        ThrowIfFailed(m_d3d12Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(d3d12DescriptorHeap.GetAddressOf())));
+
         m_descriptorHeap = std::make_unique<SVDescriptorHeap>(std::move(d3d12DescriptorHeap), newSize);
 
         if (m_residencyManager != nullptr){
@@ -875,38 +775,8 @@ void Device::EnsureReadBackHeapSize(uint64_t requestedSizeInBytes)
         m_readbackHeap = nullptr;
         m_readbackHeap = CreateReadBackBuffer(m_resourceAllocator.Get(), newSize);
     }
-    
+
     m_readbackHeap->UpdateResidency(&m_residencySet);
-}
-
-void Device::ClearGpuBuffers(dml::Span<ID3D12Resource*> buffers)
-{
-    static const uint32_t ClearValue = static_cast<uint32_t>(-1);
-
-    // The number of buffers we can clear at once is limited by the size of our descriptor heap
-    assert(static_cast<uint32_t>(buffers.size()) <= m_clearUavDescriptorHeapCpu->GetDesc().NumDescriptors);
-
-    uint32_t descriptorOffset = 0;
-    for (ID3D12Resource* buffer : buffers)
-    {
-        if (!buffer)
-        {
-            // Nothing to clear; these buffers are lazily-initialized
-            continue;
-        }
-
-        FillGpuBuffer(
-            m_commandList.Get(),
-            m_clearUavDescriptorHeapCpu.Get(),
-            m_clearUavDescriptorHeapGpu.Get(),
-            descriptorOffset,
-            buffer,
-            ClearValue);
-
-        ++descriptorOffset;
-    }
-
-    m_commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(nullptr));
 }
 
 #pragma warning(pop)

@@ -11,22 +11,13 @@
 #include <stdexcept>
 #include <optional>
 #include <string>
-#include <functional>
 #include <numeric>
 #include <map>
 #include <memory>
 
-#ifdef __cpp_lib_span
-#include <span>
-#endif
-
 #include <Windows.h>
 #include <d3d12.h>
-
-// ToDo: dxgi isn't available in WSL.
-#include <dxgi1_5.h>
 #include <dxgi1_6.h>
-#include <dxgidebug.h>
 
 #include <initguid.h>
 #include <wrl/client.h>
@@ -34,20 +25,16 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/functional.h>
 #include <pybind11/operators.h>
-#include <pybind11/buffer_info.h>
 #include <pybind11/numpy.h>
 namespace py = pybind11;
 
 #define DML_TARGET_VERSION_USE_LATEST 1
 #include <DirectML.h>
 // DirectMLX's own failure macro throws the failing expression's text with no
-// HRESULT in it, so a graph DirectML rejects surfaced as a bare
-// "m_device->CreateOperator(...)". Route it through DescribeHresult (defined
-// in util.h, declared here because the macro expands before that include) so
-// the error carries E_INVALIDARG or whatever the code was, like every other
-// throw in the bindings.
+// HRESULT in it. Route it through DescribeHresult (defined in util.h, declared
+// here because the macro expands before that include) so the error carries
+// E_INVALIDARG or whatever the code was, like every other throw in the bindings.
 std::string DescribeHresult(HRESULT hr);
 #define DMLX_THROW_IF_FAILED(_hr) \
     do { HRESULT _dmlx_hr = (_hr); if (FAILED(_dmlx_hr)) { \
@@ -61,10 +48,8 @@ std::string DescribeHresult(HRESULT hr);
 #include <DirectMLX.h>
 #pragma warning(pop)
 
-#define IID_GRAPHICS_PPV_ARGS IID_PPV_ARGS
-#include "d3dx12.h"
+#include <d3dx12.h>
 #include "util.h"
 #include "attention.h"
 #include "model.h"
-#include "typeconvert.h"
 #include "device.h"

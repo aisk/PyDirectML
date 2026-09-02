@@ -168,11 +168,9 @@ PYBIND11_MODULE(_core, module)
         .value("ACTIVATION_CELU", DML_OPERATOR_ACTIVATION_CELU)
         .value("ACTIVATION_GELU", DML_OPERATOR_ACTIVATION_GELU);
 
-    // Classes, registered before the module-level functions and ordered so that
-    // every type is registered before another definition mentions it. pybind11
-    // renders a definition's signature string at the moment of the def; a type
-    // that is not registered yet shows up as its raw C++ name, which is not
-    // valid Python and breaks the generated stubs.
+    // Classes, in dependency order: pybind11 renders a definition's signature
+    // string at the moment of the def, and a type not yet registered shows up
+    // as its raw C++ name.
     //
     py::class_<dml::TensorPolicy>(module, "TensorPolicy")
         .def_property_readonly_static("default", [](py::object) { return dml::TensorPolicy::Default(); })
@@ -243,11 +241,9 @@ PYBIND11_MODULE(_core, module)
             "The node pointer as an integer: the exact identity value hash() is "
             "derived from. The wrapper layer matches dict keys against the input "
             "slots with it.")
-        // Two Expressions are the same input if and only if they are the same
-        // node, so identity by node pointer is what lets a dict keyed by
-        // Expression replace bindings matched by position. The pointer is only
-        // ever compared, never dereferenced, which is why a key stays usable
-        // after its graph is destroyed.
+        // Identity by node pointer is what makes an Expression a dict key. The
+        // pointer is only ever compared, never dereferenced, so a key stays
+        // usable after its graph is destroyed.
         .def("__hash__", [](dml::Expression const& self) {
             return reinterpret_cast<std::uintptr_t>(self.Impl());
             })
@@ -257,20 +253,12 @@ PYBIND11_MODULE(_core, module)
         .def("__ne__", [](dml::Expression const& self, dml::Expression const& other) {
             return self.Impl() != other.Impl();
             }, py::is_operator())
-        // The arithmetic operators are DirectMLX's: +, -, *, / build the
-        // elementwise node, and a float operand rides on the scale-bias of an
-        // identity. Two are corrected here rather than taken as-is, and the
-        // in-place forms are dropped: += would mutate the C++ node behind
-        // every Python reference at once, changing the hash and dict-binding
-        // identity of each alias. Without __iadd__, Python rewrites x += y as
-        // x = x + y, which rebinds one name and leaves the aliases alone.
+        // DirectMLX's arithmetic overloads, with the deviations docs/api-design.md
+        // lists: no in-place forms, a floored %, and a corrected float / x.
         .def(py::self + py::self)
         .def(py::self - py::self)
         .def(py::self * py::self)
         .def(py::self / py::self)
-        // Python's % is floored: -7 % 5 == 3. DirectMLX's operator% picks
-        // ModulusTruncate, which is C's fmod, so bind the floored operator
-        // DirectML also has.
         .def("__mod__", [](dml::Expression const& a, dml::Expression const& b) {
             return dml::ModulusFloor(a, b);
             }, py::is_operator())
@@ -281,9 +269,6 @@ PYBIND11_MODULE(_core, module)
         .def(float() + py::self)
         .def(float() - py::self)
         .def(float() * py::self)
-        // DirectMLX writes a / x as Recip(x, scale=a), but an elementwise
-        // scale-bias applies to the operator's input, so that computes
-        // 1/(a*x). Scale the reciprocal instead.
         .def("__rtruediv__", [](dml::Expression const& self, float a) {
             return dml::Identity(dml::Recip(self), DML_SCALE_BIAS{ a, 0.0f });
             }, py::is_operator())
@@ -305,9 +290,6 @@ PYBIND11_MODULE(_core, module)
                 return "dml.Device on " + std::string(device.UseGpu() ? "GPU" : "CPU");
             });
 
-    // A tensor on the GPU. Constructed from an array by the wrapper layer's
-    // __init__, which converts to the desc's dtype first; handed out by
-    // dispatch(readback=False); accepted wherever an array is.
     py::class_<pydml::Buffer, std::shared_ptr<pydml::Buffer>>(module, "Buffer")
         .def(py::init([](std::shared_ptr<pydml::Device> device, dml::TensorDesc desc, py::array array) {
             return device->Upload(std::move(desc), std::move(array));
@@ -325,12 +307,11 @@ PYBIND11_MODULE(_core, module)
         .def("numpy", [](pydml::Buffer const& self) { return self.device->Download(self); },
             "Copy the buffer back to the host as a numpy array of its shape and dtype.");
 
-    // The private surface of a compiled operator. The public initialize(),
-    // dispatch() and __call__ live in the wrapper layer, which validates the
-    // dict of inputs, separates the Buffers (bound in place) from the arrays
-    // (converted one at a time as _initialize and _dispatch pull on the staged
-    // iterable). py::dynamic_attr lets the wrapper cache its slot table on the
-    // instance.
+    // The public initialize(), dispatch() and __call__ live in the wrapper
+    // layer, which validates the dict of inputs and splits it into Buffers
+    // (bound in place) and staged arrays (converted one at a time as
+    // _initialize and _dispatch pull on the iterable). py::dynamic_attr lets
+    // the wrapper keep its slot table and names on the instance.
     py::class_<pydml::CompiledOperator>(module, "CompiledOperator", py::dynamic_attr())
         .def_property_readonly("temporary_size", [](pydml::CompiledOperator& self) {
             return self.op->GetBindingProperties().TemporaryResourceSize;
@@ -373,8 +354,7 @@ PYBIND11_MODULE(_core, module)
             py::arg("staged"),
             py::arg("readback"));
 
-    // py::dynamic_attr for the wrapper's input names and constants, which live
-    // on the graph until compile() hands them to the operator.
+    // py::dynamic_attr for the wrapper's input names and constants.
     py::class_<pydml::Graph>(module, "Graph", py::dynamic_attr())
         .def(py::init([](std::shared_ptr<pydml::Device> device, std::optional<dml::TensorPolicy> tensorPolicy) {
             return new pydml::Graph(std::move(device), tensorPolicy.value_or(dml::TensorPolicy::Default()));
@@ -386,16 +366,14 @@ PYBIND11_MODULE(_core, module)
             py::kw_only(),
             py::arg("tensor_policy") = py::none())
         .def("_input", [](pydml::Graph& self, dml::TensorDesc desc) {
-            return self.Input(static_cast<uint32_t>(self.slots.size()), std::move(desc));
+            return self.Input(std::move(desc));
             },
-            "Add an input with the next free index; the public input() with its "
-            "defaults lives in the wrapper layer.",
+            "Add an input at the next free index; the public input() lives in the wrapper layer.",
             py::arg("desc"))
         .def("_compile", [](pydml::Graph& self, std::vector<dml::Expression> outputs, DML_EXECUTION_FLAGS flags) {
             return new pydml::CompiledOperator(self, flags, outputs);
             },
-            "Compile the graph; the public compile() with its docstring lives "
-            "in the wrapper layer.",
+            "Compile the graph; the public compile() lives in the wrapper layer.",
             py::arg("outputs"),
             py::kw_only(),
             py::arg("flags") = DML_EXECUTION_FLAG_NONE);
@@ -420,7 +398,7 @@ PYBIND11_MODULE(_core, module)
         dml::TensorDimensions outputSizes) {
             return dml::Convolution(input, filter, bias, mode, direction, strides, dilations, startPadding, endPadding, outputPadding, groupCount, fusedActivation.value_or(dml::FusedActivation::None()), outputSizes);
         },
-        "Create a builder of the convolution expression.",
+        "Convolve the input with the filter, adding the bias per output channel if given.",
         py::arg("input"),
         py::arg("filter"),
         py::arg("bias") = dml::NullOpt,
@@ -442,36 +420,35 @@ PYBIND11_MODULE(_core, module)
         DML_INTERPOLATION_MODE interpolationMode) {
             return dml::Upsample2D(input, DML_SIZE_2D { scaleSize.first, scaleSize.second }, interpolationMode);
         },
-        "Create a two-dimensional up-sample expression. scale_size is a "
-        "(width, height) tuple.",
+        "Upsample the last two axes by scale_size, a (width, height) tuple.",
         py::arg("input"),
         py::kw_only(),
         py::arg("scale_size"),
         py::arg("interpolation_mode"));
 
-    module.def("activation_relu", &dml::ActivationRelu, "Takes an input tensor and applies the function output = max(0, input) across its elements.",
+    module.def("activation_relu", &dml::ActivationRelu, "Elementwise max(0, input).",
         py::arg("input"));
 
-    module.def("activation_sigmoid", &dml::ActivationSigmoid, "Takes an input tensor and applies the function output = 1 / (1 + exp(-input)) across its elements.",
+    module.def("activation_sigmoid", &dml::ActivationSigmoid, "Elementwise 1 / (1 + exp(-input)).",
         py::arg("input"));
 
-    module.def("activation_identity", &dml::ActivationIdentity, "Takes an input tensor and return the tensor as an output.",
+    module.def("activation_identity", &dml::ActivationIdentity, "A copy of the input, packed.",
         py::arg("input"));
 
     module.def("add", [](dml::Expression a, dml::Expression b, std::optional<dml::FusedActivation> fusedActivation) {
             return dml::Add(a, b, fusedActivation.value_or(dml::FusedActivation::None()));
         },
-        "Takes 2 input tensors and performs addition then returns the resulting tensor.",
+        "Elementwise a + b, optionally with a fused activation on the result.",
         py::arg("a"),
         py::arg("b"),
         py::kw_only(),
         py::arg("fused_activation") = py::none());
 
-    module.def("subtract", &dml::Subtract, "Takes 2 input tensors and performs subtraction then returns the resulting tensor.",
+    module.def("subtract", &dml::Subtract, "Elementwise a - b.",
         py::arg("a"),
         py::arg("b"));
 
-    module.def("activation_tanh", &dml::ActivationTanh, "Calculates the hyperbolic tangent of the given input tensor.",
+    module.def("activation_tanh", &dml::ActivationTanh, "Elementwise hyperbolic tangent.",
         py::arg("input"));
 
     module.def("activation_gelu", &dml::ActivationGelu,
@@ -479,11 +456,11 @@ PYBIND11_MODULE(_core, module)
         "This is the exact form, not the tanh approximation.",
         py::arg("input"));
 
-    module.def("multiply", &dml::Multiply, "Takes 2 input tensors and performs multiplication then returns resulting tensor.",
+    module.def("multiply", &dml::Multiply, "Elementwise a * b.",
         py::arg("a"),
         py::arg("b"));
 
-    module.def("divide", &dml::Divide, "Takes 2 input tensors and performs division then returns the resulting tensor.",
+    module.def("divide", &dml::Divide, "Elementwise a / b.",
         py::arg("a"),
         py::arg("b"));
 
@@ -495,7 +472,7 @@ PYBIND11_MODULE(_core, module)
         std::vector<uint32_t> endPadding) {
             return dml::Padding(input, paddingMode, paddingValue, startPadding, endPadding);
         },
-        "Inflate the input at the edges, with constant, edge or reflection fill.",
+        "Pad the input at both ends of every axis, with constant, edge or reflection fill.",
         py::arg("input"),
         py::kw_only(),
         py::arg("padding_mode") = DML_PADDING_MODE_CONSTANT,
@@ -531,7 +508,7 @@ PYBIND11_MODULE(_core, module)
         std::vector<int32_t> inputWindowStrides) {
             return dml::Slice(input, inputWindowOffsets, inputWindowSizes, inputWindowStrides);
         },
-        "Produces a slice of the input tensor along multiple axes",
+        "A window of the input: offsets, sizes and strides per axis.",
         py::arg("input"),
         py::kw_only(),
         py::arg("input_window_offsets"),
@@ -544,13 +521,13 @@ PYBIND11_MODULE(_core, module)
         std::vector<float> bias) {
             return dml::ValueScale2D(input, scale, bias);
         },
-        "Scales and bias the input image per pixel. output = input * scale + bias[C]",
+        "output = input * scale + bias[channel], one bias per channel.",
         py::arg("input"),
         py::kw_only(),
         py::arg("scale"),
         py::arg("bias"));
 
-    module.def("activation_linear", &dml::ActivationLinear, "f(input, alpha, beta) = alpha * input + beta",
+    module.def("activation_linear", &dml::ActivationLinear, "Elementwise alpha * input + beta.",
         py::arg("input"),
         py::kw_only(),
         py::arg("alpha"),
@@ -567,7 +544,7 @@ PYBIND11_MODULE(_core, module)
         std::optional<dml::FusedActivation> fusedActivation) {
             return dml::BatchNormalization(input, mean, variance, scale, bias, spatial, epsilon, fusedActivation.value_or(dml::FusedActivation::None()));
         },
-        "normalizes data per channel across all batches by subtracting the mean, dividing by the standard deviation, and adding a bias.",
+        "output = scale * (input - mean) / sqrt(variance + epsilon) + bias, with per-channel statistics supplied as tensors.",
         py::arg("input"),
         py::arg("mean"),
         py::arg("variance"),
@@ -578,7 +555,7 @@ PYBIND11_MODULE(_core, module)
         py::arg("epsilon") = 1e-5f,
         py::arg("fused_activation") = py::none());
 
-    module.def("local_response_normalization", &dml::LocalResponseNormalization, "It normalizes over local input regions defined across the channels.",
+    module.def("local_response_normalization", &dml::LocalResponseNormalization, "Normalize each element by the energy of its neighbourhood; the wrapper layer documents the parameters.",
         py::arg("input"),
         py::kw_only(),
         py::arg("cross_channel"),
@@ -598,7 +575,7 @@ PYBIND11_MODULE(_core, module)
         std::optional<dml::FusedActivation> fusedActivation) {
             return dml::Gemm(a, b, c, transA, transB, alpha, beta, fusedActivation.value_or(dml::FusedActivation::None()));
         },
-        "Matrix product of two matrices",
+        "alpha * op(a) @ op(b) + beta * c over the last two axes, where op is the optional transpose.",
         py::arg("a"),
         py::arg("b"),
         py::arg("c") = dml::NullOpt,
@@ -620,7 +597,7 @@ PYBIND11_MODULE(_core, module)
         dml::TensorDimensions outputSizes) {
             return dml::AveragePooling(input, strides, windowSizes, startPadding, endPadding, dilations, includePadding, outputSizes);
         },
-        "Average all elements in each pool.",
+        "Average pooling over the trailing spatial axes.",
         py::arg("input"),
         py::kw_only(),
         py::arg("strides"),
@@ -640,14 +617,13 @@ PYBIND11_MODULE(_core, module)
         std::vector<uint32_t> dilations,
         bool outputIndices) {
             auto outputs = dml::MaxPooling(input, windowSizes, strides, startPadding, endPadding, dilations, outputIndices);
-            // The unrequested output is None, never an empty Expression that
-            // dereferences null when touched. The wrapper layer turns the pair
-            // into a namedtuple.
+            // An unrequested output is None, never an empty Expression that
+            // dereferences null when touched.
             return py::make_tuple(
                 outputs.values,
                 outputIndices ? py::cast(outputs.indices) : py::none());
         },
-        "Max pooling across the tensor according to kernel sizes, stride sizes, and pad lengths",
+        "Max pooling over the trailing spatial axes; the wrapper layer shapes the outputs.",
         py::arg("input"),
         py::kw_only(),
         py::arg("window_sizes"),
@@ -668,9 +644,7 @@ PYBIND11_MODULE(_core, module)
                 std::move(sizes),
                 strides ? dml::Optional<dml::TensorStrides>(std::move(*strides)) : dml::NullOpt);
         },
-        "Return tensor with a different view of the data, like a reinterpret cast "
-        "using new dimensions that are element-count compatible. dtype=None keeps "
-        "the input's type.",
+        "View the same bytes through different sizes, strides or dtype; dtype=None keeps the input's.",
         py::arg("input"),
         py::arg("sizes"),
         py::arg("strides") = py::none(),
@@ -681,7 +655,7 @@ PYBIND11_MODULE(_core, module)
             // the last dimension of a flattened 2-D view of the tensor.
             return axes.empty() ? dml::ActivationSoftmax(input) : dml::ActivationSoftmax(input, axes);
         },
-        "Raise all elements to e, and divide each element by the sum over the given axes.",
+        "Softmax over the given axes; no axes selects the legacy operator over a flattened 2-D view.",
         py::arg("input"),
         py::kw_only(),
         py::arg("axes") = std::vector<uint32_t>{});
@@ -709,7 +683,7 @@ PYBIND11_MODULE(_core, module)
         uint32_t axis) {
             return dml::Join(inputs, axis);
         },
-        "Combine multiple tensors into large output tensor.",
+        "Concatenate the inputs along an axis.",
         py::arg("inputs"),
         py::kw_only(),
         py::arg("axis"));
@@ -726,15 +700,14 @@ PYBIND11_MODULE(_core, module)
         bool linearBeforeReset,
         dml::GRUOutputOptions outputOptions) {
             auto outputs = dml::GRU(input, weight, recurrence, bias, hiddenInit, sequenceLengths, activationDescs, direction, linearBeforeReset, outputOptions);
-            // As with max_pooling: unrequested outputs are None, and the wrapper
-            // layer shapes the pair into a namedtuple.
+            // As with max_pooling: unrequested outputs are None.
             bool sequence = outputOptions == dml::GRUOutputOptions::Both || outputOptions == dml::GRUOutputOptions::Sequence;
             bool single = outputOptions == dml::GRUOutputOptions::Both || outputOptions == dml::GRUOutputOptions::Single;
             return py::make_tuple(
                 sequence ? py::cast(outputs.sequence) : py::none(),
                 single ? py::cast(outputs.single) : py::none());
         },
-        "Performs a one-layer gated recurrent unit (GRU) function on the input. This operator uses multiple gates to perform this layer. These gates are performed multiple times in a loop dictated by the sequence length dimension and the sequence_lengths argument.",
+        "A one-layer gated recurrent unit over the sequence axis; the wrapper layer shapes the outputs.",
         py::arg("input"),
         py::arg("weight"),
         py::arg("recurrence"),
@@ -747,7 +720,7 @@ PYBIND11_MODULE(_core, module)
         py::arg("linear_before_reset") = true,
         py::arg("output_options") = dml::GRUOutputOptions::Both);
 
-    module.def("gather", &dml::Gather, "Gathers elements from the input tensor along current axis, using indices tensor to remap indices.",
+    module.def("gather", &dml::Gather, "Pick elements of the input along an axis by an indices tensor.",
         py::arg("input"),
         py::arg("indices"),
         py::kw_only(),

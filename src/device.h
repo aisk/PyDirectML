@@ -13,7 +13,7 @@ namespace pydml
     class Device : public std::enable_shared_from_this<Device>
     {
     public:
-        explicit Device(bool useGpu = true, bool useDebugLayer = false, DXGI_GPU_PREFERENCE gpuPreference = DXGI_GPU_PREFERENCE_UNSPECIFIED);
+        explicit Device(bool useGpu = true, bool useDebugLayer = false);
 
         // Inputs already on the GPU, by input index. They are bound in place;
         // nothing is uploaded for them.
@@ -21,10 +21,9 @@ namespace pydml
 
         // Bind the DML_TENSOR_FLAG_OWNED_BY_DML inputs and run the operator
         // initializer, leaving the result in the operator's persistent resource.
-        // Once done, those inputs live on the GPU and dispatching does not touch
-        // them again. `staged` yields (input index, C-contiguous array of the
-        // tensor's own dtype) pairs; the Python wrapper validates and converts,
-        // and yielding lazily means only one converted copy exists at a time.
+        // `staged` yields (input index, C-contiguous array of the tensor's own
+        // dtype) pairs; the Python wrapper validates and converts, and yielding
+        // lazily means only one converted copy exists at a time.
         void Initialize(
             pydml::CompiledOperator& op,
             BufferMap const& buffers,
@@ -59,12 +58,10 @@ namespace pydml
         }
 
     protected:
-        void RecordOutputReadBack(uint64_t outputsResourceSize);
-
         py::list DownloadFromReadBackHeap(
             uint64_t outputsResourceSize,
             std::vector<dml::TensorDesc> const& outputDescs,
-            std::vector<DmlBufferBinding>& outputBindings
+            std::vector<DML_BUFFER_BINDING> const& outputBindings
             );
 
         // A packed numpy array of `desc`'s shape and dtype, copied out of mapped
@@ -74,11 +71,11 @@ namespace pydml
         // The binding for input `index` when it is supplied as a Buffer: checks
         // the buffer belongs to this device and is large enough, and marks it
         // resident for the coming command list.
-        DmlBufferBinding BindBuffer(pydml::Buffer const& buffer, dml::TensorDesc const& desc, uint32_t index);
+        DML_BUFFER_BINDING BindBuffer(pydml::Buffer const& buffer, dml::TensorDesc const& desc, uint32_t index);
 
         // Copy one array into mapped upload-heap memory at the binding's offset,
         // zero-padding the tail up to the binding's size.
-        void CopyArrayToUploadHeap(byte* uploadHeapData, DmlBufferBinding const& binding, py::array const& array, uint32_t index);
+        void CopyArrayToUploadHeap(byte* uploadHeapData, DML_BUFFER_BINDING const& binding, py::array const& array, uint32_t index);
 
         // Record a copy of `sizeInBytes` between two DEFAULT/UPLOAD/READBACK
         // buffers, with `resource` transitioned out of and back into UAV state.
@@ -91,7 +88,7 @@ namespace pydml
         void UploadStagedInputs(
             py::iterable staged,
             std::vector<pydml::InputSlot> const& slots,
-            std::vector<DmlBufferBinding> const& bindings,
+            std::vector<DML_BUFFER_BINDING> const& bindings,
             gpgmm::d3d12::ResourceAllocation* inputsResource,
             uint64_t inputsResourceSize,
             bool owned
@@ -99,12 +96,8 @@ namespace pydml
 
         void EnsureUploadHeapSize(uint64_t requestedSizeInBytes);
         void EnsureReadBackHeapSize(uint64_t requestedSizeInBytes);
-        void EnsureCpuOrDefaultBufferSize(uint64_t requestedSizeInBytes, _Inout_ Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer);
-        void EnsureCpuBufferSize(uint64_t requestedSizeInBytes, _Inout_ Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer);
         void EnsureDefaultBufferSize(uint64_t requestedSizeInBytes, _Inout_ Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation>& buffer);
         void EnsureDescriptorHeapSize(uint32_t requestedSizeInDescriptors);
-
-        void ClearGpuBuffers(dml::Span<ID3D12Resource*> buffers);
 
         void ExecuteCommandListAndWait();
 
@@ -113,48 +106,41 @@ namespace pydml
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_commandAllocator;
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocator> m_resourceAllocator;
-        
-        // Residency management is used to handle oversubscribing of video memory. 
-        // The lifetime of |m_residencyManager| will be fully owned by |m_resourceAllocator|.
-        gpgmm::d3d12::ResidencyManager* m_residencyManager = nullptr;
 
-        // GPU- and CPU-visible descriptor heaps used for ClearUnorderedAccessView
-        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_clearUavDescriptorHeapGpu;
-        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_clearUavDescriptorHeapCpu;
+        // Residency management handles oversubscription of video memory. Owned
+        // by m_resourceAllocator.
+        gpgmm::d3d12::ResidencyManager* m_residencyManager = nullptr;
 
         Microsoft::WRL::ComPtr<IDMLDevice> m_dmlDevice;
         Microsoft::WRL::ComPtr<IDMLCommandRecorder> m_commandRecorder;
         Microsoft::WRL::ComPtr<IDMLOperatorInitializer> m_operatorInitializer;
         Microsoft::WRL::ComPtr<IDMLBindingTable> m_bindingTable;
-        
+
         // GPU descriptor heaps require explicit residency management since they must
         // stay in a GPU visible memory.
         class SVDescriptorHeap : public gpgmm::d3d12::Heap {
         public:
-            SVDescriptorHeap(ComPtr<ID3D12DescriptorHeap> heap, uint64_t size) 
+            SVDescriptorHeap(ComPtr<ID3D12DescriptorHeap> heap, uint64_t size)
             : gpgmm::d3d12::Heap(heap, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, size), m_Heap(heap) {
             }
 
             Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_Heap;
         };
 
-        // Lazily-initialized resources for operator initialization/execution
+        // Lazily-sized resources shared by every operator on the device. The
+        // inputs and outputs resources are suballocated when an operator has
+        // several; the persistent resource is not here, it belongs to the
+        // CompiledOperator so one operator's weights survive another's
+        // initialization.
         std::unique_ptr<SVDescriptorHeap> m_descriptorHeap;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_uploadHeap;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_readbackHeap;
-
-        // DEFAULT heap buffers to hold input tensors, output tensors, and temporary resources. The input
-        // and output resources are suballocated for operators that have multiple inputs or outputs.
-        // The persistent resource is not here: it belongs to the CompiledModel, so that one model's
-        // initialized weights survive another model being initialized on the same device.
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_inputsResource;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_outputsResource;
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> m_temporaryResource;
 
         gpgmm::d3d12::ResidencySet m_residencySet;
 
-        bool m_useCpuCustomHeapResources = false;
         bool m_useGpu = true;
-        DXGI_GPU_PREFERENCE m_gpuPreference;
     };
 }

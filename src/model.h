@@ -21,15 +21,15 @@ namespace pydml
         bool owned;
     };
 
-    // A dml::Graph plus the record of its inputs. The record is what lets a
-    // dict keyed by Expression replace bindings matched by position: every
-    // input's index is assigned here and snapshotted into the CompiledOperator,
-    // so no caller ever writes an index by hand.
+    // A dml::Graph plus the record of its inputs, which is what lets a dict
+    // keyed by Expression replace bindings matched by position: every input's
+    // index is assigned here and snapshotted into the CompiledOperator.
     struct Graph
     {
         Graph(std::shared_ptr<Device> device, dml::TensorPolicy tensorPolicy);
 
-        dml::Expression Input(uint32_t index, dml::TensorDesc desc);
+        // Add an input at the next free index.
+        dml::Expression Input(dml::TensorDesc desc);
 
         std::shared_ptr<Device> device;
         dml::Graph graph;
@@ -46,13 +46,10 @@ namespace pydml
 
         Microsoft::WRL::ComPtr<IDMLCompiledOperator> op;
 
-        // The device that compiled this operator, which owns the execution
-        // machinery. Holding it here is what makes the operator self-contained:
-        // the natural way to write a model is to compile and then drop the
-        // graph, and initialize/dispatch must not require it to be alive.
+        // The device that compiled this operator, and snapshots of what the
+        // graph knew. Together they make the operator self-contained, so the
+        // graph can be dropped as soon as compile returns.
         std::shared_ptr<Device> device;
-
-        // Snapshots taken at compile time, for the same reason.
         std::vector<InputSlot> inputs;
         std::vector<dml::TensorDesc> outputDescs;
 
@@ -63,21 +60,17 @@ namespace pydml
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocator> allocator;
 
         // Written by Device::Initialize. DirectML folds the DML_TENSOR_FLAG_OWNED_BY_DML
-        // inputs into this buffer -- reordered into whatever layout the operator
-        // wants -- and reads them from here on every dispatch. Owning it per
-        // operator rather than per device is what lets those weights stay on the
-        // GPU across dispatches instead of being re-uploaded each time.
+        // inputs into this buffer, in whatever layout the operator wants, and
+        // reads them from here on every dispatch.
         Microsoft::WRL::ComPtr<gpgmm::d3d12::ResourceAllocation> persistentResource;
-        uint64_t persistentResourceSize = 0;
         bool initialized = false;
     };
 
     // A tensor that lives on the GPU: a DEFAULT-heap resource plus the desc
     // that says how to read it. Dispatch hands one out per output when asked
     // not to read back, and accepts one wherever it accepts an array, bound
-    // directly with no upload -- which is what lets the tensors that cross
-    // between two graphs stay where they are instead of crossing PCIe twice.
-    // The device is declared first so it outlives the allocation it made.
+    // directly with no upload. The device is declared first so it outlives
+    // the allocation it made.
     struct Buffer
     {
         Buffer(
