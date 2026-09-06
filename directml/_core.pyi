@@ -105,6 +105,10 @@ class ReduceFunction:
 class RandomGeneratorType:
     PHILOX_4X32_10: RandomGeneratorType
 
+class QuantizationType:
+    SCALE: QuantizationType
+    SCALE_ZERO_POINT: QuantizationType
+
 class ExecutionFlags:
     NONE: ExecutionFlags
     ALLOW_HALF_PRECISION_COMPUTATION: ExecutionFlags
@@ -542,6 +546,8 @@ def quantize_linear(input: Expression, scale: Expression, zero_point: Expression
                     output_dtype: _DtypeLike = ...) -> Expression: ...
 def dequantize_linear(input: Expression, scale: Expression,
                       zero_point: Expression) -> Expression: ...
+def dequantize(input: Expression, quantization_parameters: Sequence[Expression],
+               *, quantization_type: QuantizationType) -> Expression: ...
 def random_generator(input_state: Expression, *, output_sizes: _Shape,
                      output_state: bool = ...,
                      type: RandomGeneratorType = ...) -> tuple[Expression, Optional[Expression]]: ...
@@ -563,3 +569,98 @@ def roi_align(
     output_height: int,
     output_width: int,
 ) -> Expression: ...
+
+# Quantized convolution.
+def convolution_integer(
+    input: Expression,
+    filter: Expression,
+    input_zero_point: Optional[Expression] = ...,
+    filter_zero_point: Optional[Expression] = ...,
+    *,
+    strides: Sequence[int] = ...,
+    dilations: Sequence[int] = ...,
+    start_padding: Sequence[int] = ...,
+    end_padding: Sequence[int] = ...,
+    group_count: int = ...,
+    output_sizes: _Shape = ...,
+) -> Expression: ...
+def quantized_linear_convolution(
+    input: Expression,
+    input_scale: Expression,
+    filter: Expression,
+    filter_scale: Expression,
+    output_scale: Expression,
+    input_zero_point: Optional[Expression] = ...,
+    filter_zero_point: Optional[Expression] = ...,
+    bias: Optional[Expression] = ...,
+    output_zero_point: Optional[Expression] = ...,
+    *,
+    output_dtype: _DtypeLike,
+    strides: Sequence[int] = ...,
+    dilations: Sequence[int] = ...,
+    start_padding: Sequence[int] = ...,
+    end_padding: Sequence[int] = ...,
+    group_count: int = ...,
+    output_sizes: _Shape = ...,
+) -> Expression: ...
+
+# Gradients.
+def clip_grad(input: Expression, input_gradient: Expression, *, min: float,
+              max: float) -> Expression: ...
+def batch_normalization_grad(
+    input: Expression,
+    input_gradient: Expression,
+    mean: Expression,
+    variance: Expression,
+    scale: Expression,
+    *,
+    epsilon: float = ...,
+) -> tuple[Expression, Expression, Expression]: ...
+def batch_normalization_training(
+    input: Expression,
+    scale: Expression,
+    bias: Expression,
+    fused_add: Optional[Expression] = ...,
+    *,
+    epsilon: float = ...,
+    fused_activation: Optional[FusedActivation] = ...,
+) -> tuple[Expression, Expression, Expression]: ...
+def batch_normalization_training_grad(
+    input: Expression,
+    input_gradient: Expression,
+    mean: Expression,
+    variance: Expression,
+    scale: Expression,
+    *,
+    epsilon: float = ...,
+) -> tuple[Expression, Expression, Expression]: ...
+def resample_grad(input_gradient: Expression, *, output_sizes: _Shape,
+                  mode: InterpolationMode,
+                  scales: Sequence[float] = ...,
+                  input_pixel_offsets: Sequence[float] = ...,
+                  output_pixel_offsets: Sequence[float] = ...) -> Expression: ...
+def slice_grad(input_gradient: Expression, *, output_gradient_sizes: _Shape,
+               input_window_offsets: Sequence[int],
+               input_window_sizes: Sequence[int],
+               input_window_strides: Sequence[int]) -> Expression: ...
+def roi_align_grad(
+    input_gradient: Expression,
+    roi: Expression,
+    batch_indices: Expression,
+    input: Optional[Expression] = ...,
+    *,
+    reduction_function: ReduceFunction,
+    interpolation_mode: InterpolationMode,
+    spatial_scale_x: float,
+    spatial_scale_y: float,
+    input_pixel_offset: float,
+    output_pixel_offset: float,
+    minimum_samples_per_output: int,
+    maximum_samples_per_output: int,
+    align_regions_to_corners: bool,
+    batch_size: int,
+    image_height: int,
+    image_width: int,
+    compute_output_gradient: bool = ...,
+    compute_output_roi_gradient: bool = ...,
+) -> tuple[Optional[Expression], Optional[Expression]]: ...

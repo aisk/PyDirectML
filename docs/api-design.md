@@ -13,7 +13,7 @@
 **非目标**：
 
 - 不引入新抽象。没有 Keras 式的 `Layer` / `Sequential`、没有自动求导、没有算子融合的语法糖、不用字符串替代枚举。
-- 不追求补齐算子覆盖。当前绑定了约 25 个算子，DirectMLX 有上百个；按 sample 的实际需要一个个补。
+- 不引入自动求导。DirectML 自己实现了几个算子的反向（`*Grad`），这些绑上了，但库不建反向图、不记录 tape：每个 `*_grad` 就是一个算子，链式法则在调用者手里。
 - 不做隐式的事：不隐式广播、不隐式初始化、不隐式把 GPU 数据拷回 CPU。
 
 ## 2. 概念映射
@@ -209,7 +209,7 @@ w = graph.constant(array, dtype=None, *, sizes=None, name=None)
 
 ### 4.14 算子覆盖
 
-DirectMLX 为推理包装的算子全部绑上，跳过的是训练用的 `*Grad`（`BatchNormalizationGrad`、`SliceGrad`、`RoiAlignGrad` 等）、`ConvolutionInteger` / `QuantizedLinearConvolution`，以及 FL 6.3 的 `Dequantize`（变长的量化参数张量加一个 `DML_QUANTIZATION_TYPE`，签名本身还要再设计一轮）。
+**DirectMLX 包装的算子全部绑上**，推理的和训练的都在内，`tests/test_operators.py` 里每个算子都对着 numpy 跑一遍。DirectMLX 自己没包的只剩 `MatrixMultiplyInteger` / `QuantizedLinearMatrixMultiply`（它的源码里写着 TODO）和 RNN / LSTM。
 
 几个命名和形状上的决定：
 
@@ -220,6 +220,9 @@ DirectMLX 为推理包装的算子全部绑上，跳过的是训练用的 `*Grad
 - **`fill_value_constant` / `fill_value_sequence` 的第一个位置参数是 graph**，与 DirectMLX 一致：它们没有输入张量，节点总得挂在某张图上。值在包装层用 numpy 转成张量类型的 8 个字节交给 `_core`，类型表在包装层，C++ 只做一次 memcpy；装不下的值（`value=300, dtype=uint8`）在这一步就报错。
 - **`top_k` 返回 `TopKOutputs(values, indices)`**，复数与 `max_pooling` 对齐；DirectMLX 这里写的是 `value` / `index`，是它自己的不一致。
 - **逐元素两操作数算子一律走 §4.9 的形状与类型检查**，包括 `max`、张量指数的 `pow`、以及 `where` 的 `a` / `b`（`condition` 只查形状）。报错里带调用名：`max(<...>, <...>): shapes differ`。
+- **可选张量在必需张量之后**，即使 DirectMLX 把它们插在中间。`ConvolutionInteger(input, inputZeroPoint, filter, filterZeroPoint, ...)` 在这里是 `convolution_integer(input, filter, input_zero_point=None, filter_zero_point=None, ...)`，`QuantizedLinearConvolution` 九个张量参数同理（五个必需的在前，四个可选的在后）。§4.5 的「必需参数不排在可选参数之后」优先于「顺序照 DirectMLX」，否则这两个算子的可选张量必须显式传 `None` 才能跳过。
+- **`dequantize` 的量化参数是一个列表**，`[scale]` 或 `[scale, zero_point]`，长度由 `quantization_type` 决定，与 C++ 的 `Span<const Expression>` 一致。不按长度反推类型：DirectML 对同一个列表长度有两种解释（无零点时无符号输入按范围中点居中，见 docstring），猜错就是静默算错。
+- **`*_grad` 的多输出与前向算子对齐**：`BatchNormalizationGradOutputs(gradient, scale_gradient, bias_gradient)`、`RoiAlignGradOutputs(gradient, roi_gradient)`。DirectMLX 的字段名带 `output` 前缀（`outputGradient` / `outputROIGradient`），在一个已经叫 `...Outputs` 的 namedtuple 里是重复的。
 
 ## 5. 硬约束
 
@@ -230,6 +233,8 @@ DirectMLX 为推理包装的算子全部绑上，跳过的是训练用的 `*Grad
 - **一张 graph 只能 `compile` 一次**。DirectMLX 的 `Graph::Compile` 第二次调用被 DirectML 以 `E_INVALIDARG` 拒绝。要两个算子就建两张图。
 - **`FILL_VALUE_SEQUENCE` 作为一张图的输出会让 DirectML 的图编译器直接 AV**，进程崩溃，不是一个 HRESULT。同一个节点喂给别的算子就没事，`FILL_VALUE_CONSTANT` 单独作输出也没事。包装层的 docstring 写明了这条，库不拦。
 - **绑定一个没有任何表达式消费的图输入**会在 dispatch 时破坏设备（之后的 `CreateOperator` 失败）。这是 DirectML 侧的行为，库目前不拦。
+- **DirectMLX 的 `ClipGrad` 少连了一条输入边**：descriptor 声明了 `InputTensor` 和 `InputGradientTensor` 两个输入，`CreateOperatorNode` 却只传了 `{ input.Impl() }`，图编译报 `E_INVALIDARG`。`third_party/DirectMLX.h` 就地改了，改动处有注释；这是这份 vendored 头文件的第二处本地修改（另一处是 `DMLX_THROW_IF_FAILED` 的宏守卫）。
+- **`roi_align_grad` 要拿到前向读过的特征图**才肯算 ROI 梯度（框的梯度是特征图的斜率），`ReduceFunction.MAX` 也要（得知道哪个元素赢了）。只有 AVERAGE 求特征图梯度时 `input` 可以是 `None`，其余组合 `CreateOperator` 直接 `E_INVALIDARG`。
 
 ## 6. 已拍板的争议项
 

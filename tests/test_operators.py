@@ -583,3 +583,299 @@ class TestRoiAlign:
 
         assert result.shape == (1, 1, 2, 2)
         assert np.allclose(result, 3.0)
+class TestBlockedDequantization:
+    """``dequantize``, whose parameters may cover a block of the input rather
+    than an element of it."""
+
+    def test_one_scale_per_block(self, device):
+        array = shaped([0, 2, 4, 6], np.uint8)
+        scale = shaped([1.0, 10.0])
+        zero_point = shaped([1, 2], np.uint8)
+
+        result = compute(
+            device,
+            lambda x, s, z: dml.dequantize(
+                x, [s, z], quantization_type=dml.QuantizationType.SCALE_ZERO_POINT),
+            array, scale, zero_point)
+
+        # Two parameters for four elements: the first pair is (x - 1) * 1, the
+        # second (x - 2) * 10.
+        assert np.allclose(result.ravel(), [-1.0, 1.0, 20.0, 40.0])
+
+    def test_the_output_takes_the_scale_type(self, device):
+        array = shaped([0, 2, 4, 6], np.uint8)
+        scale = shaped([1.0, 10.0], np.float16)
+
+        result = compute(
+            device,
+            lambda x, s: dml.dequantize(
+                x, [s], quantization_type=dml.QuantizationType.SCALE),
+            array, scale)
+
+        assert result.dtype == np.float16
+
+    def test_an_unsigned_input_without_a_zero_point_is_centred(self, device):
+        # DirectML reads an unsigned input under QuantizationType.SCALE as
+        # having an implicit zero point at the middle of its range, so uint8 0
+        # dequantizes to -128, not to 0. Signed inputs are taken at face value.
+        array = shaped([0, 100, 200, 255], np.uint8)
+        scale = shaped([1.0])
+
+        unsigned = compute(
+            device,
+            lambda x, s: dml.dequantize(
+                x, [s], quantization_type=dml.QuantizationType.SCALE),
+            array, scale)
+        signed = compute(
+            device,
+            lambda x, s: dml.dequantize(
+                x, [s], quantization_type=dml.QuantizationType.SCALE),
+            shaped([-2, 0, 2, 4], np.int8), scale)
+
+        assert np.allclose(unsigned.ravel(), [-128.0, -28.0, 72.0, 127.0])
+        assert np.allclose(signed.ravel(), [-2.0, 0.0, 2.0, 4.0])
+
+
+class TestQuantizedConvolution:
+    """The two integer convolutions, against the same window summed in numpy."""
+
+    IMAGE = shaped([[1, 2, 3], [4, 5, 6], [7, 8, 9]], np.uint8)
+    FILTER = shaped([[1, 0], [0, 2]], np.uint8)
+
+    @staticmethod
+    def windows(image, filter):
+        """The 2x2 convolution of the 3x3 image, in exact integers."""
+        image = image.astype(np.int32).reshape(3, 3)
+        filter = filter.astype(np.int32).reshape(2, 2)
+        return np.array([[(image[i:i + 2, j:j + 2] * filter).sum()
+                          for j in range(2)] for i in range(2)])
+
+    def test_integer_sums(self, device):
+        result = compute(device, dml.convolution_integer, self.IMAGE, self.FILTER)
+
+        assert result.dtype == np.int32
+        assert np.array_equal(result.reshape(2, 2), self.windows(self.IMAGE, self.FILTER))
+
+    def test_the_zero_points_are_subtracted_first(self, device):
+        zero_point = shaped([1], np.uint8)
+
+        result = compute(
+            device,
+            lambda x, f, xz, fz: dml.convolution_integer(x, f, xz, fz),
+            self.IMAGE, self.FILTER, zero_point, zero_point)
+
+        assert np.array_equal(result.reshape(2, 2),
+                              self.windows(self.IMAGE.astype(np.int32) - 1,
+                                            self.FILTER.astype(np.int32) - 1))
+
+    def test_the_result_is_requantized(self, device):
+        # The scales come to 1 * 1 / 4, and DirectML rounds halves to even, so
+        # the accumulator 14 lands on 4 and not on 3.
+        result = compute(
+            device,
+            lambda x, xs, f, fs, os: dml.quantized_linear_convolution(
+                x, xs, f, fs, os, output_dtype=np.uint8),
+            self.IMAGE, shaped([1.0]), self.FILTER, shaped([1.0]), shaped([4.0]))
+
+        assert result.dtype == np.uint8
+        assert np.array_equal(result.reshape(2, 2),
+                              np.round(self.windows(self.IMAGE, self.FILTER) / 4))
+
+    def test_a_scale_per_output_channel(self, device):
+        filters = np.array([[[[1, 0], [0, 2]]], [[[1, 1], [1, 1]]]], np.uint8)
+
+        result = compute(
+            device,
+            lambda x, xs, f, fs, os: dml.quantized_linear_convolution(
+                x, xs, f, fs, os, output_dtype=np.uint8),
+            self.IMAGE, shaped([1.0]), filters,
+            np.array([1.0, 2.0], np.float32).reshape(1, 2, 1, 1), shaped([4.0]))
+
+        expected = np.stack([self.windows(self.IMAGE, filters[0]) * 1.0,
+                             self.windows(self.IMAGE, filters[1]) * 2.0]) / 4
+        assert np.array_equal(result.reshape(2, 2, 2), np.round(expected))
+
+    def test_the_bias_lands_on_the_integer_accumulator(self, device):
+        # 100 is in units of input_scale * filter_scale, so it survives the
+        # division by the output scale as 25.
+        result = compute(
+            device,
+            lambda x, xs, f, fs, os, b, z: dml.quantized_linear_convolution(
+                x, xs, f, fs, os, bias=b, output_zero_point=z, output_dtype=np.uint8),
+            self.IMAGE, shaped([1.0]), self.FILTER, shaped([1.0]), shaped([4.0]),
+            shaped([100], np.int32), shaped([3], np.uint8))
+
+        expected = np.round((self.windows(self.IMAGE, self.FILTER) + 100) / 4) + 3
+        assert np.array_equal(result.reshape(2, 2), expected)
+
+
+class TestGradients:
+    """The backward passes. Where the forward operator is also bound, the check
+    is that the two are adjoint: <forward(x), dy> == <x, backward(dy)>, which
+    is what makes a gradient a gradient and holds however DirectML lays out its
+    sampling grid."""
+
+    # roi_align_grad's share of roi_align's own parameters, which the two have
+    # to agree on.
+    ROI_ALIGN = dict(
+        reduction_function=dml.ReduceFunction.AVERAGE,
+        interpolation_mode=dml.InterpolationMode.LINEAR,
+        spatial_scale_x=1.0, spatial_scale_y=1.0,
+        input_pixel_offset=0.5, output_pixel_offset=-0.5,
+        minimum_samples_per_output=1, maximum_samples_per_output=1,
+        align_regions_to_corners=False,
+        batch_size=1, image_height=4, image_width=4)
+
+    def test_clip_grad_stops_at_the_window(self, device):
+        gradient = shaped([[1.0, 2.0], [3.0, 4.0]])
+
+        result = compute(
+            device,
+            lambda x, dy: dml.clip_grad(x, dy, min=-1.0, max=1.0),
+            X, gradient)
+
+        assert np.array_equal(result.ravel(), [0.0, 2.0, 3.0, 0.0])
+
+    def test_slice_grad_scatters_into_zeros(self, device):
+        gradient = shaped([[1.0, 2.0], [3.0, 4.0]])
+
+        result = compute(
+            device,
+            lambda dy: dml.slice_grad(
+                dy, output_gradient_sizes=[1, 1, 4, 4],
+                input_window_offsets=[0, 0, 1, 1], input_window_sizes=[1, 1, 2, 2],
+                input_window_strides=[1, 1, 1, 1]),
+            gradient)
+
+        expected = np.zeros((4, 4), np.float32)
+        expected[1:3, 1:3] = gradient.reshape(2, 2)
+        assert np.array_equal(result.reshape(4, 4), expected)
+
+    def test_slice_grad_is_the_adjoint_of_slice(self, device):
+        array = np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4)
+        gradient = shaped([[1.0, 2.0], [3.0, 4.0]])
+        window = dict(input_window_offsets=[0, 0, 1, 1],
+                      input_window_sizes=[1, 1, 2, 2],
+                      input_window_strides=[1, 1, 1, 1])
+
+        forward = compute(device, lambda x: dml.slice(x, **window), array)
+        backward = compute(
+            device,
+            lambda dy: dml.slice_grad(dy, output_gradient_sizes=[1, 1, 4, 4], **window),
+            gradient)
+
+        assert (forward * gradient).sum() == (array * backward).sum()
+
+    def test_resample_grad_is_the_adjoint_of_resample(self, device):
+        array = shaped([[1.0, 2.0], [3.0, 4.0]])
+        gradient = np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4)
+        mode = dml.InterpolationMode.NEAREST_NEIGHBOR
+
+        forward = compute(
+            device,
+            lambda x: dml.resample(x, output_sizes=[1, 1, 4, 4], mode=mode),
+            array)
+        backward = compute(
+            device,
+            lambda dy: dml.resample_grad(dy, output_sizes=[1, 1, 2, 2], mode=mode),
+            gradient)
+
+        assert backward.shape == array.shape
+        assert (forward * gradient).sum() == (array * backward).sum()
+
+    def test_batch_normalization_training_takes_its_own_statistics(self, device):
+        array = np.arange(8, dtype=np.float32).reshape(1, 2, 2, 2)
+        scale = np.array([1.0, 2.0], np.float32).reshape(1, 2, 1, 1)
+        bias = np.array([0.0, 1.0], np.float32).reshape(1, 2, 1, 1)
+
+        output, mean, variance = compute_all(
+            device, dml.batch_normalization_training, array, scale, bias)
+
+        # Per channel, over every other axis, and the variance is the biased
+        # one.
+        assert np.allclose(mean.ravel(), array.mean(axis=(0, 2, 3)))
+        assert np.allclose(variance.ravel(), array.var(axis=(0, 2, 3)))
+        expected = scale * (array - mean) / np.sqrt(variance + 1e-5) + bias
+        assert np.allclose(output, expected, atol=1e-4)
+
+    def test_the_fused_add_lands_on_the_result(self, device):
+        array = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+        scale = shaped([2.0])
+        bias = shaped([1.0])
+        residual = np.full((1, 1, 2, 2), 100.0, np.float32)
+
+        output, mean, variance = compute_all(
+            device,
+            lambda x, s, b, f: dml.batch_normalization_training(x, s, b, f),
+            array, scale, bias, residual)
+
+        # Added after the normalization, not before it: the statistics are the
+        # input's own, and the scale and bias do not touch the residual.
+        assert np.allclose(mean.ravel(), array.mean())
+        normalized = (array - array.mean()) / np.sqrt(array.var() + 1e-5)
+        assert np.allclose(output, normalized * 2.0 + 1.0 + residual, atol=1e-4)
+
+    def test_the_two_batch_normalization_gradients_differ(self, device):
+        array = shaped([1.0, 2.0, 4.0, 8.0])
+        gradient = shaped([1.0, 0.5, -0.5, 2.0])
+        mean = shaped([array.mean()])
+        variance = shaped([array.var()])
+        scale = shaped([2.0])
+
+        inverse = 1.0 / np.sqrt(variance + 1e-5)
+        normalized = (array - mean) * inverse
+        count = array.size
+        held = gradient * scale * inverse
+        differentiated = scale * inverse / count * (
+            count * gradient - gradient.sum() - normalized * (gradient * normalized).sum())
+
+        for operator, expected in [(dml.batch_normalization_grad, held),
+                                   (dml.batch_normalization_training_grad,
+                                    differentiated)]:
+            outputs = compute_all(device, operator, array, gradient, mean, variance,
+                                  scale)
+            assert np.allclose(outputs[0], expected, atol=1e-5), operator.__name__
+            # Both agree on the parameters; only the input's gradient depends
+            # on whether the statistics came from the input.
+            assert np.allclose(outputs[1].ravel(),
+                               (gradient * normalized).sum())
+            assert np.allclose(outputs[2].ravel(), gradient.sum())
+
+        assert not np.allclose(held, differentiated)
+
+    def test_roi_align_grad_returns_what_it_was_given(self, device):
+        # An average pooling spreads each tile's gradient over the region it
+        # read, so nothing is lost on the way back.
+        gradient = np.ones((1, 1, 2, 2), np.float32)
+        roi = shaped([[0.0, 0.0, 4.0, 4.0]])
+        batch_indices = shaped([0], np.uint32)
+
+        outputs = compute_all(
+            device,
+            lambda dy, r, b: dml.roi_align_grad(
+                dy, r, b, **self.ROI_ALIGN),
+            gradient, roi, batch_indices)
+
+        assert len(outputs) == 1  # the ROI gradient was not asked for
+        assert outputs[0].shape == (1, 1, 4, 4)
+        assert np.isclose(outputs[0].sum(), gradient.sum())
+
+    def test_roi_align_grad_needs_the_feature_map_for_the_boxes(self, device):
+        gradient = np.ones((1, 1, 2, 2), np.float32)
+        array = np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4)
+        roi = shaped([[0.0, 0.0, 4.0, 4.0]])
+        batch_indices = shaped([0], np.uint32)
+
+        def build(dy, r, b, x=None):
+            return dml.roi_align_grad(
+                dy, r, b, x, compute_output_gradient=False,
+                compute_output_roi_gradient=True, **self.ROI_ALIGN)
+
+        # The gradient towards a box is a slope of the feature map, so
+        # DirectML refuses the operator when the map is not there.
+        with pytest.raises(RuntimeError):
+            compute_all(device, build, gradient, roi, batch_indices)
+
+        outputs = compute_all(device, build, gradient, roi, batch_indices, array)
+        assert len(outputs) == 1  # the feature map's gradient was not asked for
+        assert outputs[0].shape == roi.shape

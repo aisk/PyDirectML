@@ -1019,6 +1019,248 @@ def random_generator(input_state, *, output_sizes, output_state=True,
         type=type))
 
 
+def dequantize(input, quantization_parameters, *, quantization_type):
+    """Dequantize the input, block by block.
+
+    The general form of ``dequantize_linear``: the parameters may cover fewer
+    elements than the input, in which case each one applies to a whole block of
+    it, which is how a 4-bit weight matrix carries a scale per group of
+    elements rather than per element.
+
+    Args:
+        quantization_parameters: ``[scale]`` for
+            ``QuantizationType.SCALE``, ``[scale, zero_point]`` for
+            ``QuantizationType.SCALE_ZERO_POINT``. The output takes the
+            scale's data type.
+        quantization_type: Which of those two forms the list is in. Without a
+            zero point an unsigned input is read as having an implicit one at
+            the middle of its range, so uint8 0 comes back as ``-128 * scale``;
+            a signed input is taken at face value.
+    """
+    return _core.dequantize(input, list(quantization_parameters),
+                            quantization_type=quantization_type)
+
+
+def convolution_integer(input, filter, input_zero_point=None,
+                        filter_zero_point=None, *, strides=(), dilations=(),
+                        start_padding=(), end_padding=(), group_count=1,
+                        output_sizes=()):
+    """Convolve an integer input with an integer filter, summing into int32.
+
+    The zero points are subtracted before the multiply, so the operator is
+    ``convolution(input - input_zero_point, filter - filter_zero_point)`` in
+    exact integer arithmetic. Nothing is requantized: the output is the int32
+    accumulator, which the caller scales itself.
+
+    Args:
+        input_zero_point: What value of the input stands for zero; a scalar
+            tensor, or one per input channel. None means zero.
+        filter_zero_point: The same for the filter. None means zero.
+
+    The remaining arguments are ``convolution``'s, minus the modes it has no
+    use for here.
+    """
+    return _core.convolution_integer(
+        input, filter, input_zero_point, filter_zero_point,
+        strides=list(strides), dilations=list(dilations),
+        start_padding=list(start_padding), end_padding=list(end_padding),
+        group_count=group_count, output_sizes=list(output_sizes))
+
+
+def quantized_linear_convolution(input, input_scale, filter, filter_scale,
+                                 output_scale, input_zero_point=None,
+                                 filter_zero_point=None, bias=None,
+                                 output_zero_point=None, *, output_dtype,
+                                 strides=(), dilations=(), start_padding=(),
+                                 end_padding=(), group_count=1,
+                                 output_sizes=()):
+    """Convolve in the quantized domain and requantize the result.
+
+    ONNX's QLinearConv: the convolution runs on the integers as
+    ``convolution_integer`` does, the ``bias`` is added to that integer
+    accumulator, and the sum is scaled by
+    ``input_scale * filter_scale / output_scale``, rounded, offset by
+    ``output_zero_point`` and saturated to ``output_dtype``.
+
+    Args:
+        input_scale: What one unit of the input is worth; a scalar tensor, or
+            one per input channel.
+        filter_scale: The same for the filter, usually one per output channel.
+        output_scale: The same for the output.
+        input_zero_point: What value stands for zero, alongside each scale.
+            None means zero.
+        filter_zero_point: The same for the filter. None means zero.
+        bias: An int32 bias per output channel, in units of
+            ``input_scale * filter_scale``, not of the output.
+        output_zero_point: The same for the output; its data type must be
+            ``output_dtype``.
+        output_dtype: int8 or uint8, the type the result saturates to.
+
+    The remaining arguments are ``convolution``'s.
+    """
+    return _core.quantized_linear_convolution(
+        input, input_scale, filter, filter_scale, output_scale,
+        input_zero_point, filter_zero_point, bias, output_zero_point,
+        output_dtype=_to_data_type(output_dtype), strides=list(strides),
+        dilations=list(dilations), start_padding=list(start_padding),
+        end_padding=list(end_padding), group_count=group_count,
+        output_sizes=list(output_sizes))
+
+
+# --- Gradients ---------------------------------------------------------------
+# DirectML implements the backward pass of a handful of operators. Nothing in
+# this library differentiates a graph; each of these is one link, and the chain
+# rule belongs to whoever is writing the training step.
+
+
+class BatchNormalizationGradOutputs(typing.NamedTuple):
+    gradient: _core.Expression
+    scale_gradient: _core.Expression
+    bias_gradient: _core.Expression
+
+
+class BatchNormalizationTrainingOutputs(typing.NamedTuple):
+    output: _core.Expression
+    mean: _core.Expression
+    variance: _core.Expression
+
+
+class RoiAlignGradOutputs(typing.NamedTuple):
+    gradient: typing.Optional[_core.Expression]
+    roi_gradient: typing.Optional[_core.Expression]
+
+
+def batch_normalization_training(input, scale, bias, fused_add=None, *,
+                                 epsilon=1e-5, fused_activation=None):
+    """Batch normalization over statistics taken from the batch itself.
+
+    ``batch_normalization`` is handed the mean and variance to normalize by;
+    this one computes them, per channel, over every other axis, and returns
+    them so the backward pass and the running averages can have them.
+
+    Returns ``BatchNormalizationTrainingOutputs(output, mean, variance)``. The
+    variance is the biased one, divided by the element count rather than by one
+    less than it.
+
+    Args:
+        fused_add: A tensor added to the result, after the scale and the bias,
+            which is how a residual connection folds into this operator. It
+            does not reach the statistics: those are the input's own. None to
+            add nothing.
+    """
+    return BatchNormalizationTrainingOutputs(*_core.batch_normalization_training(
+        input, scale, bias, fused_add, epsilon=epsilon,
+        fused_activation=fused_activation))
+
+
+def batch_normalization_grad(input, input_gradient, mean, variance, scale, *,
+                             epsilon=1e-5):
+    """The gradient of ``batch_normalization``.
+
+    The mean and variance are constants here, as they are in inference: the
+    gradient towards the input is just ``input_gradient * scale /
+    sqrt(variance + epsilon)``. ``batch_normalization_training_grad`` is the
+    one that accounts for the statistics being functions of the input.
+
+    Returns ``BatchNormalizationGradOutputs(gradient, scale_gradient,
+    bias_gradient)``, of the input's shape and of the mean's shape twice.
+    """
+    return BatchNormalizationGradOutputs(*_core.batch_normalization_grad(
+        input, input_gradient, mean, variance, scale, epsilon=epsilon))
+
+
+def batch_normalization_training_grad(input, input_gradient, mean, variance,
+                                      scale, *, epsilon=1e-5):
+    """The gradient of ``batch_normalization_training``.
+
+    Pass the mean and variance that operator returned. They came from the
+    input, so the gradient towards it carries the two extra terms that
+    ``batch_normalization_grad`` leaves out.
+
+    Returns ``BatchNormalizationGradOutputs(gradient, scale_gradient,
+    bias_gradient)``.
+    """
+    return BatchNormalizationGradOutputs(*_core.batch_normalization_training_grad(
+        input, input_gradient, mean, variance, scale, epsilon=epsilon))
+
+
+def resample_grad(input_gradient, *, output_sizes, mode, scales=(),
+                  input_pixel_offsets=(), output_pixel_offsets=()):
+    """The gradient of ``resample``.
+
+    Every output element of the forward pass contributed to one input element
+    (NEAREST_NEIGHBOR) or to a few (LINEAR); this sums the gradients back onto
+    the elements they were read from, so ``output_sizes`` is the shape the
+    forward pass consumed.
+
+    The sampling grid must be described the same way it was on the way
+    forward, except that the defaults differ: here they are 0.5 and -0.5, the
+    half-pixel grid, and ``resample``'s own default computes the scales from
+    the sizes instead. Pass all three explicitly when the forward call did.
+
+    Args:
+        output_sizes: The shape of the tensor the forward pass took in.
+        mode: NEAREST_NEIGHBOR or LINEAR, as on the way forward.
+        scales: Output extent over input extent, per axis, of the forward
+            pass. Computed from the sizes when empty.
+        input_pixel_offsets: 0.5 each when empty.
+        output_pixel_offsets: -0.5 each when empty.
+    """
+    return _core.resample_grad(
+        input_gradient, output_sizes=list(output_sizes), mode=mode,
+        scales=list(scales), input_pixel_offsets=list(input_pixel_offsets),
+        output_pixel_offsets=list(output_pixel_offsets))
+
+
+def roi_align_grad(input_gradient, roi, batch_indices, input=None, *,
+                   reduction_function, interpolation_mode, spatial_scale_x,
+                   spatial_scale_y, input_pixel_offset, output_pixel_offset,
+                   minimum_samples_per_output, maximum_samples_per_output,
+                   align_regions_to_corners, batch_size, image_height,
+                   image_width, compute_output_gradient=True,
+                   compute_output_roi_gradient=False):
+    """The gradient of ``roi_align``, towards the feature map and the boxes.
+
+    Returns ``RoiAlignGradOutputs(gradient, roi_gradient)``; each is None
+    unless its ``compute_`` flag asked for it, and at least one flag must be
+    set. ``gradient`` is [batch_size, channels, image_height, image_width] —
+    the forward pass consumed a feature map, not a shape this operator can
+    infer, so its shape is spelled out here.
+
+    Args:
+        input_gradient: The gradient arriving at ``roi_align``'s output, one
+            tile per region.
+        roi: The boxes the forward pass pooled, unchanged.
+        batch_indices: Which image each region belongs to, unchanged.
+        input: The feature map the forward pass read. Required by
+            ReduceFunction.MAX, which has to find which element won, and by
+            ``compute_output_roi_gradient``, since a box moves along the slope
+            of the map. None is only for an AVERAGE pooling's feature-map
+            gradient.
+        batch_size: Images in the feature map.
+        image_height: Rows of the feature map.
+        image_width: Columns of the feature map.
+        compute_output_gradient: Produce the gradient towards the feature map.
+        compute_output_roi_gradient: Produce the gradient towards the boxes.
+
+    The rest are ``roi_align``'s own parameters and must match the values it
+    was given.
+    """
+    return RoiAlignGradOutputs(*_core.roi_align_grad(
+        input_gradient, roi, batch_indices, input,
+        reduction_function=reduction_function,
+        interpolation_mode=interpolation_mode,
+        spatial_scale_x=spatial_scale_x, spatial_scale_y=spatial_scale_y,
+        input_pixel_offset=input_pixel_offset,
+        output_pixel_offset=output_pixel_offset,
+        minimum_samples_per_output=minimum_samples_per_output,
+        maximum_samples_per_output=maximum_samples_per_output,
+        align_regions_to_corners=align_regions_to_corners,
+        batch_size=batch_size, image_height=image_height,
+        image_width=image_width,
+        compute_output_gradient=compute_output_gradient,
+        compute_output_roi_gradient=compute_output_roi_gradient))
+
 # --- FusedActivation factories -----------------------------------------------
 # One per activation DirectMLX can fuse, copied 1:1 from DirectMLX.h's
 # FusedActivation statics, defaults included.

@@ -1379,7 +1379,10 @@ namespace dml
         desc.Min = min;
         desc.Max = max;
 
-        detail::NodeOutput* const inputs[] = { input.Impl() };
+        // Local fix: upstream passes only { input.Impl() }, one edge short of
+        // the two tensors the descriptor declares, and DirectML rejects the
+        // graph with E_INVALIDARG.
+        detail::NodeOutput* const inputs[] = { input.Impl(), inputGradient.Impl() };
         detail::NodeID node = builder->CreateOperatorNode(DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD, &desc, inputs);
         detail::NodeOutput* output = builder->CreateNodeOutput(node, 0, std::move(outputGradientTensor));
 

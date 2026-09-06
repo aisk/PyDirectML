@@ -128,6 +128,12 @@ PYBIND11_MODULE(_core, module)
     py::enum_<DML_RANDOM_GENERATOR_TYPE>(module, "RandomGeneratorType")
         .value("PHILOX_4X32_10", DML_RANDOM_GENERATOR_TYPE_PHILOX_4X32_10);
 
+    py::enum_<DML_QUANTIZATION_TYPE>(module, "QuantizationType")
+        // NONE is the marker other descriptors use for "not quantized";
+        // dequantize rejects it, so it is not one of the choices here.
+        .value("SCALE", DML_QUANTIZATION_TYPE_SCALE)
+        .value("SCALE_ZERO_POINT", DML_QUANTIZATION_TYPE_SCALE_ZERO_POINT);
+
     py::enum_<DML_EXECUTION_FLAGS>(module, "ExecutionFlags", py::arithmetic())
         .value("NONE", DML_EXECUTION_FLAG_NONE)
         .value("ALLOW_HALF_PRECISION_COMPUTATION", DML_EXECUTION_FLAG_ALLOW_HALF_PRECISION_COMPUTATION)
@@ -1356,6 +1362,18 @@ PYBIND11_MODULE(_core, module)
         py::arg("scale"),
         py::arg("zero_point"));
 
+    module.def("dequantize", [](
+        dml::Expression input,
+        std::vector<dml::Expression> quantizationParameters,
+        DML_QUANTIZATION_TYPE quantizationType) {
+            return dml::Dequantize(input, quantizationParameters, quantizationType);
+        },
+        "Dequantize the input by a list of parameters the quantization type decides the length of; the wrapper layer documents them.",
+        py::arg("input"),
+        py::arg("quantization_parameters"),
+        py::kw_only(),
+        py::arg("quantization_type"));
+
     module.def("random_generator", [](
         dml::Expression input_state,
         dml::TensorDimensions outputSizes,
@@ -1412,4 +1430,231 @@ PYBIND11_MODULE(_core, module)
         py::arg("align_regions_to_corners"),
         py::arg("output_height"),
         py::arg("output_width"));
+
+    // Quantized convolution. The zero points are optional because a symmetric
+    // scheme has none; the scales never are.
+    //
+    module.def("convolution_integer", [](
+        dml::Expression input,
+        dml::Expression filter,
+        dml::Optional<dml::Expression> inputZeroPoint,
+        dml::Optional<dml::Expression> filterZeroPoint,
+        std::vector<uint32_t> strides,
+        std::vector<uint32_t> dilations,
+        std::vector<uint32_t> startPadding,
+        std::vector<uint32_t> endPadding,
+        uint32_t groupCount,
+        dml::TensorDimensions outputSizes) {
+            return dml::ConvolutionInteger(input, inputZeroPoint, filter, filterZeroPoint,
+                strides, dilations, startPadding, endPadding, groupCount, std::move(outputSizes));
+        },
+        "Convolve an integer input with an integer filter into int32 sums; the wrapper layer documents the parameters.",
+        py::arg("input"),
+        py::arg("filter"),
+        py::arg("input_zero_point") = dml::NullOpt,
+        py::arg("filter_zero_point") = dml::NullOpt,
+        py::kw_only(),
+        py::arg("strides") = std::vector<uint32_t>{},
+        py::arg("dilations") = std::vector<uint32_t>{},
+        py::arg("start_padding") = std::vector<uint32_t>{},
+        py::arg("end_padding") = std::vector<uint32_t>{},
+        py::arg("group_count") = 1,
+        py::arg("output_sizes") = dml::TensorDimensions{});
+
+    module.def("quantized_linear_convolution", [](
+        dml::Expression input,
+        dml::Expression inputScale,
+        dml::Expression filter,
+        dml::Expression filterScale,
+        dml::Expression outputScale,
+        dml::Optional<dml::Expression> inputZeroPoint,
+        dml::Optional<dml::Expression> filterZeroPoint,
+        dml::Optional<dml::Expression> bias,
+        dml::Optional<dml::Expression> outputZeroPoint,
+        DML_TENSOR_DATA_TYPE outputDataType,
+        std::vector<uint32_t> strides,
+        std::vector<uint32_t> dilations,
+        std::vector<uint32_t> startPadding,
+        std::vector<uint32_t> endPadding,
+        uint32_t groupCount,
+        dml::TensorDimensions outputSizes) {
+            return dml::QuantizedLinearConvolution(input, inputScale, inputZeroPoint,
+                filter, filterScale, filterZeroPoint, bias, outputScale, outputZeroPoint,
+                outputDataType, strides, dilations, startPadding, endPadding, groupCount,
+                std::move(outputSizes));
+        },
+        "Convolve in the quantized domain and requantize the result; the wrapper layer documents the parameters.",
+        py::arg("input"),
+        py::arg("input_scale"),
+        py::arg("filter"),
+        py::arg("filter_scale"),
+        py::arg("output_scale"),
+        py::arg("input_zero_point") = dml::NullOpt,
+        py::arg("filter_zero_point") = dml::NullOpt,
+        py::arg("bias") = dml::NullOpt,
+        py::arg("output_zero_point") = dml::NullOpt,
+        py::kw_only(),
+        py::arg("output_dtype"),
+        py::arg("strides") = std::vector<uint32_t>{},
+        py::arg("dilations") = std::vector<uint32_t>{},
+        py::arg("start_padding") = std::vector<uint32_t>{},
+        py::arg("end_padding") = std::vector<uint32_t>{},
+        py::arg("group_count") = 1,
+        py::arg("output_sizes") = dml::TensorDimensions{});
+
+    // The backward passes DirectML implements. Nothing here differentiates a
+    // graph: each of these is the gradient of one forward operator, and the
+    // chain rule stays with whoever is building the training step.
+    //
+    module.def("clip_grad", &dml::ClipGrad,
+        "The gradient of clip: input_gradient where the input was inside [min, max], zero elsewhere.",
+        py::arg("input"),
+        py::arg("input_gradient"),
+        py::kw_only(),
+        py::arg("min"),
+        py::arg("max"));
+
+    module.def("batch_normalization_grad", [](
+        dml::Expression input,
+        dml::Expression inputGradient,
+        dml::Expression mean,
+        dml::Expression variance,
+        dml::Expression scale,
+        float epsilon) {
+            auto outputs = dml::BatchNormalizationGrad(input, inputGradient, mean, variance, scale, epsilon);
+            return py::make_tuple(outputs.gradient, outputs.scaleGradient, outputs.biasGradient);
+        },
+        "The gradient of batch_normalization; the wrapper layer shapes the outputs.",
+        py::arg("input"),
+        py::arg("input_gradient"),
+        py::arg("mean"),
+        py::arg("variance"),
+        py::arg("scale"),
+        py::kw_only(),
+        py::arg("epsilon") = 1e-5f);
+
+    module.def("batch_normalization_training", [](
+        dml::Expression input,
+        dml::Expression scale,
+        dml::Expression bias,
+        dml::Optional<dml::Expression> fusedAdd,
+        float epsilon,
+        std::optional<dml::FusedActivation> fusedActivation) {
+            auto outputs = dml::BatchNormalizationTraining(input, scale, bias, fusedAdd, epsilon,
+                fusedActivation.value_or(dml::FusedActivation::None()));
+            return py::make_tuple(outputs.output, outputs.mean, outputs.variance);
+        },
+        "Batch normalization over statistics taken from the batch itself; the wrapper layer shapes the outputs.",
+        py::arg("input"),
+        py::arg("scale"),
+        py::arg("bias"),
+        py::arg("fused_add") = dml::NullOpt,
+        py::kw_only(),
+        py::arg("epsilon") = 1e-5f,
+        py::arg("fused_activation") = py::none());
+
+    module.def("batch_normalization_training_grad", [](
+        dml::Expression input,
+        dml::Expression inputGradient,
+        dml::Expression mean,
+        dml::Expression variance,
+        dml::Expression scale,
+        float epsilon) {
+            auto outputs = dml::BatchNormalizationTrainingGrad(input, inputGradient, mean, variance, scale, epsilon);
+            return py::make_tuple(outputs.gradient, outputs.scaleGradient, outputs.biasGradient);
+        },
+        "The gradient of batch_normalization_training; the wrapper layer shapes the outputs.",
+        py::arg("input"),
+        py::arg("input_gradient"),
+        py::arg("mean"),
+        py::arg("variance"),
+        py::arg("scale"),
+        py::kw_only(),
+        py::arg("epsilon") = 1e-5f);
+
+    module.def("resample_grad", [](
+        dml::Expression input_gradient,
+        dml::TensorDimensions outputSizes,
+        DML_INTERPOLATION_MODE mode,
+        std::vector<float> scales,
+        std::vector<float> inputPixelOffsets,
+        std::vector<float> outputPixelOffsets) {
+            return dml::ResampleGrad(input_gradient, std::move(outputSizes), mode,
+                scales, inputPixelOffsets, outputPixelOffsets);
+        },
+        "The gradient of resample: every output element's gradient summed back onto the inputs it read; the wrapper layer documents the offsets.",
+        py::arg("input_gradient"),
+        py::kw_only(),
+        py::arg("output_sizes"),
+        py::arg("mode"),
+        py::arg("scales") = std::vector<float>{},
+        py::arg("input_pixel_offsets") = std::vector<float>{},
+        py::arg("output_pixel_offsets") = std::vector<float>{});
+
+    module.def("slice_grad", [](
+        dml::Expression input_gradient,
+        dml::TensorDimensions outputGradientSizes,
+        std::vector<uint32_t> inputWindowOffsets,
+        std::vector<uint32_t> inputWindowSizes,
+        std::vector<int32_t> inputWindowStrides) {
+            return dml::SliceGrad(input_gradient, std::move(outputGradientSizes),
+                inputWindowOffsets, inputWindowSizes, inputWindowStrides);
+        },
+        "The gradient of slice: the window's gradient scattered back into a tensor of zeros.",
+        py::arg("input_gradient"),
+        py::kw_only(),
+        py::arg("output_gradient_sizes"),
+        py::arg("input_window_offsets"),
+        py::arg("input_window_sizes"),
+        py::arg("input_window_strides"));
+
+    module.def("roi_align_grad", [](
+        dml::Expression inputGradient,
+        dml::Expression roi,
+        dml::Expression batchIndices,
+        dml::Optional<dml::Expression> input,
+        DML_REDUCE_FUNCTION reductionFunction,
+        DML_INTERPOLATION_MODE interpolationMode,
+        float spatialScaleX,
+        float spatialScaleY,
+        float inputPixelOffset,
+        float outputPixelOffset,
+        uint32_t minimumSamplesPerOutput,
+        uint32_t maximumSamplesPerOutput,
+        bool alignRegionsToCorners,
+        uint32_t batchSize,
+        uint32_t imageHeight,
+        uint32_t imageWidth,
+        bool computeOutputGradient,
+        bool computeOutputRoiGradient) {
+            auto outputs = dml::RoiAlignGrad(input, inputGradient, roi, batchIndices,
+                reductionFunction, interpolationMode, spatialScaleX, spatialScaleY,
+                inputPixelOffset, outputPixelOffset, minimumSamplesPerOutput,
+                maximumSamplesPerOutput, alignRegionsToCorners, batchSize, imageHeight,
+                imageWidth, computeOutputGradient, computeOutputRoiGradient);
+            // As with max_pooling: an unrequested output is None.
+            return py::make_tuple(
+                computeOutputGradient ? py::cast(outputs.outputGradient) : py::none(),
+                computeOutputRoiGradient ? py::cast(outputs.outputROIGradient) : py::none());
+        },
+        "The gradient of roi_align, towards the feature map and the boxes; the wrapper layer documents the parameters.",
+        py::arg("input_gradient"),
+        py::arg("roi"),
+        py::arg("batch_indices"),
+        py::arg("input") = dml::NullOpt,
+        py::kw_only(),
+        py::arg("reduction_function"),
+        py::arg("interpolation_mode"),
+        py::arg("spatial_scale_x"),
+        py::arg("spatial_scale_y"),
+        py::arg("input_pixel_offset"),
+        py::arg("output_pixel_offset"),
+        py::arg("minimum_samples_per_output"),
+        py::arg("maximum_samples_per_output"),
+        py::arg("align_regions_to_corners"),
+        py::arg("batch_size"),
+        py::arg("image_height"),
+        py::arg("image_width"),
+        py::arg("compute_output_gradient") = true,
+        py::arg("compute_output_roi_gradient") = false);
 }
