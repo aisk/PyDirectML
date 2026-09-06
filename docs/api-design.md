@@ -207,6 +207,20 @@ w = graph.constant(array, dtype=None, *, sizes=None, name=None)
 
 持有 `Expression` 句柄的对象和调用它的对象往往不是同一个，以 `Expression` 为键是正确的**原语**，不是终端用户的自然形态；没有名字，用户层会把位置绑定又造回来（`run(*values)` 按列表顺序 zip 成 dict）。所以 `graph.input(..., name=)` 和 `graph.constant(..., name=)` 接受一个 graph 内唯一的名字，绑定字典的 key 可以是 `Expression` 或名字，两者混用也行，同一个输入绑两次报错。报错信息里带名字：`input 0 'latent' (float16 [1, 4, 128, 128])`。不给名字什么都不变。
 
+### 4.14 算子覆盖
+
+DirectMLX 为推理包装的算子全部绑上，跳过的是训练用的 `*Grad`（`BatchNormalizationGrad`、`SliceGrad`、`RoiAlignGrad` 等）、`ConvolutionInteger` / `QuantizedLinearConvolution`，以及 FL 6.3 的 `Dequantize`（变长的量化参数张量加一个 `DML_QUANTIZATION_TYPE`，签名本身还要再设计一轮）。
+
+几个命名和形状上的决定：
+
+- **`dml.where(condition, a, b)`** 是 DirectMLX 的 `If`，`if` 是 Python 关键字。语义与 `np.where` 一致，名字就取后者的。
+- **`abs` / `max` / `min` / `pow` / `round` 遮蔽内置名**，但只在 `dml.` 下，和 `np.abs` 一样（`slice` 早就这样了）。为了躲开而改名（`maximum`、`elementwise_max`）比遮蔽更糟：C++ 叫什么这里就叫什么。注意 `dml.max(a, b)` 是逐元素的两操作数算子，不是归约；归约是 `dml.reduce(x, function=ReduceFunction.MAX)`。
+- **一元算子的 `scale_bias=(scale, bias)` 是一个元组**，不是两个参数、也不是一个类。DirectML 把它折进对输入的读取，算的是 `f(input * scale + bias)`；这两个数要么一起给要么一起不给，元组正好说明这件事。
+- **`output_dtype` 只有 uint8 和 uint32 合法**（比较、`is_nan`、`is_infinity`、`bit_count`），别的类型 DirectML 直接 `E_INVALIDARG`；逻辑算子的输入也只吃这两种。库不再复述这张表，错误由 DirectML 报。
+- **`fill_value_constant` / `fill_value_sequence` 的第一个位置参数是 graph**，与 DirectMLX 一致：它们没有输入张量，节点总得挂在某张图上。值在包装层用 numpy 转成张量类型的 8 个字节交给 `_core`，类型表在包装层，C++ 只做一次 memcpy；装不下的值（`value=300, dtype=uint8`）在这一步就报错。
+- **`top_k` 返回 `TopKOutputs(values, indices)`**，复数与 `max_pooling` 对齐；DirectMLX 这里写的是 `value` / `index`，是它自己的不一致。
+- **逐元素两操作数算子一律走 §4.9 的形状与类型检查**，包括 `max`、张量指数的 `pow`、以及 `where` 的 `a` / `b`（`condition` 只查形状）。报错里带调用名：`max(<...>, <...>): shapes differ`。
+
 ## 5. 硬约束
 
 不属于 API 设计，但设计绕着它们走。
@@ -214,6 +228,7 @@ w = graph.constant(array, dtype=None, *, sizes=None, name=None)
 - **单个 D3D12 buffer 到 4 GiB 就到头了**，再大不是返回 `E_OUTOFMEMORY`，而是直接 `DXGI_ERROR_DEVICE_REMOVED`。阈值实测很干净：一张带 3.75 GiB 权重的图能初始化，4.00 GiB 的不能，且和显存余量无关。DirectML 把一个模型的 `OWNED_BY_DML` 权重折进**单个** persistent resource，所以**任何超过 4 GiB 权重的模型都建不成一张图**；`samples/sdxl` 的 UNet 半精度 4.78 GiB，只能在 mid block 处劈成两张图跑，两张之间靠 `Buffer` 传递（§4.10）。库自己的缓冲区增长（`util.h` 的 `GrowBufferSize`）过了 256 MiB 改按固定步长，避免一个 2.1 GiB 的请求被翻倍成 4 GiB 主动撞墙。
 - **执行是同步的**。每次 `initialize` / `dispatch` / `Buffer.numpy()` 都在 fence 上等 GPU 完成。设备被移除时，是在这个等待点问 `GetDeviceRemovedReason`，所以错误会归到真正引起它的那次 dispatch 上，而不是之后某个无关调用。
 - **一张 graph 只能 `compile` 一次**。DirectMLX 的 `Graph::Compile` 第二次调用被 DirectML 以 `E_INVALIDARG` 拒绝。要两个算子就建两张图。
+- **`FILL_VALUE_SEQUENCE` 作为一张图的输出会让 DirectML 的图编译器直接 AV**，进程崩溃，不是一个 HRESULT。同一个节点喂给别的算子就没事，`FILL_VALUE_CONSTANT` 单独作输出也没事。包装层的 docstring 写明了这条，库不拦。
 - **绑定一个没有任何表达式消费的图输入**会在 dispatch 时破坏设备（之后的 `CreateOperator` 失败）。这是 DirectML 侧的行为，库目前不拦。
 
 ## 6. 已拍板的争议项

@@ -544,28 +544,79 @@ _core.Graph.compile = _graph_compile
 # E_INVALIDARG with no node named. The operands are right here, so say which.
 
 
-def _check_elementwise(symbol, a, b):
+def _check_elementwise(where, a, b):
     if a.shape != b.shape:
         raise ValueError(
-            f"{a!r} {symbol} {b!r}: shapes differ, and nothing broadcasts implicitly; "
+            f"{where}: shapes differ, and nothing broadcasts implicitly; "
             f"use dml.broadcast() to view one through the other's shape")
     if a.dtype != b.dtype:
-        raise ValueError(f"{a!r} {symbol} {b!r}: element types differ")
+        raise ValueError(f"{where}: element types differ")
 
 
 def _checked(symbol, function):
     """``function`` with the shape and dtype check in front of it."""
     @functools.wraps(function)
     def checked(a, b, **kwargs):
-        _check_elementwise(symbol, a, b)
+        _check_elementwise(f"{a!r} {symbol} {b!r}", a, b)
         return function(a, b, **kwargs)
     return checked
+
+
+def _checked_call(function):
+    """The same check for an operator written as a call, not a symbol."""
+    name = function.__name__
+
+    @functools.wraps(function)
+    def checked(a, b, **kwargs):
+        _check_elementwise(f"{name}({a!r}, {b!r})", a, b)
+        return function(a, b, **kwargs)
+    return checked
+
+
+def _with_dtype(function, *names):
+    """``function`` with the named data type keywords in either spelling."""
+    @functools.wraps(function)
+    def converting(*args, **kwargs):
+        for name in names:
+            if kwargs.get(name) is not None:
+                kwargs[name] = _to_data_type(kwargs[name])
+        return function(*args, **kwargs)
+    return converting
 
 
 add = _checked("+", _core.add)
 subtract = _checked("-", _core.subtract)
 multiply = _checked("*", _core.multiply)
 divide = _checked("/", _core.divide)
+
+# The elementwise operators with no symbol of their own. Comparisons write
+# their result as output_dtype, which is uint8 unless asked otherwise.
+max = _checked_call(_core.max)
+min = _checked_call(_core.min)
+mean = _checked_call(_core.mean)
+atan_yx = _checked_call(_core.atan_yx)
+difference_square = _checked_call(_core.difference_square)
+logical_and = _checked_call(_core.logical_and)
+logical_or = _checked_call(_core.logical_or)
+logical_xor = _checked_call(_core.logical_xor)
+bit_and = _checked_call(_core.bit_and)
+bit_or = _checked_call(_core.bit_or)
+bit_xor = _checked_call(_core.bit_xor)
+bit_shift_left = _checked_call(_core.bit_shift_left)
+bit_shift_right = _checked_call(_core.bit_shift_right)
+modulus_truncate = _checked_call(_core.modulus_truncate)
+modulus_floor = _checked_call(_core.modulus_floor)
+equals = _checked_call(_with_dtype(_core.equals, "output_dtype"))
+greater_than = _checked_call(_with_dtype(_core.greater_than, "output_dtype"))
+greater_than_or_equal = _checked_call(_with_dtype(_core.greater_than_or_equal, "output_dtype"))
+less_than = _checked_call(_with_dtype(_core.less_than, "output_dtype"))
+less_than_or_equal = _checked_call(_with_dtype(_core.less_than_or_equal, "output_dtype"))
+
+# The unary operators that name a data type, in either spelling.
+is_nan = _with_dtype(_core.is_nan, "output_dtype")
+is_infinity = _with_dtype(_core.is_infinity, "output_dtype")
+bit_count = _with_dtype(_core.bit_count, "output_dtype")
+quantize_linear = _with_dtype(_core.quantize_linear, "output_dtype")
 
 
 def _patch_operator(name, function):
@@ -705,6 +756,267 @@ def gru(input, weight, recurrence, bias=None, hidden_init=None,
         input, weight, recurrence, bias, hidden_init, sequence_lengths,
         activation_descs=list(activation_descs), direction=direction,
         linear_before_reset=linear_before_reset, output_options=output_options))
+
+
+def pow(input, exponent, *, scale_bias=None):
+    """``input ** exponent``, elementwise.
+
+    The exponent is a tensor of the input's shape and type, or a Python float,
+    which is a different DirectML operator and not a constant tensor.
+    """
+    if isinstance(exponent, Expression):
+        _check_elementwise(f"pow({input!r}, {exponent!r})", input, exponent)
+    return _core.pow(input, exponent, scale_bias=scale_bias)
+
+
+def where(condition, a, b):
+    """``a`` where ``condition`` is non-zero, ``b`` elsewhere, elementwise.
+
+    DirectMLX spells this ``If``. All three tensors want the same shape, and
+    the condition is a uint8 tensor whose zero elements are the false ones.
+    """
+    _check_elementwise(f"where({condition!r}, {a!r}, {b!r})", a, b)
+    if condition.shape != a.shape:
+        raise ValueError(
+            f"where({condition!r}, {a!r}, {b!r}): the condition's shape differs "
+            f"from the operands'; use dml.broadcast() to view it through theirs")
+    return _core.where(condition, a, b)
+
+
+def cast(input, *, dtype):
+    """The input's values converted to ``dtype``, as a ``static_cast`` would.
+
+    This is the operator that rounds and truncates; ``reinterpret`` is the one
+    that rereads the same bytes.
+    """
+    return _core.cast(input, dtype=_to_data_type(dtype))
+
+
+def reduce(input, *, function, axes=(), output_dtype=None):
+    """Reduce ``axes`` to an extent of 1 with ``function``.
+
+    Args:
+        function: A ReduceFunction: SUM, AVERAGE, MAX, ARGMAX, L2, ...
+        axes: The axes to reduce; every axis by default.
+        output_dtype: The result's type, the input's by default. ARGMAX and
+            ARGMIN write indices and want an integer type here.
+    """
+    return _core.reduce(
+        input, function=function, axes=list(axes),
+        output_dtype=(TensorDataType.UNKNOWN if output_dtype is None
+                      else _to_data_type(output_dtype)))
+
+
+def one_hot(indices, values, *, output_length, axis):
+    """A tensor of ``values[1]`` at each index and ``values[0]`` elsewhere.
+
+    Args:
+        indices: The index to set, per position of the other axes.
+        values: A two-element tensor, [off, on]. Its type is the result's.
+        output_length: The extent the active axis grows to.
+        axis: The axis the indices point into.
+    """
+    return _core.one_hot(indices, values, output_length=output_length, axis=axis)
+
+
+def gather_nd(input, indices, *, input_dimension_count, indices_dimension_count,
+              batch_dimension_count=0):
+    """Slices of the input, addressed by coordinates in the indices tensor.
+
+    Args:
+        input_dimension_count: How many trailing axes of the input the
+            coordinates address; the rest are batch axes.
+        indices_dimension_count: How many trailing axes of the indices tensor
+            hold coordinates, the last of them being the coordinate itself.
+        batch_dimension_count: How many leading axes the two tensors share,
+            gathered one batch at a time.
+    """
+    return _core.gather_nd(
+        input, indices, input_dimension_count=input_dimension_count,
+        indices_dimension_count=indices_dimension_count,
+        batch_dimension_count=batch_dimension_count)
+
+
+def scatter_nd(input, indices, updates, *, input_dimension_count,
+               indices_dimension_count):
+    """A copy of the input with ``updates`` written at ``indices``.
+
+    The dimension counts are ``gather_nd``'s, and the updates tensor holds one
+    slice per coordinate.
+    """
+    return _core.scatter_nd(
+        input, indices, updates, input_dimension_count=input_dimension_count,
+        indices_dimension_count=indices_dimension_count)
+
+
+def resample(input, *, output_sizes, mode,
+             rounding_direction=AxisDirection.INCREASING, scales=(),
+             input_pixel_offsets=(), output_pixel_offsets=(), antialiased=False):
+    """Resample every axis of the input to ``output_sizes``.
+
+    ``upsample_2d`` is the same operator with an integer scale on the last two
+    axes; this one takes the shape it should produce.
+
+    Args:
+        output_sizes: The shape out, of the input's rank.
+        mode: NEAREST_NEIGHBOR or LINEAR.
+        rounding_direction: Which way NEAREST_NEIGHBOR breaks a tie; INCREASING
+            by default.
+        scales: Output extent over input extent, per axis. Computed from the
+            sizes when empty.
+        input_pixel_offsets: Where a source pixel's center sits, per axis;
+            0.5 each when empty.
+        output_pixel_offsets: The same for the destination; -0.5 each when
+            empty. Together with the scales these decide the sampling grid.
+        antialiased: Filter over the whole source window when downsampling,
+            rather than point-sampling it.
+    """
+    return _core.resample(
+        input, output_sizes=list(output_sizes), mode=mode,
+        rounding_direction=rounding_direction, scales=list(scales),
+        input_pixel_offsets=list(input_pixel_offsets),
+        output_pixel_offsets=list(output_pixel_offsets), antialiased=antialiased)
+
+
+def roi_align(input, roi, batch_indices, *, reduction_function,
+              interpolation_mode, spatial_scale_x, spatial_scale_y,
+              input_pixel_offset, output_pixel_offset, out_of_bounds_input_value,
+              minimum_samples_per_output, maximum_samples_per_output,
+              align_regions_to_corners, output_height, output_width):
+    """Pool each region of interest down to one fixed-size tile.
+
+    Args:
+        input: The feature map, [batch, channels, height, width].
+        roi: One box per region, as x1, y1, x2, y2 along the last axis.
+        batch_indices: Which image of the batch each region belongs to.
+        reduction_function: AVERAGE or MAX over the samples of a bin.
+        interpolation_mode: How a sample between pixels is read.
+        spatial_scale_x: Scale from the boxes' coordinates to input pixels,
+            horizontally.
+        spatial_scale_y: The same, vertically.
+        input_pixel_offset: Where a pixel's center sits in the input, usually
+            0.5.
+        output_pixel_offset: The same for an output bin, usually -0.5.
+        out_of_bounds_input_value: What a sample outside the input reads as.
+        minimum_samples_per_output: Fewest samples taken per output bin.
+        maximum_samples_per_output: Most samples taken per output bin; equal to
+            the minimum fixes the sampling ratio.
+        align_regions_to_corners: Align the regions to pixel corners rather
+            than centers, dropping the half-pixel shift.
+        output_height: Rows of the output tile.
+        output_width: Columns of the output tile.
+    """
+    return _core.roi_align(
+        input, roi, batch_indices, reduction_function=reduction_function,
+        interpolation_mode=interpolation_mode, spatial_scale_x=spatial_scale_x,
+        spatial_scale_y=spatial_scale_y, input_pixel_offset=input_pixel_offset,
+        output_pixel_offset=output_pixel_offset,
+        out_of_bounds_input_value=out_of_bounds_input_value,
+        minimum_samples_per_output=minimum_samples_per_output,
+        maximum_samples_per_output=maximum_samples_per_output,
+        align_regions_to_corners=align_regions_to_corners,
+        output_height=output_height, output_width=output_width)
+
+
+def _fill_value(value, data_type, what):
+    """``value`` as the eight bytes DirectML reads a scalar of ``data_type`` from."""
+    try:
+        scalar = np.array(value, dtype=_NUMPY_DTYPES[data_type])
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{what}={value!r} is not a {_NUMPY_DTYPES[data_type]}: "
+                         f"{error}") from None
+    return scalar.tobytes().ljust(8, b"\0")
+
+
+def fill_value_constant(graph, *, sizes, value, dtype=None):
+    """A tensor of ``sizes`` filled with ``value``, computed on the GPU.
+
+    Nothing is uploaded and no input is added: this is the constant to reach
+    for when a graph needs a tensor of zeros or ones, rather than
+    ``graph.constant(np.zeros(...))``.
+
+    Args:
+        sizes: The shape to produce.
+        value: The value every element takes, converted to ``dtype``.
+        dtype: The tensor's type; float32 by default.
+    """
+    data_type = TensorDataType.FLOAT32 if dtype is None else _to_data_type(dtype)
+    return _core.fill_value_constant(
+        graph, sizes=list(sizes), dtype=data_type,
+        value=_fill_value(value, data_type, "value"))
+
+
+def fill_value_sequence(graph, *, sizes, value_start, value_delta, dtype=None):
+    """A tensor of ``sizes`` counting from ``value_start`` by ``value_delta``.
+
+    The sequence runs in memory order, so a [1, 1, 2, 3] tensor starting at 0
+    with a delta of 1 holds [[0, 1, 2], [3, 4, 5]].
+
+    DirectML's graph compiler faults on a graph whose output is this operator
+    itself; pass the result through another operator (``dml.identity()`` will
+    do) when the sequence is what the graph returns.
+
+    Args:
+        sizes: The shape to produce.
+        value_start: The first element's value.
+        value_delta: What each element adds to the one before it.
+        dtype: The tensor's type; float32 by default.
+    """
+    data_type = TensorDataType.FLOAT32 if dtype is None else _to_data_type(dtype)
+    return _core.fill_value_sequence(
+        graph, sizes=list(sizes), dtype=data_type,
+        value_start=_fill_value(value_start, data_type, "value_start"),
+        value_delta=_fill_value(value_delta, data_type, "value_delta"))
+
+
+class TopKOutputs(typing.NamedTuple):
+    values: _core.Expression
+    indices: _core.Expression
+
+
+class NonZeroCoordinatesOutputs(typing.NamedTuple):
+    count: _core.Expression
+    coordinates: _core.Expression
+
+
+class RandomGeneratorOutputs(typing.NamedTuple):
+    values: _core.Expression
+    state: typing.Optional[_core.Expression]
+
+
+def top_k(input, *, axis, k, axis_direction=AxisDirection.DECREASING):
+    """The ``k`` largest elements along ``axis``, and where they came from.
+
+    Returns ``TopKOutputs(values, indices)``, both of the input's shape with
+    ``axis`` cut to ``k``. ``axis_direction=AxisDirection.INCREASING`` takes the
+    smallest instead. DirectMLX names these outputs value and index; they are
+    plural here, as max_pooling's are.
+    """
+    return TopKOutputs(*_core.top_k(input, axis=axis, k=k,
+                                    axis_direction=axis_direction))
+
+
+def non_zero_coordinates(input):
+    """Where the input's non-zero elements are.
+
+    Returns ``NonZeroCoordinatesOutputs(count, coordinates)``: how many
+    elements are non-zero, and a [element count, rank] tensor of their indices,
+    of which only the first ``count`` rows are filled in.
+    """
+    return NonZeroCoordinatesOutputs(*_core.non_zero_coordinates(input))
+
+
+def random_generator(input_state, *, output_sizes, output_state=True,
+                     type=RandomGeneratorType.PHILOX_4X32_10):
+    """Uniform random uint32s, from a generator state tensor.
+
+    Returns ``RandomGeneratorOutputs(values, state)``; ``state`` is None unless
+    ``output_state=True``, and is the state to feed the next dispatch, which is
+    what makes the stream continue rather than repeat.
+    """
+    return RandomGeneratorOutputs(*_core.random_generator(
+        input_state, output_sizes=list(output_sizes), output_state=output_state,
+        type=type))
 
 
 # --- FusedActivation factories -----------------------------------------------

@@ -6,6 +6,38 @@
 
 #include "precomp.h"
 
+namespace
+{
+    // The optional linear transform an elementwise unary operator folds into
+    // the read of its input, spelled in Python as a (scale, bias) pair.
+    dml::Optional<DML_SCALE_BIAS> ToScaleBias(std::optional<std::pair<float, float>> const& scaleBias)
+    {
+        if (!scaleBias)
+        {
+            return dml::NullOpt;
+        }
+        return DML_SCALE_BIAS{ scaleBias->first, scaleBias->second };
+    }
+
+    // The value a fill operator writes, as the eight bytes of the tensor's own
+    // type. The wrapper layer converts the Python number with numpy, which is
+    // where the type table already lives; here it is only copied into place.
+    DML_SCALAR_UNION ToScalarUnion(py::bytes const& value)
+    {
+        std::string bytes = value;
+        if (bytes.size() != sizeof(DML_SCALAR_UNION::Bytes))
+        {
+            throw std::invalid_argument(
+                "a fill value is " + std::to_string(sizeof(DML_SCALAR_UNION::Bytes)) +
+                " bytes, not " + std::to_string(bytes.size()));
+        }
+
+        DML_SCALAR_UNION scalar = {};
+        memcpy(scalar.Bytes, bytes.data(), sizeof(scalar.Bytes));
+        return scalar;
+    }
+}
+
 PYBIND11_MODULE(_core, module)
 {
     module.doc() = "C++ core of the directml package. Import directml, not this.";
@@ -60,6 +92,41 @@ PYBIND11_MODULE(_core, module)
         .value("CONSTANT", DML_PADDING_MODE_CONSTANT)
         .value("EDGE", DML_PADDING_MODE_EDGE)
         .value("REFLECTION", DML_PADDING_MODE_REFLECTION);
+
+    py::enum_<DML_ROUNDING_MODE>(module, "RoundingMode")
+        .value("HALVES_TO_NEAREST_EVEN", DML_ROUNDING_MODE_HALVES_TO_NEAREST_EVEN)
+        .value("TOWARD_ZERO", DML_ROUNDING_MODE_TOWARD_ZERO)
+        .value("TOWARD_INFINITY", DML_ROUNDING_MODE_TOWARD_INFINITY);
+
+    py::enum_<DML_IS_INFINITY_MODE>(module, "IsInfinityMode")
+        .value("EITHER", DML_IS_INFINITY_MODE_EITHER)
+        .value("POSITIVE", DML_IS_INFINITY_MODE_POSITIVE)
+        .value("NEGATIVE", DML_IS_INFINITY_MODE_NEGATIVE);
+
+    py::enum_<DML_AXIS_DIRECTION>(module, "AxisDirection")
+        .value("INCREASING", DML_AXIS_DIRECTION_INCREASING)
+        .value("DECREASING", DML_AXIS_DIRECTION_DECREASING);
+
+    py::enum_<DML_DEPTH_SPACE_ORDER>(module, "DepthSpaceOrder")
+        .value("DEPTH_COLUMN_ROW", DML_DEPTH_SPACE_ORDER_DEPTH_COLUMN_ROW)
+        .value("COLUMN_ROW_DEPTH", DML_DEPTH_SPACE_ORDER_COLUMN_ROW_DEPTH);
+
+    py::enum_<DML_REDUCE_FUNCTION>(module, "ReduceFunction")
+        .value("ARGMAX", DML_REDUCE_FUNCTION_ARGMAX)
+        .value("ARGMIN", DML_REDUCE_FUNCTION_ARGMIN)
+        .value("AVERAGE", DML_REDUCE_FUNCTION_AVERAGE)
+        .value("L1", DML_REDUCE_FUNCTION_L1)
+        .value("L2", DML_REDUCE_FUNCTION_L2)
+        .value("LOG_SUM", DML_REDUCE_FUNCTION_LOG_SUM)
+        .value("LOG_SUM_EXP", DML_REDUCE_FUNCTION_LOG_SUM_EXP)
+        .value("MAX", DML_REDUCE_FUNCTION_MAX)
+        .value("MIN", DML_REDUCE_FUNCTION_MIN)
+        .value("MULTIPLY", DML_REDUCE_FUNCTION_MULTIPLY)
+        .value("SUM", DML_REDUCE_FUNCTION_SUM)
+        .value("SUM_SQUARE", DML_REDUCE_FUNCTION_SUM_SQUARE);
+
+    py::enum_<DML_RANDOM_GENERATOR_TYPE>(module, "RandomGeneratorType")
+        .value("PHILOX_4X32_10", DML_RANDOM_GENERATOR_TYPE_PHILOX_4X32_10);
 
     py::enum_<DML_EXECUTION_FLAGS>(module, "ExecutionFlags", py::arithmetic())
         .value("NONE", DML_EXECUTION_FLAG_NONE)
@@ -726,4 +793,623 @@ PYBIND11_MODULE(_core, module)
         py::kw_only(),
         py::arg("axis"),
         py::arg("index_dimensions"));
+
+    // Elementwise unary operators. Every one of them takes the same optional
+    // (scale, bias) pair, which DirectML folds into the read of the input: the
+    // operator computes f(input * scale + bias) for one pass over the data.
+    //
+#define PYDML_UNARY(_name, _function, _doc)                                     \
+    module.def(_name,                                                           \
+        [](dml::Expression input, std::optional<std::pair<float, float>> scaleBias) { \
+            return dml::_function(input, ToScaleBias(scaleBias));               \
+        },                                                                      \
+        _doc,                                                                   \
+        py::arg("input"),                                                       \
+        py::kw_only(),                                                          \
+        py::arg("scale_bias") = py::none())
+
+    PYDML_UNARY("identity", Identity, "A copy of the input.");
+    PYDML_UNARY("abs", Abs, "Elementwise absolute value.");
+    PYDML_UNARY("acos", ACos, "Elementwise arc cosine, in radians.");
+    PYDML_UNARY("asin", ASin, "Elementwise arc sine, in radians.");
+    PYDML_UNARY("atan", ATan, "Elementwise arc tangent, in radians.");
+    PYDML_UNARY("ceil", Ceil, "Elementwise round towards positive infinity.");
+    PYDML_UNARY("cos", Cos, "Elementwise cosine of an angle in radians.");
+    PYDML_UNARY("exp", Exp, "Elementwise e ** input.");
+    PYDML_UNARY("floor", Floor, "Elementwise round towards negative infinity.");
+    PYDML_UNARY("log", Log, "Elementwise natural logarithm.");
+    PYDML_UNARY("recip", Recip, "Elementwise 1 / input.");
+    PYDML_UNARY("sin", Sin, "Elementwise sine of an angle in radians.");
+    PYDML_UNARY("sqrt", Sqrt, "Elementwise square root.");
+    PYDML_UNARY("tan", Tan, "Elementwise tangent of an angle in radians.");
+    PYDML_UNARY("erf", Erf, "Elementwise Gauss error function.");
+    PYDML_UNARY("sinh", Sinh, "Elementwise hyperbolic sine.");
+    PYDML_UNARY("cosh", Cosh, "Elementwise hyperbolic cosine.");
+    PYDML_UNARY("tanh", Tanh, "Elementwise hyperbolic tangent.");
+    PYDML_UNARY("asinh", ASinh, "Elementwise inverse hyperbolic sine.");
+    PYDML_UNARY("acosh", ACosh, "Elementwise inverse hyperbolic cosine.");
+    PYDML_UNARY("atanh", ATanh, "Elementwise inverse hyperbolic tangent.");
+
+#undef PYDML_UNARY
+
+    // The unary operators with no scale and bias to fold.
+    //
+    module.def("sign", &dml::Sign, "Elementwise -1, 0 or 1 by the sign of the input.",
+        py::arg("input"));
+
+    module.def("negate", &dml::Negate, "Elementwise -input.",
+        py::arg("input"));
+
+    module.def("logical_not", &dml::LogicalNot, "Elementwise 1 where the input is zero, 0 elsewhere.",
+        py::arg("input"));
+
+    module.def("bit_not", &dml::BitNot, "Elementwise bitwise complement.",
+        py::arg("input"));
+
+    // The unary operators with parameters of their own.
+    //
+    module.def("clip", [](
+        dml::Expression input,
+        float min,
+        float max,
+        std::optional<std::pair<float, float>> scaleBias) {
+            return dml::Clip(input, min, max, ToScaleBias(scaleBias));
+        },
+        "Elementwise clamp of the input to [min, max].",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("min"),
+        py::arg("max"),
+        py::arg("scale_bias") = py::none());
+
+    module.def("threshold", [](
+        dml::Expression input,
+        float min,
+        std::optional<std::pair<float, float>> scaleBias) {
+            return dml::Threshold(input, min, ToScaleBias(scaleBias));
+        },
+        "Elementwise max(input, min), the one-sided clip.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("min"),
+        py::arg("scale_bias") = py::none());
+
+    module.def("round", [](dml::Expression input, DML_ROUNDING_MODE roundingMode) {
+            return dml::Round(input, roundingMode);
+        },
+        "Elementwise round to an integer value, by the given rule.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("rounding_mode") = DML_ROUNDING_MODE_HALVES_TO_NEAREST_EVEN);
+
+    module.def("is_nan", [](dml::Expression input, DML_TENSOR_DATA_TYPE outputDataType) {
+            return dml::IsNaN(input, outputDataType);
+        },
+        "Elementwise 1 where the input is NaN, 0 elsewhere.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("output_dtype") = DML_TENSOR_DATA_TYPE_UINT8);
+
+    module.def("is_infinity", [](
+        dml::Expression input,
+        DML_IS_INFINITY_MODE infinityMode,
+        DML_TENSOR_DATA_TYPE outputDataType) {
+            return dml::IsInfinity(input, infinityMode, outputDataType);
+        },
+        "Elementwise 1 where the input is an infinity of the given sign, 0 elsewhere.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("infinity_mode") = DML_IS_INFINITY_MODE_EITHER,
+        py::arg("output_dtype") = DML_TENSOR_DATA_TYPE_UINT8);
+
+    module.def("bit_count", [](dml::Expression input, DML_TENSOR_DATA_TYPE outputDataType) {
+            return dml::BitCount(input, outputDataType);
+        },
+        "Elementwise count of the bits set in the input.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("output_dtype") = DML_TENSOR_DATA_TYPE_UINT8);
+
+    module.def("cast", [](dml::Expression input, DML_TENSOR_DATA_TYPE targetDataType) {
+            return dml::Cast(input, targetDataType);
+        },
+        "Convert the elements to another type, as a static_cast would.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("dtype"));
+
+    // Elementwise binary operators. Both operands want the same shape and type;
+    // the wrapper layer says which one is wrong when they differ. The logical
+    // and bitwise ones read and write a predicate, so uint8 or uint32.
+    //
+#define PYDML_BINARY(_name, _function, _doc)                                    \
+    module.def(_name, &dml::_function, _doc, py::arg("a"), py::arg("b"))
+
+    PYDML_BINARY("max", Max, "Elementwise larger of a and b.");
+    PYDML_BINARY("min", Min, "Elementwise smaller of a and b.");
+    PYDML_BINARY("mean", Mean, "Elementwise (a + b) / 2.");
+    PYDML_BINARY("atan_yx", ATanYX, "Elementwise arc tangent of a / b, in the quadrant the signs of both name.");
+    PYDML_BINARY("difference_square", DifferenceSquare, "Elementwise (a - b) ** 2.");
+    PYDML_BINARY("logical_and", LogicalAnd, "Elementwise 1 where both operands are non-zero, 0 elsewhere.");
+    PYDML_BINARY("logical_or", LogicalOr, "Elementwise 1 where either operand is non-zero, 0 elsewhere.");
+    PYDML_BINARY("logical_xor", LogicalXor, "Elementwise 1 where exactly one operand is non-zero, 0 elsewhere.");
+    PYDML_BINARY("bit_and", BitAnd, "Elementwise bitwise and.");
+    PYDML_BINARY("bit_or", BitOr, "Elementwise bitwise or.");
+    PYDML_BINARY("bit_xor", BitXor, "Elementwise bitwise exclusive or.");
+    PYDML_BINARY("bit_shift_left", BitShiftLeft, "Elementwise a shifted left by b bits.");
+    PYDML_BINARY("bit_shift_right", BitShiftRight, "Elementwise a shifted right by b bits.");
+    PYDML_BINARY("modulus_truncate", ModulusTruncate, "Elementwise remainder with the sign of a, as C's % has.");
+    PYDML_BINARY("modulus_floor", ModulusFloor, "Elementwise remainder with the sign of b, as Python's % has.");
+
+#undef PYDML_BINARY
+
+    // The comparisons, which write their result as the type asked for rather
+    // than the operands'. uint8 and uint32 are the only two DirectML accepts,
+    // here and on is_nan, is_infinity and bit_count.
+    //
+#define PYDML_COMPARISON(_name, _function, _doc)                                \
+    module.def(_name,                                                           \
+        [](dml::Expression a, dml::Expression b, DML_TENSOR_DATA_TYPE outputDataType) { \
+            return dml::_function(a, b, outputDataType);                        \
+        },                                                                      \
+        _doc,                                                                   \
+        py::arg("a"),                                                           \
+        py::arg("b"),                                                           \
+        py::kw_only(),                                                          \
+        py::arg("output_dtype") = DML_TENSOR_DATA_TYPE_UINT8)
+
+    PYDML_COMPARISON("equals", Equals, "Elementwise 1 where a == b, 0 elsewhere.");
+    PYDML_COMPARISON("greater_than", GreaterThan, "Elementwise 1 where a > b, 0 elsewhere.");
+    PYDML_COMPARISON("greater_than_or_equal", GreaterThanOrEqual, "Elementwise 1 where a >= b, 0 elsewhere.");
+    PYDML_COMPARISON("less_than", LessThan, "Elementwise 1 where a < b, 0 elsewhere.");
+    PYDML_COMPARISON("less_than_or_equal", LessThanOrEqual, "Elementwise 1 where a <= b, 0 elsewhere.");
+
+#undef PYDML_COMPARISON
+
+    // Pow is the one elementwise operator with a scalar form of its own: a
+    // constant exponent is a different DirectML operator, not a constant tensor.
+    //
+    module.def("pow", [](
+        dml::Expression input,
+        dml::Expression exponent,
+        std::optional<std::pair<float, float>> scaleBias) {
+            return dml::Pow(input, exponent, ToScaleBias(scaleBias));
+        },
+        "Elementwise input ** exponent.",
+        py::arg("input"),
+        py::arg("exponent"),
+        py::kw_only(),
+        py::arg("scale_bias") = py::none());
+
+    module.def("pow", [](
+        dml::Expression input,
+        float exponent,
+        std::optional<std::pair<float, float>> scaleBias) {
+            return dml::Pow(input, exponent, ToScaleBias(scaleBias));
+        },
+        "Elementwise input ** exponent for a constant exponent.",
+        py::arg("input"),
+        py::arg("exponent"),
+        py::kw_only(),
+        py::arg("scale_bias") = py::none());
+
+    module.def("where", [](dml::Expression condition, dml::Expression a, dml::Expression b) {
+            return dml::If(condition, a, b);
+        },
+        "Elementwise a where the condition is non-zero, b elsewhere.",
+        py::arg("condition"),
+        py::arg("a"),
+        py::arg("b"));
+
+    // Activations. Every one of these is also a FusedActivation an operator can
+    // apply to its own output; these are the standalone nodes.
+    //
+    module.def("activation_elu", &dml::ActivationElu,
+        "Exponential linear unit, input where positive and alpha * (exp(input) - 1) elsewhere.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 1.0f);
+
+    module.def("activation_celu", &dml::ActivationCelu,
+        "Continuously differentiable exponential linear unit.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 1.0f);
+
+    module.def("activation_hardmax", &dml::ActivationHardmax,
+        "1 at the largest element of each row of a flattened 2-D view, 0 elsewhere.",
+        py::arg("input"));
+
+    module.def("activation_hard_sigmoid", &dml::ActivationHardSigmoid,
+        "Elementwise clip(alpha * input + beta, 0, 1).",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 0.2f,
+        py::arg("beta") = 0.5f);
+
+    module.def("activation_leaky_relu", &dml::ActivationLeakyRelu,
+        "Elementwise input where positive, alpha * input elsewhere.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 0.01f);
+
+    module.def("activation_log_softmax", &dml::ActivationLogSoftmax,
+        "The logarithm of the softmax, over the last dimension of a flattened 2-D view.",
+        py::arg("input"));
+
+    module.def("activation_parameterized_relu", &dml::ActivationParameterizedRelu,
+        "Leaky relu with the slope of the negative half read from a tensor, one per channel.",
+        py::arg("input"),
+        py::arg("slope"));
+
+    module.def("activation_parametric_softplus", &dml::ActivationParametricSoftplus,
+        "Elementwise alpha * log(1 + exp(beta * input)).",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha"),
+        py::arg("beta"));
+
+    module.def("activation_scaled_elu", &dml::ActivationScaledElu,
+        "The elu scaled by gamma, the self-normalizing activation.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 1.67326319217681884765625f,
+        py::arg("gamma") = 1.05070102214813232421875f);
+
+    module.def("activation_scaled_tanh", &dml::ActivationScaledTanh,
+        "Elementwise alpha * tanh(beta * input).",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 1.0f,
+        py::arg("beta") = 0.5f);
+
+    module.def("activation_shrink", &dml::ActivationShrink,
+        "Elementwise zero within threshold of zero, and shifted towards it by bias outside.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("bias") = 0.0f,
+        py::arg("threshold") = 0.5f);
+
+    module.def("activation_softplus", &dml::ActivationSoftplus,
+        "Elementwise log(1 + exp(steepness * input)) / steepness.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("steepness") = 1.0f);
+
+    module.def("activation_softsign", &dml::ActivationSoftsign,
+        "Elementwise input / (1 + abs(input)).",
+        py::arg("input"));
+
+    module.def("activation_thresholded_relu", &dml::ActivationThresholdedRelu,
+        "Elementwise input where it is above alpha, 0 elsewhere.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("alpha") = 1.0f);
+
+    // Shape and data movement.
+    //
+    module.def("split", [](
+        dml::Expression input,
+        uint32_t axis,
+        std::vector<uint32_t> outputAxisSizes) {
+            return dml::Split(input, axis, outputAxisSizes);
+        },
+        "Cut the input along an axis into one output per requested extent.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("axis"),
+        py::arg("output_axis_sizes"));
+
+    module.def("tile", [](dml::Expression input, std::vector<uint32_t> repeats) {
+            return dml::Tile(input, repeats);
+        },
+        "Repeat the input repeats[i] times along axis i.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("repeats"));
+
+    module.def("one_hot", [](
+        dml::Expression indices,
+        dml::Expression values,
+        uint32_t outputLength,
+        uint32_t axis) {
+            return dml::OneHot(indices, values, outputLength, axis);
+        },
+        "Expand an axis of indices to output_length, filled with values[1] at the index and values[0] elsewhere.",
+        py::arg("indices"),
+        py::arg("values"),
+        py::kw_only(),
+        py::arg("output_length"),
+        py::arg("axis"));
+
+    module.def("top_k", [](
+        dml::Expression input,
+        uint32_t axis,
+        uint32_t k,
+        DML_AXIS_DIRECTION axisDirection) {
+            auto outputs = dml::TopK(input, axis, k, axisDirection);
+            return py::make_tuple(outputs.value, outputs.index);
+        },
+        "The k largest or smallest elements along an axis; the wrapper layer shapes the outputs.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("axis"),
+        py::arg("k"),
+        py::arg("axis_direction") = DML_AXIS_DIRECTION_DECREASING);
+
+    module.def("gather_elements", [](
+        dml::Expression input,
+        dml::Expression indices,
+        uint32_t axis) {
+            return dml::GatherElements(input, indices, axis);
+        },
+        "Pick one element per index along an axis, the indices tensor's shape out.",
+        py::arg("input"),
+        py::arg("indices"),
+        py::kw_only(),
+        py::arg("axis"));
+
+    module.def("gather_nd", [](
+        dml::Expression input,
+        dml::Expression indices,
+        uint32_t inputDimensionCount,
+        uint32_t indicesDimensionCount,
+        uint32_t batchDimensionCount) {
+            return dml::GatherND(input, indices, inputDimensionCount, indicesDimensionCount, batchDimensionCount);
+        },
+        "Pick slices of the input by coordinates in the last axis of the indices tensor.",
+        py::arg("input"),
+        py::arg("indices"),
+        py::kw_only(),
+        py::arg("input_dimension_count"),
+        py::arg("indices_dimension_count"),
+        py::arg("batch_dimension_count") = 0);
+
+    module.def("scatter_elements", [](
+        dml::Expression input,
+        dml::Expression indices,
+        dml::Expression updates,
+        uint32_t axis) {
+            return dml::ScatterElements(input, indices, updates, axis);
+        },
+        "A copy of the input with the updates written at the indices along an axis.",
+        py::arg("input"),
+        py::arg("indices"),
+        py::arg("updates"),
+        py::kw_only(),
+        py::arg("axis"));
+
+    module.def("scatter_nd", [](
+        dml::Expression input,
+        dml::Expression indices,
+        dml::Expression updates,
+        uint32_t inputDimensionCount,
+        uint32_t indicesDimensionCount) {
+            return dml::ScatterND(input, indices, updates, inputDimensionCount, indicesDimensionCount);
+        },
+        "A copy of the input with the updates written at the coordinates in the indices tensor.",
+        py::arg("input"),
+        py::arg("indices"),
+        py::arg("updates"),
+        py::kw_only(),
+        py::arg("input_dimension_count"),
+        py::arg("indices_dimension_count"));
+
+    module.def("space_to_depth", [](
+        dml::Expression input,
+        uint32_t blockSize,
+        DML_DEPTH_SPACE_ORDER order) {
+            return dml::SpaceToDepth(input, blockSize, order);
+        },
+        "Move block_size x block_size spatial patches into the channel axis.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("block_size"),
+        py::arg("order") = DML_DEPTH_SPACE_ORDER_DEPTH_COLUMN_ROW);
+
+    module.def("depth_to_space", [](
+        dml::Expression input,
+        uint32_t blockSize,
+        DML_DEPTH_SPACE_ORDER order) {
+            return dml::DepthToSpace(input, blockSize, order);
+        },
+        "Move channels out into block_size x block_size spatial patches.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("block_size"),
+        py::arg("order") = DML_DEPTH_SPACE_ORDER_DEPTH_COLUMN_ROW);
+
+    module.def("reverse_subsequences", [](
+        dml::Expression input,
+        dml::Expression sequenceLengths,
+        uint32_t axis) {
+            return dml::ReverseSubsequences(input, sequenceLengths, axis);
+        },
+        "Reverse the first sequence_lengths[i] elements of each subsequence along an axis.",
+        py::arg("input"),
+        py::arg("sequence_lengths"),
+        py::kw_only(),
+        py::arg("axis"));
+
+    module.def("resample", [](
+        dml::Expression input,
+        dml::TensorDimensions outputSizes,
+        DML_INTERPOLATION_MODE mode,
+        DML_AXIS_DIRECTION roundingDirection,
+        std::vector<float> scales,
+        std::vector<float> inputPixelOffsets,
+        std::vector<float> outputPixelOffsets,
+        bool antialiased) {
+            return dml::Resample(input, std::move(outputSizes), mode, roundingDirection,
+                scales, inputPixelOffsets, outputPixelOffsets, antialiased);
+        },
+        "Resample every axis to output_sizes; the wrapper layer documents the offsets.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("output_sizes"),
+        py::arg("mode"),
+        py::arg("rounding_direction") = DML_AXIS_DIRECTION_INCREASING,
+        py::arg("scales") = std::vector<float>{},
+        py::arg("input_pixel_offsets") = std::vector<float>{},
+        py::arg("output_pixel_offsets") = std::vector<float>{},
+        py::arg("antialiased") = false);
+
+    module.def("fill_value_constant", [](
+        pydml::Graph& graph,
+        dml::TensorDimensions sizes,
+        DML_TENSOR_DATA_TYPE dataType,
+        py::bytes value) {
+            return dml::FillValueConstant(graph.graph, std::move(sizes), dataType, ToScalarUnion(value));
+        },
+        "A tensor of one repeated value, computed rather than uploaded.",
+        py::arg("graph"),
+        py::kw_only(),
+        py::arg("sizes"),
+        py::arg("dtype"),
+        py::arg("value"));
+
+    module.def("fill_value_sequence", [](
+        pydml::Graph& graph,
+        dml::TensorDimensions sizes,
+        DML_TENSOR_DATA_TYPE dataType,
+        py::bytes valueStart,
+        py::bytes valueDelta) {
+            return dml::FillValueSequence(graph.graph, std::move(sizes), dataType,
+                ToScalarUnion(valueStart), ToScalarUnion(valueDelta));
+        },
+        "An arithmetic sequence in memory order, computed rather than uploaded.",
+        py::arg("graph"),
+        py::kw_only(),
+        py::arg("sizes"),
+        py::arg("dtype"),
+        py::arg("value_start"),
+        py::arg("value_delta"));
+
+    // Reductions and the operators with an output the shape of a question.
+    //
+    module.def("reduce", [](
+        dml::Expression input,
+        DML_REDUCE_FUNCTION function,
+        std::vector<uint32_t> axes,
+        DML_TENSOR_DATA_TYPE outputDataType) {
+            return dml::Reduce(input, function, axes, outputDataType);
+        },
+        "Reduce the given axes to an extent of 1 with the named function.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("function"),
+        py::arg("axes") = std::vector<uint32_t>{},
+        py::arg("output_dtype") = DML_TENSOR_DATA_TYPE_UNKNOWN);
+
+    module.def("cumulative_summation", [](
+        dml::Expression input,
+        uint32_t axis,
+        DML_AXIS_DIRECTION axisDirection,
+        bool hasExclusiveSum) {
+            return dml::CumulativeSummation(input, axis, axisDirection, hasExclusiveSum);
+        },
+        "The running sum along an axis.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("axis"),
+        py::arg("axis_direction") = DML_AXIS_DIRECTION_INCREASING,
+        py::arg("has_exclusive_sum") = false);
+
+    module.def("cumulative_product", [](
+        dml::Expression input,
+        uint32_t axis,
+        DML_AXIS_DIRECTION axisDirection,
+        bool hasExclusiveProduct) {
+            return dml::CumulativeProduct(input, axis, axisDirection, hasExclusiveProduct);
+        },
+        "The running product along an axis.",
+        py::arg("input"),
+        py::kw_only(),
+        py::arg("axis"),
+        py::arg("axis_direction") = DML_AXIS_DIRECTION_INCREASING,
+        py::arg("has_exclusive_product") = false);
+
+    module.def("non_zero_coordinates", [](dml::Expression input) {
+            auto outputs = dml::NonZeroCoordinates(input);
+            return py::make_tuple(outputs.count, outputs.coordinates);
+        },
+        "How many elements are non-zero and where they are; the wrapper layer shapes the outputs.",
+        py::arg("input"));
+
+    module.def("quantize_linear", [](
+        dml::Expression input,
+        dml::Expression scale,
+        dml::Expression zeroPoint,
+        DML_TENSOR_DATA_TYPE outputDataType) {
+            return dml::QuantizeLinear(input, scale, zeroPoint, outputDataType);
+        },
+        "Quantize the input as round(input / scale) + zero_point.",
+        py::arg("input"),
+        py::arg("scale"),
+        py::arg("zero_point"),
+        py::kw_only(),
+        py::arg("output_dtype") = DML_TENSOR_DATA_TYPE_UINT8);
+
+    module.def("dequantize_linear", &dml::DequantizeLinear,
+        "Dequantize the input as (input - zero_point) * scale.",
+        py::arg("input"),
+        py::arg("scale"),
+        py::arg("zero_point"));
+
+    module.def("random_generator", [](
+        dml::Expression input_state,
+        dml::TensorDimensions outputSizes,
+        bool outputState,
+        DML_RANDOM_GENERATOR_TYPE type) {
+            auto outputs = dml::RandomGenerator(input_state, std::move(outputSizes), outputState, type);
+            // As with max_pooling: an unrequested output is None.
+            return py::make_tuple(
+                outputs.values,
+                outputState ? py::cast(outputs.state) : py::none());
+        },
+        "Uniform random uint32s from a generator state tensor; the wrapper layer shapes the outputs.",
+        py::arg("input_state"),
+        py::kw_only(),
+        py::arg("output_sizes"),
+        py::arg("output_state") = true,
+        py::arg("type") = DML_RANDOM_GENERATOR_TYPE_PHILOX_4X32_10);
+
+    module.def("roi_align", [](
+        dml::Expression input,
+        dml::Expression roi,
+        dml::Expression batchIndices,
+        DML_REDUCE_FUNCTION reductionFunction,
+        DML_INTERPOLATION_MODE interpolationMode,
+        float spatialScaleX,
+        float spatialScaleY,
+        float inputPixelOffset,
+        float outputPixelOffset,
+        float outOfBoundsInputValue,
+        uint32_t minimumSamplesPerOutput,
+        uint32_t maximumSamplesPerOutput,
+        bool alignRegionsToCorners,
+        uint32_t outputHeight,
+        uint32_t outputWidth) {
+            return dml::RoiAlign(input, roi, batchIndices, reductionFunction, interpolationMode,
+                spatialScaleX, spatialScaleY, inputPixelOffset, outputPixelOffset,
+                outOfBoundsInputValue, minimumSamplesPerOutput, maximumSamplesPerOutput,
+                alignRegionsToCorners, outputHeight, outputWidth);
+        },
+        "Pool each region of interest to one output_height x output_width tile; the wrapper layer documents the parameters.",
+        py::arg("input"),
+        py::arg("roi"),
+        py::arg("batch_indices"),
+        py::kw_only(),
+        py::arg("reduction_function"),
+        py::arg("interpolation_mode"),
+        py::arg("spatial_scale_x"),
+        py::arg("spatial_scale_y"),
+        py::arg("input_pixel_offset"),
+        py::arg("output_pixel_offset"),
+        py::arg("out_of_bounds_input_value"),
+        py::arg("minimum_samples_per_output"),
+        py::arg("maximum_samples_per_output"),
+        py::arg("align_regions_to_corners"),
+        py::arg("output_height"),
+        py::arg("output_width"));
 }
